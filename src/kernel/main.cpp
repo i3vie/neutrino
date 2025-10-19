@@ -10,7 +10,7 @@ static void hcf(void) {
 }
 
 extern "C" void kernel_main(void) {
-    if (framebuffer_request.response == nullptr
+    /*if (framebuffer_request.response == nullptr
      || framebuffer_request.response->framebuffer_count == 0) {
         // limine didn't give us a framebuffer
         hcf();
@@ -25,7 +25,9 @@ extern "C" void kernel_main(void) {
         }
     }
 
-    asm volatile("cli");
+    asm volatile("cli");*/
+
+    gdt_install();
 
     hcf();
     
