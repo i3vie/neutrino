@@ -1,3 +1,4 @@
-./limine/
+/limine/
+!src/drivers/limine
 out/
 build/
