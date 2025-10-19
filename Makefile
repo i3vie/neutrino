@@ -11,7 +11,7 @@ BUILD_DIR  := build
 SRC_DIR    := src
 
 TARGET_ELF := $(OUT_DIR)/kernel.elf
-TARGET_ISO := $(OUT_DIR)/trisys.iso
+TARGET_ISO := $(OUT_DIR)/neutrino.iso
 
 CFLAGS     := -std=c++20 -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
@@ -64,7 +64,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 	
 	echo 'timeout: 1' > $(ISO_ROOT)/limine.conf
 	echo '' >> $(ISO_ROOT)/limine.conf
-	echo '/Trisys' >> $(ISO_ROOT)/limine.conf
+	echo '/Neutrino' >> $(ISO_ROOT)/limine.conf
 	echo '    protocol: limine' >> $(ISO_ROOT)/limine.conf
 	echo '    path: boot():/boot/kernel.elf' >> $(ISO_ROOT)/limine.conf
 
