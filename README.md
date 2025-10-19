@@ -1,5 +1,5 @@
-# trisys64
-Trisys is a novel, x86_64 kernel written in C++. More information to come
+# neutrino
+Neutrino is a novel, x86_64 kernel written in C++. More information to come
 
 ## Building
 All of these methods will likely require some changes to variables defined at the top of the file, since some arch packages (ovmf firmware and cross-compilers) use somewhat nonstandard names and paths, as far as I'm aware. You'll want to have a C++20 conforming compiler that can output x86_64 ELF files (preferably GCC, and its accompanying binutils), git, xorriso, nasm, and make. You'll also want qemu-system-x86_64 and optionally OVMF firmware for make run and make debug targets.
