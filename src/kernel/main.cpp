@@ -27,7 +27,7 @@ extern "C" void kernel_main(void) {
 
     asm volatile("cli");*/
 
-    gdt_install();
+    idt_install();
 
     hcf();
     
