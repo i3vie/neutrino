@@ -13,7 +13,7 @@ SRC_DIR    := src
 TARGET_ELF := $(OUT_DIR)/kernel.elf
 TARGET_ISO := $(OUT_DIR)/trisys.iso
 
-CFLAGS     := -std=c++20 -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -fno-exceptions -fno-rtti -mcmodel=kernel -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
+CFLAGS     := -std=c++20 -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
 # === Source discovery ===
