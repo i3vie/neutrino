@@ -84,6 +84,10 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 run: $(TARGET_ISO)
 	qemu-system-x86_64 -m 512M -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int
 
+# === Run but wait for debugger to attach ===
+debug: $(TARGET_ISO)
+	qemu-system-x86_64 -m 512M -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int -s -S
+
 # === Utility targets ===
 iso: $(TARGET_ISO)
 
