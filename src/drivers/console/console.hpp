@@ -33,6 +33,7 @@ private:
     void draw_char(char c, size_t x, size_t y);
     void scroll();
     void print_dec(uint64_t n);
-    void print_hex(uint64_t n);
+    void print_hex(uint64_t n, bool pad16);
 };
 
+extern Console* kconsole;

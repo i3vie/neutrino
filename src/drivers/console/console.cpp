@@ -2,9 +2,14 @@
 
 #include <stdarg.h>
 
+Console* kconsole = nullptr;
+
 Console::Console(Framebuffer* fb)
-    : fb(fb), cursor_x(0), cursor_y(0),
-      fg_color(0xFFFFFFFF), bg_color(0x00000000) {} // white on black
+    : fb(fb),
+      cursor_x(0),
+      cursor_y(0),
+      fg_color(0xFFFFFFFF),
+      bg_color(0x00000000) {}  // white on black
 
 void Console::draw_char(char c, size_t x, size_t y) {
     if ((unsigned char)c >= 128) return;
@@ -22,7 +27,8 @@ void Console::draw_char(char c, size_t x, size_t y) {
                     size_t px = base_px + dx;
                     size_t py = base_py + dy;
                     if (px < fb->width && py < fb->height) {
-                        ((uint32_t*)fb->base)[py * (fb->pitch / 4) + px] = color;
+                        ((uint32_t*)fb->base)[py * (fb->pitch / 4) + px] =
+                            color;
                     }
                 }
             }
@@ -90,19 +96,26 @@ void Console::print_dec(uint64_t n) {
     while (i--) putc(buf[i]);
 }
 
-void Console::print_hex(uint64_t n) {
+void Console::print_hex(uint64_t n, bool pad16 = false) {
     char buf[17];
     int i = 0;
     if (n == 0) {
-        puts("0x0");
+        puts(pad16 ? "0x0000000000000000" : "0x0");
         return;
     }
+
     puts("0x");
+
     while (n > 0) {
         uint8_t d = n & 0xF;
         buf[i++] = (d < 10) ? ('0' + d) : ('a' + (d - 10));
         n >>= 4;
     }
+
+    if (pad16) {
+        for (int j = 0; j < 16 - i; j++) putc('0');
+    }
+
     while (i--) putc(buf[i]);
 }
 
@@ -115,12 +128,23 @@ void Console::printf(const char* fmt, ...) {
             continue;
         }
         fmt++;
+
+        bool pad16 = false;
+
+        // check for "%016x"
+        if (*fmt == '0' && *(fmt + 1) == '1' && *(fmt + 2) == '6') {
+            fmt += 3;
+            if (*fmt == 'x') {
+                pad16 = true;
+            }
+        }
+
         switch (*fmt++) {
             case 'd':
                 print_dec(va_arg(args, int));
                 break;
             case 'x':
-                print_hex(va_arg(args, unsigned int));
+                print_hex(va_arg(args, unsigned int), pad16);
                 break;
             case 's':
                 puts(va_arg(args, const char*));

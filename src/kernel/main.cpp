@@ -27,6 +27,7 @@ extern "C" void kernel_main(void) {
         fb.pitch
     };
     Console console = Console(&framebuffer);
+    kconsole = &console; // HAVE AT THEE
     
     console.puts("Welcome to ");
     console.set_color(0xFFEBA134, 0x00000000);
