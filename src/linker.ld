@@ -51,4 +51,14 @@ SECTIONS
         *(.eh_frame*)
         *(.note .note.*)
     }
+
+    KERNEL_VIRT_BASE = 0xffffffff80000000;
+    KERNEL_START     = KERNEL_VIRT_BASE;
+    KERNEL_END       = .;
+    KERNEL_SIZE      = KERNEL_END - KERNEL_START;
+
+    PROVIDE(kernel_virt_base = KERNEL_VIRT_BASE);
+    PROVIDE(kernel_start = KERNEL_START);
+    PROVIDE(kernel_end = KERNEL_END);
+    PROVIDE(kernel_size = KERNEL_SIZE);
 }

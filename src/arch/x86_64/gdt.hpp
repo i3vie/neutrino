@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define KERNEL_VIRT_BASE 0xffffffff80000000
+const uint64_t G_KERNEL_VIRT_BASE = 0xffffffff80000000ULL;
 
 extern "C" void gdt_install();
 extern "C" uint16_t get_kernel_cs();

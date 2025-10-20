@@ -14,7 +14,6 @@ Console::Console(Framebuffer* fb)
 void Console::draw_char(char c, size_t x, size_t y) {
     if ((unsigned char)c >= 128) return;
 
-    constexpr int scale = 2;
     for (int row = 0; row < 8; ++row) {
         uint8_t bits = font8x8_basic[(uint8_t)c][row];
         for (int col = 0; col < 8; ++col) {
@@ -96,28 +95,39 @@ void Console::print_dec(uint64_t n) {
     while (i--) putc(buf[i]);
 }
 
-void Console::print_hex(uint64_t n, bool pad16 = false) {
+void Console::print_hex(uint64_t n, bool pad16) {
     char buf[17];
     int i = 0;
+
+    // handle zero explicitly
     if (n == 0) {
-        puts(pad16 ? "0x0000000000000000" : "0x0");
+        if (pad16)
+            puts("0x0000000000000000");
+        else
+            puts("0x0");
         return;
     }
 
-    puts("0x");
-
-    while (n > 0) {
+    // convert to hex string (reversed)
+    while (n > 0 && i < 16) {
         uint8_t d = n & 0xF;
         buf[i++] = (d < 10) ? ('0' + d) : ('a' + (d - 10));
         n >>= 4;
     }
 
-    if (pad16) {
-        for (int j = 0; j < 16 - i; j++) putc('0');
+    puts("0x");
+
+    // pad to 16 digits if requested
+    if (pad16 && i < 16) {
+        for (int j = 0; j < 16 - i; j++)
+            putc('0');
     }
 
-    while (i--) putc(buf[i]);
+    // print reversed buffer
+    while (i--)
+        putc(buf[i]);
 }
+
 
 void Console::printf(const char* fmt, ...) {
     va_list args;

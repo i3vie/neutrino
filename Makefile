@@ -86,7 +86,7 @@ run: $(TARGET_ISO)
 
 # === Run but wait for debugger to attach ===
 debug: $(TARGET_ISO)
-	qemu-system-x86_64 -m 512M -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int -s -S
+	qemu-system-x86_64 -m 512M -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int -s -S -monitor unix:./qemu-monitor-socket,server,nowait
 
 # === Utility targets ===
 iso: $(TARGET_ISO)
