@@ -42,7 +42,6 @@ static void set_tss_descriptor_bytes(uint8_t* dst, uint64_t base, uint32_t limit
     *(uint64_t*)(dst + 8) = high;
 }
 
-
 extern "C" void load_gdt_ptr(const void* ptr); // gdt_load.S
 
 void gdt_install() {
@@ -58,7 +57,8 @@ void gdt_install() {
     set_gdt_entry_bytes(gdt_area + 3*8, 0, 0x000FFFFF, 0xFA, 0x20); // user code DPL=3 L=1
     set_gdt_entry_bytes(gdt_area + 4*8, 0, 0x000FFFFF, 0xF2, 0x00); // user data DPL=3
 
-    set_tss_descriptor_bytes(gdt_area + 6*8, (uint64_t)&tss - KERNEL_VIRT_BASE, sizeof(TSS)-1, 0x89, 0x00); // TSS at index 5
+
+    set_tss_descriptor_bytes(gdt_area + 6*8, (uint64_t)&tss, sizeof(TSS)-1, 0x89, 0x00); // TSS at index 5
    
     gdtr.limit = (uint16_t)((8*8) - 1);
     gdtr.base  = (uint64_t)&gdt_area;

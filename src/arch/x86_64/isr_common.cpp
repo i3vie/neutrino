@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
+#include "../../drivers/console/console.hpp"
 
 struct isr_regs {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
@@ -16,4 +17,6 @@ struct isr_regs {
 extern "C" void isr_handler(struct isr_regs* regs) {
     (void)regs;
     for (;;) asm volatile("hlt");
+    extern Console console;
+    console.puts("Unhandled interrupt: ");
 }

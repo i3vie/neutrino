@@ -21,3 +21,4 @@ struct TSS {
 
 extern TSS tss;
 extern "C" void set_rsp0(uint64_t rsp);
+void init_tss();

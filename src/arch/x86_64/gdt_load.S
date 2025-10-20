@@ -11,12 +11,7 @@ load_gdt_ptr:
     mov gs, ax
     mov ss, ax
 
-    lea rax, [rel tss]
-    push rax
-    push 0x08
-    lretq
-tss:
-    mov ax, 0x28
+    mov ax, 0x30
     ltr ax
 
     ret
