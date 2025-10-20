@@ -51,15 +51,19 @@ extern "C" void kernel_main(void) {
     console.putc('\n');
     console.set_color(0xFFFFFFFF, 0x00000000);
 
-    console.puts("Installing IDT     ");
+    console.puts("Installing IDT         ");
     idt_install();
     console.set_color(0xFF00B000, 0x00000000);
     console.puts("[OK]\n");
     console.set_color(0xFFFFFFFF, 0x00000000);
 
+    console.puts("Initializing TSS       ");
     init_tss();
+    console.set_color(0xFF00B000, 0x00000000);
+    console.puts("[OK]\n");
+    console.set_color(0xFFFFFFFF, 0x00000000);
 
-    console.puts("Installing GDT     ");
+    console.puts("Installing GDT         ");
     gdt_install();
     console.set_color(0xFF00B000, 0x00000000);
     console.puts("[OK]\n");
