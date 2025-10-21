@@ -42,8 +42,6 @@ extern "C" void kernel_main(void) {
         "Unknown compiler";
 #endif
 
-    asm volatile("cli");
-
     console.puts("Compiler: ");
     console.set_color(0xFFEBA134, 0x00000000);
     console.puts(compiler_string);
@@ -69,19 +67,17 @@ extern "C" void kernel_main(void) {
     console.set_color(0xFFFFFFFF, 0x00000000);
 
     uint64_t kernel_phys_base = (uint64_t)kernel_file_request.response->kernel_file->address;
-    console.printf("Kernel phys base addr:     %x\n", kernel_phys_base);
+    console.printf("Kernel phys base addr:     %x\n", kernel_addr_request.response->physical_base);
+    console.printf("Kernel virt base addr:     %x\n", kernel_addr_request.response->virtual_base);
     console.printf("Kernel size:               %d KB (%x)\n", kernel_file_request.response->kernel_file->size / 1024, kernel_file_request.response->kernel_file->size);
 
+    console.printf("hhdm_request.response->offset: %x\n", hhdm_request.response->offset);
+
     console.puts("Initializing paging        ");
-    paging_init(kernel_phys_base, 0xffffffff80000000ULL, kernel_file_request.response->kernel_file->size);
+    paging_init(kernel_addr_request.response->physical_base, kernel_addr_request.response->virtual_base, kernel_file_request.response->kernel_file->size);
     console.set_color(0xFF00B000, 0x00000000);
     console.puts("[OK]\n");
     console.set_color(0xFFFFFFFF, 0x00000000);
-
-    uint64_t test_phys = 0x00200000; // 2 mb
-    uint64_t test_virt = 0xffffffff90000000;
-
-    map_page(test_virt, test_phys, PAGE_PRESENT | PAGE_WRITE);
 
     hcf();
 }

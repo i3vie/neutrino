@@ -13,7 +13,7 @@ SRC_DIR    := src
 TARGET_ELF := $(OUT_DIR)/kernel.elf
 TARGET_ISO := $(OUT_DIR)/neutrino.iso
 
-CFLAGS     := -std=c++20 -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
+CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
 # === Source discovery ===
@@ -82,11 +82,11 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 
 # === Run in QEMU (EFI mode) ===
 run: $(TARGET_ISO)
-	qemu-system-x86_64 -m 512M -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int
+	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int
 
 # === Run but wait for debugger to attach ===
 debug: $(TARGET_ISO)
-	qemu-system-x86_64 -m 512M -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int -s -S -monitor unix:./qemu-monitor-socket,server,nowait
+	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int -s -S -monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot
 
 # === Utility targets ===
 iso: $(TARGET_ISO)
