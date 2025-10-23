@@ -80,8 +80,13 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 	
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO)
 
-# === Run in QEMU (EFI mode) ===
 run: $(TARGET_ISO)
+	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) \
+		-serial stdio -d int \
+		-drive file=hdd.img,format=raw,if=ide
+
+# === Run in QEMU (EFI mode) ===
+run-nodisk: $(TARGET_ISO)
 	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int
 
 # === Run but wait for debugger to attach ===

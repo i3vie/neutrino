@@ -2,3 +2,6 @@
 !src/drivers/limine
 out/
 build/
+
+# drive images
+/*.img
