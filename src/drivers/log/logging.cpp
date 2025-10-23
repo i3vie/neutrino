@@ -90,29 +90,66 @@ void append_string(char*& out, char* end, const char* str) {
     }
 }
 
-void append_unsigned(char*& out, char* end, uint64_t value) {
+void append_unsigned(char*& out, char* end, uint64_t value, int width,
+                     char pad_char) {
     char buffer[21];
     int pos = 0;
     if (value == 0) {
-        append_char(out, end, '0');
-        return;
+        buffer[pos++] = '0';
+    } else {
+        while (value > 0 && pos < 21) {
+            buffer[pos++] = static_cast<char>('0' + (value % 10));
+            value /= 10;
+        }
     }
-    while (value > 0 && pos < 21) {
-        buffer[pos++] = static_cast<char>('0' + (value % 10));
-        value /= 10;
+
+    int total_len = pos;
+    int pad_len = width > total_len ? width - total_len : 0;
+    while (pad_len-- > 0) {
+        append_char(out, end, pad_char);
     }
     while (pos--) {
         append_char(out, end, buffer[pos]);
     }
 }
 
-void append_signed(char*& out, char* end, int64_t value) {
-    uint64_t mag = static_cast<uint64_t>(value);
-    if (value < 0) {
-        append_char(out, end, '-');
-        mag = static_cast<uint64_t>(-value);
+void append_signed(char*& out, char* end, int64_t value, int width,
+                   char pad_char) {
+    bool negative = value < 0;
+    uint64_t mag = negative ? static_cast<uint64_t>(-value)
+                            : static_cast<uint64_t>(value);
+
+    char buffer[21];
+    int pos = 0;
+    if (mag == 0) {
+        buffer[pos++] = '0';
+    } else {
+        while (mag > 0 && pos < 21) {
+            buffer[pos++] = static_cast<char>('0' + (mag % 10));
+            mag /= 10;
+        }
     }
-    append_unsigned(out, end, mag);
+
+    int total_len = pos + (negative ? 1 : 0);
+    int pad_len = width > total_len ? width - total_len : 0;
+
+    if (negative && pad_char == '0') {
+        append_char(out, end, '-');
+        while (pad_len-- > 0) {
+            append_char(out, end, '0');
+        }
+    } else {
+        while (pad_len-- > 0) {
+            append_char(out, end, pad_char);
+        }
+        if (negative) {
+            append_char(out, end, '-');
+        }
+    }
+
+    while (pos--) {
+        append_char(out, end, buffer[pos]);
+    }
 }
 
 void append_hex(char*& out, char* end, uint64_t value, bool pad16) {
@@ -159,10 +196,21 @@ size_t format_message(char* out, size_t capacity, const char* fmt,
         }
         ++fmt;
 
+        bool zero_pad = false;
+        int width = 0;
+        if (*fmt == '0') {
+            zero_pad = true;
+            ++fmt;
+        }
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            ++fmt;
+        }
+
         bool pad16 = false;
-        if (fmt[0] == '0' && fmt[1] == '1' && fmt[2] == '6') {
+        if (zero_pad && width == 16 && *fmt == 'x') {
             pad16 = true;
-            fmt += 3;
+            width = 0;  // handled separately
         }
 
         char spec = *fmt++;
@@ -172,10 +220,12 @@ size_t format_message(char* out, size_t capacity, const char* fmt,
                 break;
             case 'd':
             case 'i':
-                append_signed(cursor, end, va_arg(args, int));
+                append_signed(cursor, end, va_arg(args, int), width,
+                              zero_pad ? '0' : ' ');
                 break;
             case 'u':
-                append_unsigned(cursor, end, va_arg(args, unsigned int));
+                append_unsigned(cursor, end, va_arg(args, unsigned int), width,
+                                zero_pad ? '0' : ' ');
                 break;
             case 'x':
                 append_hex(cursor, end, va_arg(args, unsigned long long), pad16);
