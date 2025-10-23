@@ -4,6 +4,7 @@
 
 #include "../drivers/console/console.hpp"
 #include "../drivers/limine/limine_requests.hpp"
+#include "../drivers/log/logging.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/idt.hpp"
 #include "arch/x86_64/memory/paging.hpp"
@@ -43,10 +44,11 @@ static void kernel_main_stage2() {
     Console console = Console(&framebuffer);
     kconsole = &console;  // HAVE AT THEE
 
-    console.puts("Welcome to ");
-    console.set_color(0xFFEBA134, 0x00000000);
-    console.puts("Neutrino\n");
-    console.set_color(0xFFFFFFFF, 0x00000000);
+    log_init();
+    log_message(LogLevel::Info, "Console online");
+
+    log_message(LogLevel::Info, "Welcome to Neutrino");
+
     const char* compiler_string =
 #if defined(__clang__)
         "Clang/LLVM " __clang_version__;
@@ -58,46 +60,35 @@ static void kernel_main_stage2() {
         "Unknown compiler";
 #endif
 
-    console.puts("Compiler: ");
-    console.set_color(0xFFEBA134, 0x00000000);
-    console.puts(compiler_string);
-    console.putc('\n');
-    console.set_color(0xFFFFFFFF, 0x00000000);
+    log_message(LogLevel::Info, "Compiler: %s", compiler_string);
 
-    console.puts("Installing IDT             ");
+    log_message(LogLevel::Info, "Installing IDT");
     idt_install();
-    console.set_color(0xFF00B000, 0x00000000);
-    console.puts("[OK]\n");
-    console.set_color(0xFFFFFFFF, 0x00000000);
+    log_message(LogLevel::Info, "IDT installed");
 
-    console.puts("Initializing TSS           ");
+    log_message(LogLevel::Info, "Initializing TSS");
     init_tss();
-    console.set_color(0xFF00B000, 0x00000000);
-    console.puts("[OK]\n");
-    console.set_color(0xFFFFFFFF, 0x00000000);
+    log_message(LogLevel::Info, "TSS initialized");
 
-    console.puts("Installing GDT             ");
+    log_message(LogLevel::Info, "Installing GDT");
     gdt_install();
-    console.set_color(0xFF00B000, 0x00000000);
-    console.puts("[OK]\n");
-    console.set_color(0xFFFFFFFF, 0x00000000);
+    log_message(LogLevel::Info, "GDT installed");
 
-    console.printf("Kernel phys base addr:     %x\n",
-                   kernel_addr_request.response->physical_base);
-    console.printf("Kernel virt base addr:     %x\n",
-                   kernel_addr_request.response->virtual_base);
-    console.printf("Kernel size:               %d KB (%x)\n",
-                   kernel_file_request.response->kernel_file->size / 1024,
-                   kernel_file_request.response->kernel_file->size);
+    log_message(LogLevel::Debug, "Kernel phys base addr: %016x",
+                (unsigned long long)kernel_addr_request.response->physical_base);
+    log_message(LogLevel::Debug, "Kernel virt base addr: %016x",
+                (unsigned long long)kernel_addr_request.response->virtual_base);
+    log_message(LogLevel::Debug, "Kernel size: %u KB (%x)",
+                (unsigned int)(kernel_file_request.response->kernel_file->size /
+                               1024),
+                (unsigned int)kernel_file_request.response->kernel_file->size);
 
-    console.printf("hhdm_request.response->offset: %x\n",
-                   hhdm_request.response->offset);
+    log_message(LogLevel::Debug, "HHDM offset: %016x",
+                (unsigned long long)hhdm_request.response->offset);
 
-    console.puts("Initializing paging        ");
+    log_message(LogLevel::Info, "Initializing paging");
     paging_init();
-    console.set_color(0xFF00B000, 0x00000000);
-    console.puts("[OK]\n");
-    console.set_color(0xFFFFFFFF, 0x00000000);
+    log_message(LogLevel::Info, "Paging initialized");
 
     hcf();
 }
