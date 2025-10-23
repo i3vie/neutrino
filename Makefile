@@ -67,6 +67,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 	echo '/Neutrino' >> $(ISO_ROOT)/limine.conf
 	echo '    protocol: limine' >> $(ISO_ROOT)/limine.conf
 	echo '    path: boot():/boot/kernel.elf' >> $(ISO_ROOT)/limine.conf
+	echo '    cmdline: ROOT=IDE_PM_0' >> $(ISO_ROOT)/limine.conf
 
 	mkdir -p $(ISO_ROOT)/EFI/BOOT
 	cp -v $(LIMINE_DIR)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/

@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 static inline void io_wait() {
-    asm volatile("outb %0, %1" : : "a"(0), "Nd"(0x80));
+    asm volatile("outb %0, %1" : : "a"(static_cast<uint8_t>(0)), "Nd"(0x80));
 }
 
 static inline void outb(uint16_t port, uint8_t value) {
