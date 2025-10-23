@@ -14,7 +14,23 @@ static void hcf(void) {
     for (;;) asm("hlt");
 }
 
+constexpr size_t BOOTSTRAP_STACK_SIZE = 0x8000;
+alignas(16) static uint8_t bootstrap_stack[BOOTSTRAP_STACK_SIZE];
+
+static void kernel_main_stage2();
+
 extern "C" void kernel_main(void) {
+    uint8_t* stack_top = bootstrap_stack + BOOTSTRAP_STACK_SIZE;
+    asm volatile(
+        "mov %0, %%rsp\n"
+        "xor %%rbp, %%rbp\n"
+        :
+        : "r"(stack_top)
+        : "memory");
+    kernel_main_stage2();
+}
+
+static void kernel_main_stage2() {
     if (framebuffer_request.response == nullptr ||
         framebuffer_request.response->framebuffer_count == 0) {
         // limine didn't give us a framebuffer
@@ -66,15 +82,19 @@ extern "C" void kernel_main(void) {
     console.puts("[OK]\n");
     console.set_color(0xFFFFFFFF, 0x00000000);
 
-    uint64_t kernel_phys_base = (uint64_t)kernel_file_request.response->kernel_file->address;
-    console.printf("Kernel phys base addr:     %x\n", kernel_addr_request.response->physical_base);
-    console.printf("Kernel virt base addr:     %x\n", kernel_addr_request.response->virtual_base);
-    console.printf("Kernel size:               %d KB (%x)\n", kernel_file_request.response->kernel_file->size / 1024, kernel_file_request.response->kernel_file->size);
+    console.printf("Kernel phys base addr:     %x\n",
+                   kernel_addr_request.response->physical_base);
+    console.printf("Kernel virt base addr:     %x\n",
+                   kernel_addr_request.response->virtual_base);
+    console.printf("Kernel size:               %d KB (%x)\n",
+                   kernel_file_request.response->kernel_file->size / 1024,
+                   kernel_file_request.response->kernel_file->size);
 
-    console.printf("hhdm_request.response->offset: %x\n", hhdm_request.response->offset);
+    console.printf("hhdm_request.response->offset: %x\n",
+                   hhdm_request.response->offset);
 
     console.puts("Initializing paging        ");
-    paging_init(kernel_addr_request.response->physical_base, kernel_addr_request.response->virtual_base, kernel_file_request.response->kernel_file->size);
+    paging_init();
     console.set_color(0xFF00B000, 0x00000000);
     console.puts("[OK]\n");
     console.set_color(0xFFFFFFFF, 0x00000000);

@@ -154,7 +154,7 @@ void Console::printf(const char* fmt, ...) {
                 print_dec(va_arg(args, int));
                 break;
             case 'x':
-                print_hex(va_arg(args, unsigned int), pad16);
+                print_hex(va_arg(args, unsigned long long), pad16);
                 break;
             case 's':
                 puts(va_arg(args, const char*));
