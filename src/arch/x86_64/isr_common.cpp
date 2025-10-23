@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
-#include "../../drivers/console/console.hpp"
+#include "../../drivers/log/logging.hpp"
 
 struct isr_regs {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
@@ -51,22 +51,19 @@ constexpr const char* exception_names[32] = {
 };
 
 extern "C" void isr_handler(isr_regs* regs) {
-    kconsole->set_color(0xFFFF0000, 0x00000000);
-    kconsole->printf("\nException: %x ", regs->int_no);
-    if (regs->int_no < 32) {
-        kconsole->printf("(%s)", exception_names[regs->int_no]);
-    }
-    kconsole->putc('\n');
-    kconsole->printf("E=%x\n", regs->err_code);
-    kconsole->set_color(0xFFFFFFFF, 0x00000000);
+    log_message(LogLevel::Error, "Exception %x %s", regs->int_no,
+                regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown");
+    log_message(LogLevel::Error, "Error code: %x", regs->err_code);
+    
     // Print all register values, 3 per line
-    kconsole->printf("RAX=%016x     RBX=%016x     RCX=%016x\n\n", regs->rax, regs->rbx, regs->rcx);
-    kconsole->printf("RDX=%016x     RSI=%016x     RDI=%016x\n\n", regs->rdx, regs->rsi, regs->rdi);
-    kconsole->printf("R8 =%016x     R9 =%016x     R10=%016x\n\n", regs->r8, regs->r9, regs->r10);
-    kconsole->printf("R11=%016x     R12=%016x     R13=%016x\n\n", regs->r11, regs->r12, regs->r13);
-    kconsole->printf("R14=%016x     R15=%016x     RBP=%016x\n\n", regs->r14, regs->r15, regs->rbp);
-    kconsole->printf("RIP=%016x     RSP=%016x  RFLAGS=%016x\n\n", regs->rip, regs->rsp, regs->rflags);
-    kconsole->printf("CS %x    SS %x\n", regs->cs, regs->ss);
+    log_message(LogLevel::Debug, "RAX=%016x     RBX=%016x     RCX=%016x", regs->rax, regs->rbx, regs->rcx);
+    log_message(LogLevel::Debug, "RDX=%016x     RSI=%016x     RDI=%016x", regs->rdx, regs->rsi, regs->rdi);
+    log_message(LogLevel::Debug, "R8 =%016x     R9 =%016x     R10=%016x", regs->r8, regs->r9, regs->r10);
+    log_message(LogLevel::Debug, "R11=%016x     R12=%016x     R13=%016x", regs->r11, regs->r12, regs->r13);
+    log_message(LogLevel::Debug, "R14=%016x     R15=%016x     RBP=%016x", regs->r14, regs->r15, regs->rbp);
+    log_message(LogLevel::Debug, "RIP=%016x     RSP=%016x  RFLAGS=%016x", regs->rip, regs->rsp, regs->rflags);
+    log_message(LogLevel::Debug, "CS=%x    SS=%x", regs->cs, regs->ss);
+
     // Halt the system
     for (;;) asm("hlt");
 }
