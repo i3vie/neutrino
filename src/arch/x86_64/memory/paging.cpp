@@ -19,6 +19,7 @@ constexpr uint64_t PAGE_LARGE_MASK = PAGE_LARGE_SIZE - 1;
 
 constexpr uint64_t PTE_PRESENT = 1ull << 0;
 constexpr uint64_t PTE_WRITE = 1ull << 1;
+constexpr uint64_t PTE_USER = 1ull << 2;
 constexpr uint64_t PTE_LARGE = 1ull << 7;
 constexpr uint64_t PTE_GLOBAL = 1ull << 8;
 
@@ -73,12 +74,16 @@ uint64_t phys_to_virt(uint64_t phys) {
     return phys - g_kernel_phys_base + g_kernel_virt_base;
 }
 
-uint64_t* ensure_table(uint64_t* table, size_t index) {
+uint64_t* ensure_table(uint64_t* table, size_t index, uint64_t flags) {
     uint64_t entry = table[index];
     if ((entry & PTE_PRESENT) == 0) {
         auto child = static_cast<uint64_t*>(alloc_boot_page());
         uint64_t phys = virt_to_phys(reinterpret_cast<uint64_t>(child));
-        table[index] = phys | PTE_PRESENT | PTE_WRITE;
+        uint64_t child_flags = PTE_PRESENT | PTE_WRITE;
+        if (flags & PTE_USER) {
+            child_flags |= PTE_USER;
+        }
+        table[index] = phys | child_flags;
         return child;
     }
 
@@ -92,6 +97,11 @@ uint64_t* ensure_table(uint64_t* table, size_t index) {
         halt_system();
     }
 
+    if ((flags & PTE_USER) != 0 && (entry & PTE_USER) == 0) {
+        table[index] |= PTE_USER;
+        entry = table[index];
+    }
+
     uint64_t phys = entry & ~PAGE_MASK;
     return reinterpret_cast<uint64_t*>(phys_to_virt(phys));
 }
@@ -102,9 +112,9 @@ void map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     size_t pd_index = (virt >> 21) & 0x1FF;
     size_t pt_index = (virt >> 12) & 0x1FF;
 
-    uint64_t* pdpt = ensure_table(pml4_table, pml4_index);
-    uint64_t* pd = ensure_table(pdpt, pdpt_index);
-    uint64_t* pt = ensure_table(pd, pd_index);
+    uint64_t* pdpt = ensure_table(pml4_table, pml4_index, flags);
+    uint64_t* pd = ensure_table(pdpt, pdpt_index, flags);
+    uint64_t* pt = ensure_table(pd, pd_index, flags);
 
     pt[pt_index] = (phys & ~PAGE_MASK) | flags | PTE_PRESENT;
 }
@@ -118,8 +128,8 @@ bool try_map_large_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     size_t pdpt_index = (virt >> 30) & 0x1FF;
     size_t pd_index = (virt >> 21) & 0x1FF;
 
-    uint64_t* pdpt = ensure_table(pml4_table, pml4_index);
-    uint64_t* pd = ensure_table(pdpt, pdpt_index);
+    uint64_t* pdpt = ensure_table(pml4_table, pml4_index, flags);
+    uint64_t* pd = ensure_table(pdpt, pdpt_index, flags);
 
     uint64_t entry = pd[pd_index];
     if (entry & PTE_PRESENT) {
@@ -250,4 +260,12 @@ bool paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     map_page(virt, phys, flags);
     asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
     return true;
+}
+
+uint64_t paging_virt_to_phys(uint64_t virt) {
+    return virt_to_phys(virt);
+}
+
+void* paging_alloc_page() {
+    return alloc_boot_page();
 }

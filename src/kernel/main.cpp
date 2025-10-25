@@ -7,10 +7,16 @@
 #include "../drivers/log/logging.hpp"
 #include "../drivers/fs/fat32/fat32.hpp"
 #include "../drivers/fs/mount_manager.hpp"
+#include "../drivers/interrupts/pic.hpp"
+#include "../drivers/timer/pit.hpp"
 #include "../fs/vfs.hpp"
+#include "loader.hpp"
+#include "process.hpp"
+#include "scheduler.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/idt.hpp"
 #include "arch/x86_64/memory/paging.hpp"
+#include "arch/x86_64/syscall.hpp"
 #include "arch/x86_64/tss.hpp"
 
 static void hcf(void) {
@@ -128,6 +134,18 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Info, "Installing GDT");
     gdt_install();
     log_message(LogLevel::Info, "GDT installed");
+
+    log_message(LogLevel::Info, "Initializing syscall interface");
+    syscall::init();
+    log_message(LogLevel::Info, "Syscall interface initialized");
+
+    log_message(LogLevel::Info, "Initializing PIC");
+    pic::init();
+    log_message(LogLevel::Info, "PIC initialized");
+
+    log_message(LogLevel::Info, "Configuring PIT");
+    pit::init(100);
+    log_message(LogLevel::Info, "PIT configured");
 
     log_message(LogLevel::Debug, "Kernel phys base addr: %016x",
                 (unsigned long long)kernel_addr_request.response->physical_base);
@@ -315,5 +333,11 @@ static void kernel_main_stage2() {
                     "Boot: skipping KERNEL.CFG lookup (root not mounted)");
     }
 
+    process::init();
+    scheduler::init();
+    scheduler::run();
+
+    log_message(LogLevel::Error,
+                "Scheduler failed to start or was exited, halting");
     hcf();
 }

@@ -20,9 +20,6 @@ struct __attribute__((packed)) IdtPtr {
 static IdtEntry idt[256];
 static IdtPtr idt_ptr;
 
-extern "C" void isr_page_fault_stub();
-extern "C" void isr_default_stub();
-
 static void set_idt_entry(int vec, void* handler, uint8_t ist, uint8_t flags) {
     uintptr_t addr = (uintptr_t)handler;
     idt[vec].offset_low  = (uint16_t)(addr & 0xFFFF);
@@ -34,11 +31,11 @@ static void set_idt_entry(int vec, void* handler, uint8_t ist, uint8_t flags) {
     idt[vec].zero        = 0;
 }
 
-extern void* isr_stub_table[32];
+extern void* isr_stub_table[256];
 
 extern "C" void idt_install() {
     memset(idt, 0, sizeof(idt));
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < 256; i++) {
         set_idt_entry(i, isr_stub_table[i], 0, 0x8E);
     }
     idt_ptr.limit = sizeof(idt) - 1;
