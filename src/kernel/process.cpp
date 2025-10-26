@@ -26,6 +26,7 @@ void init() {
         g_process_table[i].kernel_stack_top =
             g_process_table[i].kernel_stack_base + kKernelStackSize;
         g_process_table[i].kernel_stack_top &= ~0xFULL;
+        descriptor::init_table(g_process_table[i].descriptors);
     }
 }
 
@@ -40,6 +41,7 @@ Process* allocate() {
         proc.pid = g_next_pid++;
         proc.cr3 = 0;
         proc.has_context = false;
+        descriptor::init_table(proc.descriptors);
         return &proc;
     }
     return nullptr;

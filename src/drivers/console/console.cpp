@@ -3,6 +3,7 @@
 #include <stdarg.h>
 
 Console* kconsole = nullptr;
+uint32_t DEFAULT_BG = 0x00000000;
 
 Console::Console(Framebuffer* fb)
     : fb(fb),
@@ -35,7 +36,7 @@ void Console::draw_char(char c, size_t x, size_t y) {
     }
 }
 
-void Console::set_color(uint32_t fg, uint32_t bg) {
+void Console::set_color(uint32_t fg, uint32_t bg = DEFAULT_BG) {
     fg_color = fg;
     bg_color = bg;
 }

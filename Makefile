@@ -83,7 +83,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 
 run: $(TARGET_ISO)
 	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) \
-		-serial stdio -d int \
+		-serial stdio  \
 		-drive file=hdd.img,format=raw,if=ide
 
 # === Run in QEMU (EFI mode) ===
@@ -96,6 +96,7 @@ debug: $(TARGET_ISO)
 
 # === Utility targets ===
 iso: $(TARGET_ISO)
+	@echo ISO created at $(TARGET_ISO)
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUT_DIR)

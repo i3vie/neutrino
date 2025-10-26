@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "../../kernel/scheduler.hpp"
+#include "../../drivers/log/logging.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/syscall_table.hpp"
 

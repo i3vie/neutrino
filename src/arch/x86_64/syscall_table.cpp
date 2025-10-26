@@ -1,6 +1,8 @@
 #include "arch/x86_64/syscall_table.hpp"
 
 #include "../../drivers/log/logging.hpp"
+#include "../../kernel/descriptor.hpp"
+#include "../../kernel/process.hpp"
 
 namespace syscall {
 
@@ -24,6 +26,81 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::Yield: {
             return Result::Reschedule;
         }
+        case SystemCall::DescriptorOpen: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint32_t type = static_cast<uint32_t>(frame.rdi) &
+                            descriptor::kTypeMask;
+            int32_t handle =
+                descriptor::open(*proc,
+                                 proc->descriptors,
+                                 type,
+                                 frame.rsi,
+                                 frame.rdx,
+                                 frame.r10);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorQuery: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool ok = false;
+            uint32_t info = descriptor::query(
+                proc->descriptors,
+                static_cast<uint32_t>(frame.rdi),
+                &ok);
+            frame.rax =
+                ok ? static_cast<uint64_t>(info) : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorRead: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int64_t result = descriptor::read(*proc,
+                                              proc->descriptors,
+                                              static_cast<uint32_t>(frame.rdi),
+                                              frame.rsi,
+                                              frame.rdx,
+                                              frame.r10);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorWrite: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int64_t result = descriptor::write(*proc,
+                                               proc->descriptors,
+                                               static_cast<uint32_t>(frame.rdi),
+                                               frame.rsi,
+                                               frame.rdx,
+                                               frame.r10);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorClose: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool ok = descriptor::close(*proc,
+                                        proc->descriptors,
+                                        static_cast<uint32_t>(frame.rdi));
+            frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
         default: {
             log_message(LogLevel::Warn, "Unhandled syscall %llx", frame.rax);
             frame.rax = static_cast<uint64_t>(-1);
@@ -33,4 +110,3 @@ Result handle_syscall(SyscallFrame& frame) {
 }
 
 }  // namespace syscall
-

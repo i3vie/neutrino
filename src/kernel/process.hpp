@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "arch/x86_64/syscall.hpp"
+#include "descriptor.hpp"
 #include "vm.hpp"
 
 namespace process {
@@ -32,6 +33,7 @@ struct Process {
     syscall::SyscallFrame context;
     Process* parent;
     bool has_context;
+    descriptor::Table descriptors;
 };
 
 void init();
@@ -41,4 +43,3 @@ void set_current(Process* proc);
 Process* table_entry(size_t index);
 
 }  // namespace process
-

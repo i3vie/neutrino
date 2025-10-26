@@ -7,12 +7,16 @@
 namespace syscall {
 
 enum class SystemCall : uint64_t {
-    AbiMajor = 0,
-    AbiMinor = 1,
-    Yield    = 2,
+    AbiMajor         = 0,
+    AbiMinor         = 1,
+    Yield            = 2,
+    DescriptorOpen   = 3,
+    DescriptorQuery  = 4,
+    DescriptorRead   = 5,
+    DescriptorWrite  = 6,
+    DescriptorClose  = 7,
 };
 
 Result handle_syscall(SyscallFrame& frame);
 
 }  // namespace syscall
-

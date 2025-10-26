@@ -69,4 +69,22 @@ void write_string(const char* str) {
     }
 }
 
+size_t read(char* buffer, size_t len) {
+    if (buffer == nullptr || len == 0) {
+        return 0;
+    }
+    size_t read_count = 0;
+    while (read_count < len) {
+        if ((inb(COM1_PORT + 5) & 0x01) == 0) {
+            break;
+        }
+        buffer[read_count++] = static_cast<char>(inb(COM1_PORT));
+    }
+    return read_count;
+}
+
+bool data_available() {
+    return (inb(COM1_PORT + 5) & 0x01) != 0;
+}
+
 }  // namespace serial
