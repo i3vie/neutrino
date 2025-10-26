@@ -28,6 +28,41 @@ static void hcf(void) {
 
 namespace {
 
+constexpr const char kRootDevicePlaceholder[] = "RootDevice";
+bool matches_literal(const char* str, size_t len, const char* literal) {
+    if (str == nullptr || literal == nullptr) {
+        return false;
+    }
+    size_t idx = 0;
+    while (idx < len && literal[idx] != '\0') {
+        if (str[idx] != literal[idx]) {
+            return false;
+        }
+        ++idx;
+    }
+    return (idx == len) && (literal[idx] == '\0');
+}
+
+bool append_chunk(const char* data,
+                  size_t length,
+                  char* out,
+                  size_t out_size,
+                  size_t& index) {
+    if (data == nullptr || out == nullptr) {
+        return false;
+    }
+    if (length == 0) {
+        return true;
+    }
+    if (index + length >= out_size) {
+        return false;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        out[index++] = data[i];
+    }
+    return true;
+}
+
 bool build_mount_path(const char* spec,
                       const char* default_mount,
                       char* out,
@@ -54,22 +89,44 @@ bool build_mount_path(const char* spec,
         while (*remainder == '/') {
             ++remainder;
         }
-    size_t remainder_len = string_util::length(remainder);
+        size_t remainder_len = string_util::length(remainder);
         if (remainder_len == 0) {
             return false;
         }
 
-        if (mount_len + 1 + remainder_len >= out_size) {
-            return false;
+        const char* mount_value = mount_start;
+        size_t mount_value_len = mount_len;
+        if (matches_literal(mount_start,
+                            mount_len,
+                            kRootDevicePlaceholder)) {
+            if (default_mount == nullptr || default_mount[0] == '\0') {
+                return false;
+            }
+            mount_value = default_mount;
+            mount_value_len = string_util::length(default_mount);
         }
 
         size_t idx = 0;
-        for (size_t i = 0; i < mount_len; ++i) {
-            out[idx++] = mount_start[i];
+        if (!append_chunk(mount_value,
+                          mount_value_len,
+                          out,
+                          out_size,
+                          idx)) {
+            return false;
+        }
+        if (idx + 1 >= out_size) {
+            return false;
         }
         out[idx++] = '/';
-        for (size_t i = 0; i < remainder_len; ++i) {
-            out[idx++] = remainder[i];
+        if (!append_chunk(remainder,
+                          remainder_len,
+                          out,
+                          out_size,
+                          idx)) {
+            return false;
+        }
+        if (idx >= out_size) {
+            return false;
         }
         out[idx] = '\0';
         return true;
@@ -82,13 +139,14 @@ bool build_mount_path(const char* spec,
 
     bool has_slash = string_util::contains(spec, '/');
     if (has_slash || default_mount == nullptr || default_mount[0] == '\0') {
-        if (spec_len >= out_size) {
+        size_t idx = 0;
+        if (!append_chunk(spec, spec_len, out, out_size, idx)) {
             return false;
         }
-        for (size_t i = 0; i < spec_len; ++i) {
-            out[i] = spec[i];
+        if (idx >= out_size) {
+            return false;
         }
-        out[spec_len] = '\0';
+        out[idx] = '\0';
         return true;
     }
 
@@ -96,17 +154,28 @@ bool build_mount_path(const char* spec,
     if (mount_len == 0) {
         return false;
     }
-    if (mount_len + 1 + spec_len >= out_size) {
-        return false;
-    }
 
     size_t idx = 0;
-    for (size_t i = 0; i < mount_len; ++i) {
-        out[idx++] = default_mount[i];
+    if (!append_chunk(default_mount,
+                      mount_len,
+                      out,
+                      out_size,
+                      idx)) {
+        return false;
+    }
+    if (idx + 1 >= out_size) {
+        return false;
     }
     out[idx++] = '/';
-    for (size_t i = 0; i < spec_len; ++i) {
-        out[idx++] = spec[i];
+    if (!append_chunk(spec,
+                      spec_len,
+                      out,
+                      out_size,
+                      idx)) {
+        return false;
+    }
+    if (idx >= out_size) {
+        return false;
     }
     out[idx] = '\0';
     return true;
