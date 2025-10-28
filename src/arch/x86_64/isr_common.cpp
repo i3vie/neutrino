@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "../../drivers/input/keyboard.hpp"
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "../../kernel/scheduler.hpp"
@@ -53,6 +54,8 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             if ((regs->cs & 0x3) != 0) {
                 scheduler::reschedule_from_interrupt(*regs);
             }
+        } else if (irq == 1) {
+            keyboard::handle_irq();
         }
         if (irq < 16) {
             pic::send_eoi(static_cast<uint8_t>(irq));

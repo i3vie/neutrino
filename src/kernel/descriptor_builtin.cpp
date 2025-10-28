@@ -1,6 +1,7 @@
 #include "descriptor.hpp"
 
 #include "../drivers/console/console.hpp"
+#include "../drivers/input/keyboard.hpp"
 #include "../drivers/log/logging.hpp"
 #include "../drivers/serial/serial.hpp"
 #include "process.hpp"
@@ -111,6 +112,52 @@ bool open_serial(process::Process&,
     return true;
 }
 
+int64_t keyboard_read(process::Process&,
+                      Entry&,
+                      uint64_t user_address,
+                      uint64_t length,
+                      uint64_t offset) {
+    if (offset != 0) {
+        return -1;
+    }
+    if (length == 0) {
+        return 0;
+    }
+    auto* buffer = reinterpret_cast<char*>(user_address);
+    if (buffer == nullptr) {
+        return -1;
+    }
+    size_t to_read = static_cast<size_t>(length);
+    size_t read_count = keyboard::read(buffer, to_read);
+    return static_cast<int64_t>(read_count);
+}
+
+int64_t keyboard_write(process::Process&,
+                       Entry&,
+                       uint64_t,
+                       uint64_t,
+                       uint64_t) {
+    return -1;
+}
+
+const Ops kKeyboardOps{
+    .read = keyboard_read,
+    .write = keyboard_write,
+};
+
+bool open_keyboard(process::Process&,
+                   uint64_t,
+                   uint64_t,
+                   uint64_t,
+                   Allocation& alloc) {
+    keyboard::init();
+    alloc.info = make_info(kTypeKeyboard, CapabilityReadable);
+    alloc.object = nullptr;
+    alloc.close = nullptr;
+    alloc.ops = &kKeyboardOps;
+    return true;
+}
+
 }  // namespace
 
 void register_builtin_types() {
@@ -121,6 +168,10 @@ void register_builtin_types() {
     if (!register_type(kTypeSerial, open_serial, &kSerialOps)) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register serial descriptor type");
+    }
+    if (!register_type(kTypeKeyboard, open_keyboard, &kKeyboardOps)) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register keyboard descriptor type");
     }
 }
 

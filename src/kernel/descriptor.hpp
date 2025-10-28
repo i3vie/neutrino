@@ -15,7 +15,8 @@ constexpr uint32_t kTypeMask = 0x3FF;
 constexpr uint32_t kCapabilityMask = (1u << kTypeShift) - 1u;
 
 constexpr uint32_t kTypeConsole = 0x001;
-constexpr uint32_t kTypeSerial  = 0x004;
+constexpr uint32_t kTypeSerial  = 0x002;
+constexpr uint32_t kTypeKeyboard = 0x003;
 
 enum Capability : uint32_t {
     CapabilityReadable = 1u << 0,
