@@ -9,12 +9,13 @@ namespace syscall {
 enum class SystemCall : uint64_t {
     AbiMajor         = 0,
     AbiMinor         = 1,
-    Yield            = 2,
-    DescriptorOpen   = 3,
-    DescriptorQuery  = 4,
-    DescriptorRead   = 5,
-    DescriptorWrite  = 6,
-    DescriptorClose  = 7,
+    Exit             = 2,
+    Yield            = 3,
+    DescriptorOpen   = 4,
+    DescriptorQuery  = 5,
+    DescriptorRead   = 6,
+    DescriptorWrite  = 7,
+    DescriptorClose  = 8,
 };
 
 Result handle_syscall(SyscallFrame& frame);

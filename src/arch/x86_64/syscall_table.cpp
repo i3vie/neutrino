@@ -23,6 +23,10 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = kAbiMinor;
             return Result::Continue;
         }
+        case SystemCall::Exit: {
+            frame.rax = frame.rdi % 0xFFFF;
+            return Result::Unschedule;
+        }
         case SystemCall::Yield: {
             return Result::Reschedule;
         }

@@ -142,6 +142,9 @@ void enqueue(process::Process* proc) {
                         "Scheduler: no runnable processes, halting");
             halt_system();
         }
+        if (next->state == process::State::Terminated) {
+            continue;
+        }
         process::set_current(next);
         set_rsp0(next->kernel_stack_top);
         userspace::enter_process(*next);
@@ -157,17 +160,32 @@ void reschedule(syscall::SyscallFrame& frame) {
         return;
     }
 
-    current_proc->context = frame;
-    current_proc->has_context = true;
-    current_proc->user_ip = frame.user_rip;
-    current_proc->user_sp = frame.user_rsp;
+    bool terminated = current_proc->state == process::State::Terminated;
 
-    if (current_proc->state != process::State::Terminated) {
+    if (!terminated) {
+        current_proc->context = frame;
+        current_proc->has_context = true;
+        current_proc->user_ip = frame.user_rip;
+        current_proc->user_sp = frame.user_rsp;
+    } else {
+        current_proc->has_context = false;
+    }
+
+    if (!terminated) {
         enqueue(current_proc);
     }
 
     process::Process* next = queue_pop();
+    while (next != nullptr && next->state == process::State::Terminated) {
+        next = queue_pop();
+    }
+
     if (next == nullptr) {
+        if (terminated) {
+            log_message(LogLevel::Error,
+                        "Scheduler: no runnable processes after termination, halting");
+            halt_system();
+        }
         process::set_current(current_proc);
         prepare_frame_for_process(*current_proc, frame);
         return;

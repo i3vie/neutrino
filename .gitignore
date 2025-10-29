@@ -2,6 +2,7 @@
 !src/drivers/limine
 out/
 build/
+userspace/programs/**/**.elf
 
 # drive images
 /*.img

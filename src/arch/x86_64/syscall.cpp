@@ -44,8 +44,22 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
         return;
     }
 
-    if (handle_syscall(*frame) == Result::Reschedule) {
-        scheduler::reschedule(*frame);
+    Result res = handle_syscall(*frame);
+
+    switch (res) {
+        case Result::Continue:
+            break;
+        case Result::Reschedule:
+            scheduler::reschedule(*frame);
+            break;
+        case Result::Unschedule: {
+            process::Process* proc = process::current();
+            if (proc != nullptr) {
+                proc->state = process::State::Terminated;
+            }
+            scheduler::reschedule(*frame);
+            break;
+        }
     }
 }
 

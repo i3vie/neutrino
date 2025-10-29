@@ -68,6 +68,33 @@ Region map_user_code(const uint8_t* data, size_t length,
     return region;
 }
 
+Region allocate_user_region(size_t length) {
+    Region region{0, 0};
+    if (length == 0) {
+        return region;
+    }
+
+    uint64_t base = align_up(g_next_user_code, kPageSize);
+    size_t padded = static_cast<size_t>(align_up(length, kPageSize));
+    size_t pages = padded / kPageSize;
+
+    for (size_t i = 0; i < pages; ++i) {
+        auto page = static_cast<uint8_t*>(paging_alloc_page());
+        if (page == nullptr) {
+            return Region{0, 0};
+        }
+        memset(page, 0, kPageSize);
+        uint64_t phys = paging_virt_to_phys(reinterpret_cast<uint64_t>(page));
+        uint64_t virt = base + static_cast<uint64_t>(i) * kPageSize;
+        paging_map_page(virt, phys, PAGE_FLAG_WRITE | PAGE_FLAG_USER);
+    }
+
+    region.base = base;
+    region.length = pages * kPageSize;
+    g_next_user_code = region.base + region.length;
+    return region;
+}
+
 Stack allocate_user_stack(size_t length) {
     if (length == 0) {
         length = kPageSize;
@@ -95,4 +122,3 @@ Stack allocate_user_stack(size_t length) {
 }
 
 }  // namespace vm
-

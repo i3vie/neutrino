@@ -29,6 +29,7 @@ void init();
 enum class Result {
     Continue,
     Reschedule,
+    Unschedule
 };
 
 }  // namespace syscall

@@ -18,7 +18,7 @@ struct Stack {
 
 Region map_user_code(const uint8_t* data, size_t length,
                      uint64_t entry_offset, uint64_t& entry_point);
+Region allocate_user_region(size_t length);
 Stack allocate_user_stack(size_t length);
 
 }  // namespace vm
-

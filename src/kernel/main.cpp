@@ -483,40 +483,56 @@ constexpr size_t kInitMaxSize = 64 * 1024;
 alignas(16) static uint8_t init_buffer[kInitMaxSize];
 size_t init_size = 0;
 
-const char* init_candidates[2];
+constexpr size_t kMaxInitCandidates = 4;
+const char* init_candidates[kMaxInitCandidates];
 size_t init_candidate_count = 0;
 
 if (init_task_path_valid) {
     init_candidates[init_candidate_count++] = init_task_path;
 }
 
-char default_init_path[64] = {0};
-bool default_init_path_valid = false;
+char default_init_paths[2][64] = {{0}};
+size_t default_paths_used = 0;
 
 if (root_ptr != nullptr) {
-    string_util::copy(default_init_path, sizeof(default_init_path), root_ptr);
-    size_t len = string_util::length(default_init_path);
-    if (len + 1 < sizeof(default_init_path)) {
-        default_init_path[len++] = '/';
-        const char* fallback = "init.bin";
-        size_t fallback_len = string_util::length(fallback);
-        if (len + fallback_len < sizeof(default_init_path)) {
-            for (size_t idx = 0; idx < fallback_len; ++idx) {
-                default_init_path[len + idx] = fallback[idx];
-            }
-            default_init_path[len + fallback_len] = '\0';
-            default_init_path_valid = true;
-        } else {
+    constexpr const char* kDefaultInitFiles[] = {"init.elf", "init.bin"};
+
+    for (const char* fallback : kDefaultInitFiles) {
+        if (default_paths_used >= 2) {
+            break;
+        }
+
+        char* buffer = default_init_paths[default_paths_used];
+        string_util::copy(buffer, sizeof(default_init_paths[default_paths_used]),
+                          root_ptr);
+        size_t len = string_util::length(buffer);
+        if (len + 1 >= sizeof(default_init_paths[default_paths_used])) {
             log_message(LogLevel::Warn,
                         "Boot: init path truncated for root mount '%s'",
                         root_ptr);
+            continue;
         }
-    }
-    if (default_init_path_valid) {
-        if (!init_task_path_valid ||
-            !string_util::equals(init_task_path, default_init_path)) {
-            init_candidates[init_candidate_count++] = default_init_path;
+        buffer[len++] = '/';
+
+        size_t fallback_len = string_util::length(fallback);
+        if (len + fallback_len >= sizeof(default_init_paths[default_paths_used])) {
+            log_message(LogLevel::Warn,
+                        "Boot: init filename '%s' truncated for root mount '%s'",
+                        fallback,
+                        root_ptr);
+            continue;
         }
+        for (size_t idx = 0; idx < fallback_len; ++idx) {
+            buffer[len + idx] = fallback[idx];
+        }
+        buffer[len + fallback_len] = '\0';
+
+        bool duplicate = init_task_path_valid &&
+                         string_util::equals(init_task_path, buffer);
+        if (!duplicate && init_candidate_count < kMaxInitCandidates) {
+            init_candidates[init_candidate_count++] = buffer;
+        }
+        ++default_paths_used;
     }
 }
 
