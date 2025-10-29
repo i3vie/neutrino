@@ -4,6 +4,10 @@
 
 #include "../block_device.hpp"
 
+namespace vfs {
+struct FilesystemOps;
+}
+
 struct Fat32DirEntry {
     char name[12];
     uint8_t attributes;
@@ -23,7 +27,17 @@ struct Fat32Volume {
 };
 
 bool fat32_mount(Fat32Volume& volume, const fs::BlockDevice& device);
-size_t fat32_list_root(Fat32Volume& volume, Fat32DirEntry* out_entries,
-                       size_t max_entries);
-bool fat32_read_file(Fat32Volume& volume, const char* name, void* buffer,
-                     size_t buffer_size, size_t& out_size);
+bool fat32_list_directory(Fat32Volume& volume, uint32_t start_cluster,
+                          Fat32DirEntry* out_entries, size_t max_entries,
+                          size_t& out_count);
+bool fat32_find_entry(Fat32Volume& volume, uint32_t directory_cluster,
+                      const char* name, Fat32DirEntry& out_entry);
+bool fat32_read_file(Fat32Volume& volume, const Fat32DirEntry& entry,
+                     void* buffer, size_t buffer_size, size_t& out_size);
+bool fat32_read_file_range(Fat32Volume& volume, const Fat32DirEntry& entry,
+                           uint32_t offset, void* buffer, size_t buffer_size,
+                           size_t& out_size);
+bool fat32_get_entry_by_index(Fat32Volume& volume, uint32_t directory_cluster,
+                              size_t index, Fat32DirEntry& out_entry);
+
+const vfs::FilesystemOps& fat32_vfs_ops();

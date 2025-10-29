@@ -3,7 +3,6 @@
 #include <stdint.h>
 
 #include "../drivers/console/console.hpp"
-#include "../drivers/fs/fat32/fat32.hpp"
 #include "../drivers/fs/mount_manager.hpp"
 #include "../drivers/input/keyboard.hpp"
 #include "../drivers/interrupts/pic.hpp"
@@ -404,7 +403,7 @@ static void kernel_main_stage2() {
     }
 
     if (root_ptr != nullptr && root_ok) {
-        Fat32DirEntry entries[32];
+        vfs::DirEntry entries[32];
         size_t entry_count = 0;
         if (vfs::list(root_ptr, entries, 32, entry_count)) {
             log_message(LogLevel::Info, "VFS: %s contains %u entries", root_ptr,

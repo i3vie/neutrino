@@ -16,6 +16,14 @@ enum class SystemCall : uint64_t {
     DescriptorRead   = 6,
     DescriptorWrite  = 7,
     DescriptorClose  = 8,
+    FileOpen         = 9,
+    FileClose        = 10,
+    FileRead         = 11,
+    FileWrite        = 12,
+    DirectoryOpen    = 13,
+    DirectoryRead    = 14,
+    DirectoryClose   = 15,
+    Child            = 16,
 };
 
 Result handle_syscall(SyscallFrame& frame);

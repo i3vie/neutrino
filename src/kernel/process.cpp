@@ -27,6 +27,15 @@ void init() {
             g_process_table[i].kernel_stack_base + kKernelStackSize;
         g_process_table[i].kernel_stack_top &= ~0xFULL;
         descriptor::init_table(g_process_table[i].descriptors);
+        for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
+            g_process_table[i].file_handles[fh].in_use = false;
+            g_process_table[i].file_handles[fh].handle = {};
+            g_process_table[i].file_handles[fh].position = 0;
+        }
+        for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
+            g_process_table[i].directory_handles[dh].in_use = false;
+            g_process_table[i].directory_handles[dh].handle = {};
+        }
     }
 }
 
@@ -42,6 +51,15 @@ Process* allocate() {
         proc.cr3 = 0;
         proc.has_context = false;
         descriptor::init_table(proc.descriptors);
+        for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
+            proc.file_handles[fh].in_use = false;
+            proc.file_handles[fh].handle = {};
+            proc.file_handles[fh].position = 0;
+        }
+        for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
+            proc.directory_handles[dh].in_use = false;
+            proc.directory_handles[dh].handle = {};
+        }
         return &proc;
     }
     return nullptr;

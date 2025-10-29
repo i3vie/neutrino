@@ -5,12 +5,15 @@
 
 #include "arch/x86_64/syscall.hpp"
 #include "descriptor.hpp"
+#include "fs/vfs.hpp"
 #include "vm.hpp"
 
 namespace process {
 
 constexpr size_t kMaxProcesses = 16;
 constexpr size_t kKernelStackSize = 0x4000;
+constexpr size_t kMaxFileHandles = 16;
+constexpr size_t kMaxDirectoryHandles = 8;
 
 enum class State {
     Unused = 0,
@@ -18,6 +21,17 @@ enum class State {
     Running,
     Blocked,
     Terminated,
+};
+
+struct FileHandle {
+    bool in_use;
+    vfs::FileHandle handle;
+    uint64_t position;
+};
+
+struct DirectoryHandle {
+    bool in_use;
+    vfs::DirectoryHandle handle;
 };
 
 struct Process {
@@ -34,6 +48,8 @@ struct Process {
     Process* parent;
     bool has_context;
     descriptor::Table descriptors;
+    FileHandle file_handles[kMaxFileHandles];
+    DirectoryHandle directory_handles[kMaxDirectoryHandles];
 };
 
 void init();

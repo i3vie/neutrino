@@ -41,7 +41,7 @@ bool fat32_probe(const fs::BlockDevice& device) {
         return false;
     }
 
-    if (!vfs::register_mount(device.name, volume)) {
+    if (!vfs::register_mount(device.name, &fat32_vfs_ops(), volume)) {
         log_message(LogLevel::Warn,
                     "FAT32: failed to register VFS mount for %s",
                     device.name != nullptr ? device.name : "(unnamed)");

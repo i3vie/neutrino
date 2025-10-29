@@ -13,6 +13,25 @@ enum class SystemCall : long {
     DescriptorRead   = 6,
     DescriptorWrite  = 7,
     DescriptorClose  = 8,
+    FileOpen         = 9,
+    FileClose        = 10,
+    FileRead         = 11,
+    FileWrite        = 12,
+    DirectoryOpen    = 13,
+    DirectoryRead    = 14,
+    DirectoryClose   = 15,
+    Child            = 16,
+};
+
+enum : uint32_t {
+    DIR_ENTRY_FLAG_DIRECTORY = 1u << 0,
+};
+
+struct DirEntry {
+    char name[64];
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t size;
 };
 
 static inline long raw_syscall6(SystemCall num,
@@ -91,6 +110,10 @@ static inline long yield() {
     return raw_syscall0(SystemCall::Yield);
 }
 
+static inline long child() {
+    return raw_syscall0(SystemCall::Child);
+}
+
 // requests a descriptor of the given type. the optional parameters allow
 // callers to select a specific resource instance, request particular
 // capability bits, or pass type-specific context understood by the kernel
@@ -135,5 +158,49 @@ static inline long descriptor_write(uint32_t handle,
 
 static inline long descriptor_close(uint32_t handle) {
     return raw_syscall1(SystemCall::DescriptorClose,
+                        static_cast<long>(handle));
+}
+
+static inline long file_open(const char* path) {
+    return raw_syscall1(SystemCall::FileOpen,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long file_close(uint32_t handle) {
+    return raw_syscall1(SystemCall::FileClose,
+                        static_cast<long>(handle));
+}
+
+static inline long file_read(uint32_t handle,
+                             void* buffer,
+                             size_t length) {
+    return raw_syscall3(SystemCall::FileRead,
+                        static_cast<long>(handle),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(buffer)),
+                        static_cast<long>(length));
+}
+
+static inline long file_write(uint32_t handle,
+                              const void* buffer,
+                              size_t length) {
+    return raw_syscall3(SystemCall::FileWrite,
+                        static_cast<long>(handle),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(buffer)),
+                        static_cast<long>(length));
+}
+
+static inline long directory_open(const char* path) {
+    return raw_syscall1(SystemCall::DirectoryOpen,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long directory_read(uint32_t handle, DirEntry* out_entry) {
+    return raw_syscall2(SystemCall::DirectoryRead,
+                        static_cast<long>(handle),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(out_entry)));
+}
+
+static inline long directory_close(uint32_t handle) {
+    return raw_syscall1(SystemCall::DirectoryClose,
                         static_cast<long>(handle));
 }
