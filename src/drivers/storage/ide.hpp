@@ -33,3 +33,7 @@ const char* ide_device_name(IdeDeviceId device);
 IdeStatus ide_read_sectors(IdeDeviceId device, uint32_t lba, uint8_t sector_count,
                            void* buffer);
 IdeStatus ide_read_sectors(uint32_t lba, uint8_t sector_count, void* buffer);
+IdeStatus ide_write_sectors(IdeDeviceId device, uint32_t lba,
+                            uint8_t sector_count, const void* buffer);
+IdeStatus ide_write_sectors(uint32_t lba, uint8_t sector_count,
+                            const void* buffer);

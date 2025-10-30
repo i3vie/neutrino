@@ -156,6 +156,17 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
             return Result::Continue;
         }
+        case SystemCall::FileCreate: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            int32_t handle = file_io::create_file(*proc, path);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
         case SystemCall::DirectoryOpen: {
             process::Process* proc = process::current();
             if (proc == nullptr) {

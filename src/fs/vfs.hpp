@@ -41,11 +41,20 @@ struct FilesystemOps {
                       const char* path,
                       void*& out_file_context,
                       DirEntry* out_metadata);
+    bool (*create_file)(void* fs_context,
+                        const char* path,
+                        void*& out_file_context,
+                        DirEntry* out_metadata);
     bool (*read_file)(void* file_context,
                       uint64_t offset,
                       void* buffer,
                       size_t buffer_size,
                       size_t& out_size);
+    bool (*write_file)(void* file_context,
+                       uint64_t offset,
+                       const void* buffer,
+                       size_t buffer_size,
+                       size_t& out_size);
     void (*close_file)(void* file_context);
     bool (*open_directory)(void* fs_context,
                            const char* path,
@@ -70,16 +79,21 @@ bool read_file(const char* path,
                size_t& out_size);
 
 bool open_file(const char* path, FileHandle& out_handle);
+bool create_file(const char* path, FileHandle& out_handle);
 void close_file(FileHandle& handle);
 bool read_file(FileHandle& handle,
                uint64_t offset,
                void* buffer,
                size_t buffer_size,
                size_t& out_size);
+bool write_file(FileHandle& handle,
+                uint64_t offset,
+                const void* buffer,
+                size_t buffer_size,
+                size_t& out_size);
 
 bool open_directory(const char* path, DirectoryHandle& out_handle);
 bool read_directory(DirectoryHandle& handle, DirEntry& out_entry);
 void close_directory(DirectoryHandle& handle);
 
 }  // namespace vfs
-

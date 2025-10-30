@@ -245,6 +245,45 @@ bool open_file(const char* path, FileHandle& out_handle) {
     return true;
 }
 
+bool create_file(const char* path, FileHandle& out_handle) {
+    out_handle = {};
+
+    const char* remainder = nullptr;
+    MountEntry* mount = find_mount_for_path(path, remainder);
+    if (mount == nullptr) {
+        log_message(LogLevel::Warn,
+                    "VFS: mount not found for path '%s'",
+                    (path != nullptr) ? path : "(null)");
+        return false;
+    }
+
+    if (mount->ops == nullptr || mount->ops->create_file == nullptr ||
+        mount->ops->read_file == nullptr || mount->ops->write_file == nullptr ||
+        mount->ops->close_file == nullptr) {
+        return false;
+    }
+
+    const char* relative = normalize_relative_path(remainder);
+    if (relative == nullptr || *relative == '\0') {
+        return false;
+    }
+
+    DirEntry metadata{};
+    void* file_context = nullptr;
+    if (!mount->ops->create_file(mount->fs_context,
+                                 relative,
+                                 file_context,
+                                 &metadata)) {
+        return false;
+    }
+
+    out_handle.ops = mount->ops;
+    out_handle.fs_context = mount->fs_context;
+    out_handle.file_context = file_context;
+    out_handle.size = metadata.size;
+    return true;
+}
+
 void close_file(FileHandle& handle) {
     if (handle.ops != nullptr && handle.ops->close_file != nullptr &&
         handle.file_context != nullptr) {
@@ -268,6 +307,31 @@ bool read_file(FileHandle& handle,
                                  buffer,
                                  buffer_size,
                                  out_size);
+}
+
+bool write_file(FileHandle& handle,
+                uint64_t offset,
+                const void* buffer,
+                size_t buffer_size,
+                size_t& out_size) {
+    out_size = 0;
+    if (handle.ops == nullptr || handle.ops->write_file == nullptr ||
+        handle.file_context == nullptr || buffer == nullptr) {
+        return false;
+    }
+    if (!handle.ops->write_file(handle.file_context,
+                                offset,
+                                buffer,
+                                buffer_size,
+                                out_size)) {
+        return false;
+    }
+
+    uint64_t end_offset = offset + static_cast<uint64_t>(out_size);
+    if (end_offset > handle.size) {
+        handle.size = end_offset;
+    }
+    return true;
 }
 
 bool open_directory(const char* path, DirectoryHandle& out_handle) {

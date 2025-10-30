@@ -94,6 +94,33 @@ int32_t open_file(process::Process& proc, const char* path) {
     return slot;
 }
 
+int32_t create_file(process::Process& proc, const char* path) {
+    char local_path[kMaxPathLength];
+    if (!copy_path(path, local_path)) {
+        return -1;
+    }
+
+    int32_t slot = allocate_file_handle(proc);
+    if (slot < 0) {
+        log_message(LogLevel::Warn,
+                    "FileIO: no free file handles for process %u",
+                    static_cast<unsigned int>(proc.pid));
+        return -1;
+    }
+
+    vfs::FileHandle vfs_handle{};
+    if (!vfs::create_file(local_path, vfs_handle)) {
+        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
+        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        return -1;
+    }
+
+    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    handle.handle = vfs_handle;
+    handle.position = 0;
+    return slot;
+}
+
 bool close_file(process::Process& proc, uint32_t handle) {
     process::FileHandle* entry = get_file_handle(proc, handle);
     if (entry == nullptr) {
@@ -132,13 +159,32 @@ int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
     return static_cast<int64_t>(out_size);
 }
 
-int64_t write_file(process::Process& proc, uint32_t handle, uint64_t,
-                   uint64_t) {
-    (void)proc;
-    (void)handle;
-    log_message(LogLevel::Warn,
-                "FileIO: write not supported on current filesystem backend");
-    return -1;
+int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
+                   uint64_t length) {
+    process::FileHandle* entry = get_file_handle(proc, handle);
+    if (entry == nullptr) {
+        return -1;
+    }
+    if (length == 0) {
+        return 0;
+    }
+
+    size_t requested =
+        (length > static_cast<uint64_t>(SIZE_MAX))
+            ? static_cast<size_t>(SIZE_MAX)
+            : static_cast<size_t>(length);
+    const void* buffer = reinterpret_cast<const void*>(user_addr);
+    size_t out_size = 0;
+    if (!vfs::write_file(entry->handle,
+                         entry->position,
+                         buffer,
+                         requested,
+                         out_size)) {
+        return -1;
+    }
+
+    entry->position += static_cast<uint64_t>(out_size);
+    return static_cast<int64_t>(out_size);
 }
 
 int32_t open_directory(process::Process& proc, const char* path) {

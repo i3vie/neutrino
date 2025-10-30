@@ -17,10 +17,11 @@ enum class SystemCall : long {
     FileClose        = 10,
     FileRead         = 11,
     FileWrite        = 12,
-    DirectoryOpen    = 13,
-    DirectoryRead    = 14,
-    DirectoryClose   = 15,
-    Child            = 16,
+    FileCreate       = 13,
+    DirectoryOpen    = 14,
+    DirectoryRead    = 15,
+    DirectoryClose   = 16,
+    Child            = 17,
 };
 
 enum : uint32_t {
@@ -191,6 +192,11 @@ static inline long file_write(uint32_t handle,
 
 static inline long directory_open(const char* path) {
     return raw_syscall1(SystemCall::DirectoryOpen,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long file_create(const char* path) {
+    return raw_syscall1(SystemCall::FileCreate,
                         static_cast<long>(reinterpret_cast<uintptr_t>(path)));
 }
 

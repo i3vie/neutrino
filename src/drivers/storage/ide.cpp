@@ -21,6 +21,7 @@ constexpr uint16_t ATA_REG_STATUS = 0x07;
 
 constexpr uint8_t ATA_CMD_IDENTIFY = 0xEC;
 constexpr uint8_t ATA_CMD_READ_SECTORS = 0x20;
+constexpr uint8_t ATA_CMD_WRITE_SECTORS = 0x30;
 
 constexpr uint8_t ATA_SR_BSY = 0x80;
 constexpr uint8_t ATA_SR_DRDY = 0x40;
@@ -124,6 +125,13 @@ void read_data(IdeDeviceId device, uint16_t* buffer, size_t words) {
     const auto& desc = device_desc(device);
     for (size_t i = 0; i < words; ++i) {
         buffer[i] = inw(desc.io_base + ATA_REG_DATA);
+    }
+}
+
+void write_data(IdeDeviceId device, const uint16_t* buffer, size_t words) {
+    const auto& desc = device_desc(device);
+    for (size_t i = 0; i < words; ++i) {
+        outw(desc.io_base + ATA_REG_DATA, buffer[i]);
     }
 }
 
@@ -327,4 +335,72 @@ IdeStatus ide_read_sectors(uint32_t lba, uint8_t sector_count,
                            void* buffer) {
     return ide_read_sectors(IdeDeviceId::PrimaryMaster, lba, sector_count,
                             buffer);
+}
+
+IdeStatus ide_write_sectors(IdeDeviceId device, uint32_t lba,
+                            uint8_t sector_count, const void* buffer) {
+    if (!identify_device(device)) {
+        return IdeStatus::NoDevice;
+    }
+    if (!device_state(device).identify.present) {
+        return IdeStatus::NoDevice;
+    }
+    if (sector_count == 0) {
+        sector_count = 1;
+    }
+
+    uint32_t max_sector = device_state(device).identify.sector_count;
+    if (max_sector != 0) {
+        uint64_t last_lba =
+            static_cast<uint64_t>(lba) + static_cast<uint64_t>(sector_count);
+        if (lba >= max_sector || last_lba > max_sector) {
+            log_message(LogLevel::Warn,
+                        "IDE %s: write beyond device size (lba=%u count=%u max=%u)",
+                        device_name(device), lba, sector_count, max_sector);
+            return IdeStatus::IoError;
+        }
+    }
+
+    const auto& desc = device_desc(device);
+    const uint16_t* buffer_words = static_cast<const uint16_t*>(buffer);
+
+    if (!wait_not_busy(device)) {
+        return IdeStatus::Busy;
+    }
+
+    io_write8(desc, ATA_REG_HDDEVSEL,
+              select_lba_prefix(desc) | ((lba >> 24) & 0x0F));
+    io_wait();
+    io_write8(desc, ATA_REG_SECCOUNT0, sector_count);
+    io_write8(desc, ATA_REG_LBA0, static_cast<uint8_t>(lba));
+    io_write8(desc, ATA_REG_LBA1, static_cast<uint8_t>(lba >> 8));
+    io_write8(desc, ATA_REG_LBA2, static_cast<uint8_t>(lba >> 16));
+
+    io_write8(desc, ATA_REG_COMMAND, ATA_CMD_WRITE_SECTORS);
+
+    for (uint8_t sector = 0; sector < sector_count; ++sector) {
+        if (!wait_not_busy(device)) {
+            return IdeStatus::Busy;
+        }
+        if (!wait_drq(device)) {
+            return IdeStatus::IoError;
+        }
+
+        write_data(device, buffer_words + (sector * 256), 256);
+        io_wait();
+    }
+
+    if (!wait_not_busy(device)) {
+        return IdeStatus::Busy;
+    }
+
+    return IdeStatus::Ok;
+}
+
+IdeStatus ide_write_sectors(uint32_t lba, uint8_t sector_count,
+                            const void* buffer) {
+    return ide_write_sectors(IdeDeviceId::PrimaryMaster,
+                             lba,
+                             sector_count,
+                             buffer);
 }

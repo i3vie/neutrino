@@ -56,6 +56,24 @@ fs::BlockIoStatus ide_partition_read(void* context, uint32_t lba,
     }
 }
 
+fs::BlockIoStatus ide_partition_write(void* context, uint32_t lba,
+                                      uint8_t count, const void* buffer) {
+    auto* ctx = static_cast<IdePartitionContext*>(context);
+    uint32_t absolute_lba = ctx->lba_base + lba;
+    IdeStatus status =
+        ide_write_sectors(ctx->device, absolute_lba, count, buffer);
+    switch (status) {
+        case IdeStatus::Ok:
+            return fs::BlockIoStatus::Ok;
+        case IdeStatus::Busy:
+            return fs::BlockIoStatus::Busy;
+        case IdeStatus::NoDevice:
+            return fs::BlockIoStatus::NoDevice;
+        default:
+            return fs::BlockIoStatus::IoError;
+    }
+}
+
 uint32_t read_u32_le(const uint8_t* data) {
     return static_cast<uint32_t>(data[0]) |
            (static_cast<uint32_t>(data[1]) << 8) |
@@ -224,6 +242,7 @@ size_t enumerate_ide_devices(fs::BlockDevice* out_devices,
             device.sector_size = 512;
             device.sector_count = sector_count;
             device.read = ide_partition_read;
+            device.write = ide_partition_write;
             device.context = &context;
 
             ++device_count;

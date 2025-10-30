@@ -18,7 +18,8 @@ PROGRAM_OUTPUT := $(PROG_DIR)/$(PROGRAM).elf
 # shared tool flags
 ASFLAGS  := -f elf64
 PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
-                    -m64 -fPIE -pie -Wall -Wextra -I$(CRT_DIR)
+                    -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
+                    -fPIE -pie -Wall -Wextra -I$(CRT_DIR)
 
 # deployment configuration (override as needed)
 HDD_IMAGE ?= ../hdd.img

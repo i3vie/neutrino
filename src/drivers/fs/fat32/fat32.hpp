@@ -13,6 +13,8 @@ struct Fat32DirEntry {
     uint8_t attributes;
     uint32_t first_cluster;
     uint32_t size;
+    uint32_t directory_cluster;
+    uint32_t raw_entry_index;
 };
 
 struct Fat32Volume {
@@ -24,6 +26,11 @@ struct Fat32Volume {
     uint32_t fat_begin_lba;
     uint32_t cluster_begin_lba;
     uint32_t root_dir_first_cluster;
+    uint32_t num_fats;
+    uint32_t total_sectors;
+    uint32_t fs_info_sector;
+    uint32_t total_clusters;
+    uint32_t next_free_cluster;
 };
 
 bool fat32_mount(Fat32Volume& volume, const fs::BlockDevice& device);

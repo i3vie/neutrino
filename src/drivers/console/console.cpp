@@ -63,6 +63,23 @@ void Console::putc(char c) {
         if ((cursor_y + 1) * 8 * scale >= fb->height) scroll();
         return;
     }
+    if (c == '\r') {
+        cursor_x = 0;
+        return;
+    }
+    if (c == '\b') {
+        if (cursor_x > 0) {
+            cursor_x--;
+        } else if (cursor_y > 0) {
+            size_t max_cols = fb->width / (8 * scale);
+            if (max_cols > 0) {
+                cursor_y--;
+                cursor_x = max_cols - 1;
+            }
+        }
+        draw_char(' ', cursor_x, cursor_y);
+        return;
+    }
 
     draw_char(c, cursor_x, cursor_y);
     cursor_x++;
