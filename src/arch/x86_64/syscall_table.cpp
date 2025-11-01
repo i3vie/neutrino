@@ -5,6 +5,7 @@
 #include "../../kernel/file_io.hpp"
 #include "../../kernel/loader.hpp"
 #include "../../kernel/process.hpp"
+#include "../../kernel/path_util.hpp"
 #include "../../kernel/scheduler.hpp"
 #include "../../fs/vfs.hpp"
 #include "../../lib/mem.hpp"
@@ -19,6 +20,39 @@ constexpr uint64_t kAbiMinor = 1;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
+
+uint64_t place_args_on_stack(process::Process& child, const char* args) {
+    if (args == nullptr) {
+        return 0;
+    }
+    size_t len = string_util::length(args);
+    if (len == 0) {
+        return 0;
+    }
+
+    uint64_t base = child.stack_region.base;
+    uint64_t top = child.stack_region.top;
+    if (top <= base + 1) {
+        return 0;
+    }
+
+    uint64_t available = top - base;
+    if (available <= 1) {
+        return 0;
+    }
+
+    if (len + 1 > static_cast<size_t>(available)) {
+        len = static_cast<size_t>(available) - 1;
+    }
+
+    uint64_t dest = top - static_cast<uint64_t>(len + 1);
+    char* dest_ptr = reinterpret_cast<char*>(dest);
+    for (size_t i = 0; i < len; ++i) {
+        dest_ptr[i] = args[i];
+    }
+    dest_ptr[len] = '\0';
+    return dest;
+}
 
 bool load_program_image(const char* path, loader::ProgramImage& out_image) {
     if (path == nullptr) {
@@ -227,9 +261,34 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            const char* path_user = reinterpret_cast<const char*>(frame.rdi);
+            const char* args = reinterpret_cast<const char*>(frame.rsi);
+            uint64_t flags = frame.rdx;
+            const char* cwd_user = reinterpret_cast<const char*>(frame.r10);
+
+            if (path_user == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            size_t path_len = string_util::length(path_user);
+            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char path_input[path_util::kMaxPathLength];
+            char resolved_exec[path_util::kMaxPathLength];
+            string_util::copy(path_input, sizeof(path_input), path_user);
+            if (!path_util::build_absolute_path(proc->cwd,
+                                                path_input,
+                                                resolved_exec)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
             loader::ProgramImage image{};
-            if (!load_program_image(path, image)) {
+            if (!load_program_image(resolved_exec, image)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -244,6 +303,24 @@ Result handle_syscall(SyscallFrame& frame) {
             child->waiting_on = nullptr;
             child->exit_code = 0;
             child->has_exited = false;
+            char child_cwd_buffer[path_util::kMaxPathLength];
+            bool child_cwd_valid = false;
+            if (cwd_user != nullptr) {
+                size_t cwd_len = string_util::length(cwd_user);
+                if (cwd_len > 0 && cwd_len < path_util::kMaxPathLength) {
+                    char cwd_input[path_util::kMaxPathLength];
+                    string_util::copy(cwd_input, sizeof(cwd_input), cwd_user);
+                    child_cwd_valid = path_util::build_absolute_path(proc->cwd,
+                                                                     cwd_input,
+                                                                     child_cwd_buffer);
+                }
+            }
+            if (!child_cwd_valid) {
+                string_util::copy(child_cwd_buffer,
+                                  sizeof(child_cwd_buffer),
+                                  proc->cwd);
+            }
+            string_util::copy(child->cwd, sizeof(child->cwd), child_cwd_buffer);
 
             if (!loader::load_into_process(image, *child)) {
                 child->state = process::State::Unused;
@@ -254,11 +331,25 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
+            uint64_t arg_ptr = place_args_on_stack(*child, args);
+
+            memset(&child->context, 0, sizeof(child->context));
+            child->context.user_rip = child->user_ip;
+            child->context.user_rsp = child->user_sp;
+            child->context.user_rflags = 0x202;
+            child->context.r11 = 0x202;
+            child->context.rdi = arg_ptr;
+            child->context.rsi = flags;
+            child->context.rax = 0;
+            child->has_context = true;
+
             child->state = process::State::Ready;
             scheduler::enqueue(child);
 
             proc->waiting_on = child;
             proc->state = process::State::Blocked;
+            bool transferred = descriptor::transfer_console_owner(*proc, *child);
+            proc->console_transferred = transferred;
             frame.rax = 0;
             return Result::Reschedule;
         }
@@ -269,13 +360,35 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            const char* path_user = reinterpret_cast<const char*>(frame.rdi);
             const char* args = reinterpret_cast<const char*>(frame.rsi);
             uint64_t flags = frame.rdx;
+            const char* cwd_user = reinterpret_cast<const char*>(frame.r10);
             (void)flags;
 
+            if (path_user == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            size_t path_len = string_util::length(path_user);
+            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char path_input[path_util::kMaxPathLength];
+            char resolved_exec[path_util::kMaxPathLength];
+            string_util::copy(path_input, sizeof(path_input), path_user);
+            if (!path_util::build_absolute_path(proc->cwd,
+                                                path_input,
+                                                resolved_exec)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
             loader::ProgramImage image{};
-            if (!load_program_image(path, image)) {
+            if (!load_program_image(resolved_exec, image)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -290,6 +403,24 @@ Result handle_syscall(SyscallFrame& frame) {
             child->waiting_on = nullptr;
             child->exit_code = 0;
             child->has_exited = false;
+            char child_cwd_buffer[path_util::kMaxPathLength];
+            bool child_cwd_valid = false;
+            if (cwd_user != nullptr) {
+                size_t cwd_len = string_util::length(cwd_user);
+                if (cwd_len > 0 && cwd_len < path_util::kMaxPathLength) {
+                    char cwd_input[path_util::kMaxPathLength];
+                    string_util::copy(cwd_input, sizeof(cwd_input), cwd_user);
+                    child_cwd_valid = path_util::build_absolute_path(proc->cwd,
+                                                                     cwd_input,
+                                                                     child_cwd_buffer);
+                }
+            }
+            if (!child_cwd_valid) {
+                string_util::copy(child_cwd_buffer,
+                                  sizeof(child_cwd_buffer),
+                                  proc->cwd);
+            }
+            string_util::copy(child->cwd, sizeof(child->cwd), child_cwd_buffer);
 
             if (!loader::load_into_process(image, *child)) {
                 child->state = process::State::Unused;
@@ -299,18 +430,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            uint64_t arg_ptr = 0;
-            if (args != nullptr && args[0] != '\0' &&
-                child->stack_region.top > child->stack_region.base) {
-                size_t arg_len = string_util::length(args);
-                size_t total = arg_len + 1;
-                uint64_t available = child->stack_region.top - child->stack_region.base;
-                if (total < available) {
-                    uint64_t dest = child->stack_region.top - static_cast<uint64_t>(total);
-                    memcpy(reinterpret_cast<void*>(dest), args, total);
-                    arg_ptr = dest;
-                }
-            }
+            uint64_t arg_ptr = place_args_on_stack(*child, args);
 
             memset(&child->context, 0, sizeof(child->context));
             child->context.user_rip = child->user_ip;
@@ -326,6 +446,39 @@ Result handle_syscall(SyscallFrame& frame) {
             scheduler::enqueue(child);
 
             frame.rax = static_cast<uint64_t>(child->pid);
+            return Result::Continue;
+        }
+        case SystemCall::ProcessSetCwd: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            const char* path_user = reinterpret_cast<const char*>(frame.rdi);
+            if (path_user == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            size_t path_len = string_util::length(path_user);
+            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char path_input[path_util::kMaxPathLength];
+            char resolved[path_util::kMaxPathLength];
+            string_util::copy(path_input, sizeof(path_input), path_user);
+            if (!path_util::build_absolute_path(proc->cwd,
+                                                path_input,
+                                                resolved)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            string_util::copy(proc->cwd, sizeof(proc->cwd), resolved);
+            frame.rax = 0;
             return Result::Continue;
         }
         case SystemCall::DirectoryOpen: {

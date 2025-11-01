@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "../../kernel/scheduler.hpp"
+#include "../../kernel/descriptor.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/syscall_table.hpp"
@@ -63,6 +64,10 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
                     parent->waiting_on = nullptr;
                     parent->context.rax = proc->exit_code;
                     parent->state = process::State::Ready;
+                    if (parent->console_transferred) {
+                        descriptor::restore_console_owner(*parent);
+                        parent->console_transferred = false;
+                    }
                     scheduler::enqueue(parent);
                 }
                 proc->parent = nullptr;

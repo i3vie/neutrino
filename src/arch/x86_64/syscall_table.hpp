@@ -21,10 +21,12 @@ enum class SystemCall : uint64_t {
     FileRead         = 11,
     FileWrite        = 12,
     FileCreate       = 13,
-    DirectoryOpen    = 14,
-    DirectoryRead    = 15,
-    DirectoryClose   = 16,
-    Child            = 17,
+    ProcessExec      = 14,
+    Child            = 15,
+    ProcessSetCwd    = 16,
+    DirectoryOpen    = 17,
+    DirectoryRead    = 18,
+    DirectoryClose   = 19,
 };
 
 Result handle_syscall(SyscallFrame& frame);
