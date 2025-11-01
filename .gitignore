@@ -3,6 +3,7 @@
 out/
 build/
 userspace/programs/**/**.elf
+userspace/binary/
 
 # drive images
 /*.img
