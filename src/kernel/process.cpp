@@ -30,6 +30,9 @@ void init() {
         g_process_table[i].waiting_on = nullptr;
         g_process_table[i].exit_code = 0;
         g_process_table[i].has_exited = false;
+        g_process_table[i].console_transferred = false;
+        g_process_table[i].cwd[0] = '/';
+        g_process_table[i].cwd[1] = '\0';
         descriptor::init_table(g_process_table[i].descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             g_process_table[i].file_handles[fh].in_use = false;
@@ -58,6 +61,9 @@ Process* allocate() {
         proc.waiting_on = nullptr;
         proc.exit_code = 0;
         proc.has_exited = false;
+        proc.console_transferred = false;
+        proc.cwd[0] = '/';
+        proc.cwd[1] = '\0';
         descriptor::init_table(proc.descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             proc.file_handles[fh].in_use = false;

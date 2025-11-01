@@ -172,7 +172,12 @@ void reschedule(syscall::SyscallFrame& frame) {
     }
 
     if (!terminated) {
-        enqueue(current_proc);
+        if (current_proc->state == process::State::Running) {
+            current_proc->state = process::State::Ready;
+        }
+        if (current_proc->state == process::State::Ready) {
+            enqueue(current_proc);
+        }
     }
 
     process::Process* next = queue_pop();

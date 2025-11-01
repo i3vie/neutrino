@@ -70,6 +70,9 @@ bool register_type(uint32_t type, OpenFn open, const Ops* ops);
 void init();
 void register_builtin_types();
 
+bool transfer_console_owner(process::Process& from, process::Process& to);
+void restore_console_owner(process::Process& proc);
+
 void init_table(Table& table);
 void destroy_table(process::Process& proc, Table& table);
 

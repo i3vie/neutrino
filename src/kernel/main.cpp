@@ -8,6 +8,7 @@
 #include "../drivers/interrupts/pic.hpp"
 #include "../drivers/limine/limine_requests.hpp"
 #include "../drivers/log/logging.hpp"
+#include "../drivers/pci/pci.hpp"
 #include "../drivers/timer/pit.hpp"
 #include "../fs/vfs.hpp"
 #include "arch/x86_64/gdt.hpp"
@@ -274,6 +275,10 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Info, "Initializing paging");
     paging_init();
     log_message(LogLevel::Info, "Paging initialized");
+
+    log_message(LogLevel::Info, "Initializing PCI subsystem");
+    pci::init();
+    log_message(LogLevel::Info, "PCI subsystem initialized");
 
     vfs::init();
 

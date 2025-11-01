@@ -44,12 +44,14 @@ struct Process {
     uint64_t kernel_stack_top;
     vm::Region code_region;
     vm::Stack stack_region;
-   syscall::SyscallFrame context;
+    syscall::SyscallFrame context;
     Process* parent;
     Process* waiting_on;
     uint16_t exit_code;
     bool has_exited;
+    bool console_transferred;
     bool has_context;
+    char cwd[128];
     descriptor::Table descriptors;
     FileHandle file_handles[kMaxFileHandles];
     DirectoryHandle directory_handles[kMaxDirectoryHandles];

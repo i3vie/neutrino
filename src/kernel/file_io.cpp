@@ -6,11 +6,10 @@
 #include "drivers/log/logging.hpp"
 #include "fs/vfs.hpp"
 #include "lib/mem.hpp"
+#include "path_util.hpp"
 #include "string_util.hpp"
 
 namespace {
-
-constexpr size_t kMaxPathLength = 128;
 
 process::FileHandle* get_file_handle(process::Process& proc, uint32_t handle) {
     if (handle >= process::kMaxFileHandles) {
@@ -52,15 +51,21 @@ int32_t allocate_directory_handle(process::Process& proc) {
     return -1;
 }
 
-bool copy_path(const char* user_path, char (&out)[kMaxPathLength]) {
+bool copy_path(process::Process& proc,
+               const char* user_path,
+               char (&out)[path_util::kMaxPathLength]) {
     if (user_path == nullptr) {
         return false;
     }
-    string_util::copy(out, sizeof(out), user_path);
-    if (out[0] == '\0') {
+
+    size_t input_len = string_util::length(user_path);
+    if (input_len == 0 || input_len >= path_util::kMaxPathLength) {
         return false;
     }
-    return true;
+
+    char temp[path_util::kMaxPathLength];
+    string_util::copy(temp, sizeof(temp), user_path);
+    return path_util::build_absolute_path(proc.cwd, temp, out);
 }
 
 }  // namespace
@@ -68,8 +73,8 @@ bool copy_path(const char* user_path, char (&out)[kMaxPathLength]) {
 namespace file_io {
 
 int32_t open_file(process::Process& proc, const char* path) {
-    char local_path[kMaxPathLength];
-    if (!copy_path(path, local_path)) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
         return -1;
     }
 
@@ -95,8 +100,8 @@ int32_t open_file(process::Process& proc, const char* path) {
 }
 
 int32_t create_file(process::Process& proc, const char* path) {
-    char local_path[kMaxPathLength];
-    if (!copy_path(path, local_path)) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
         return -1;
     }
 
@@ -188,8 +193,8 @@ int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
 }
 
 int32_t open_directory(process::Process& proc, const char* path) {
-    char local_path[kMaxPathLength];
-    if (!copy_path(path, local_path)) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
         return -1;
     }
 

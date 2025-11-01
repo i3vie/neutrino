@@ -207,29 +207,88 @@ size_t format_message(char* out, size_t capacity, const char* fmt,
             ++fmt;
         }
 
-        bool pad16 = false;
-        if (zero_pad && width == 16 && *fmt == 'x') {
-            pad16 = true;
-            width = 0;  // handled separately
+        char length = '\0';
+        if (*fmt == 'z' || *fmt == 'l') {
+            length = *fmt++;
+            if (length == 'l' && *fmt == 'l') {
+                length = 'L';
+                ++fmt;
+            }
         }
 
         char spec = *fmt++;
+        bool pad16 = false;
+        if (zero_pad && width == 16 && spec == 'x') {
+            pad16 = true;
+            width = 0;  // handled separately
+        }
         switch (spec) {
             case 's':
                 append_string(cursor, end, va_arg(args, const char*));
                 break;
             case 'd':
-            case 'i':
-                append_signed(cursor, end, va_arg(args, int), width,
+            case 'i': {
+                long long value = 0;
+                switch (length) {
+                    case 'z':
+                        value = static_cast<long long>(va_arg(args, long));
+                        break;
+                    case 'l':
+                        value = va_arg(args, long);
+                        break;
+                    case 'L':
+                        value = va_arg(args, long long);
+                        break;
+                    default:
+                        value = va_arg(args, int);
+                        break;
+                }
+                append_signed(cursor, end, value, width,
                               zero_pad ? '0' : ' ');
                 break;
-            case 'u':
-                append_unsigned(cursor, end, va_arg(args, unsigned int), width,
+            }
+            case 'u': {
+                uint64_t value = 0;
+                switch (length) {
+                    case 'z':
+                        value = static_cast<uint64_t>(va_arg(args, size_t));
+                        break;
+                    case 'l':
+                        value = static_cast<uint64_t>(va_arg(
+                            args, unsigned long));
+                        break;
+                    case 'L':
+                        value = va_arg(args, unsigned long long);
+                        break;
+                    default:
+                        value =
+                            static_cast<uint64_t>(va_arg(args, unsigned int));
+                        break;
+                }
+                append_unsigned(cursor, end, value, width,
                                 zero_pad ? '0' : ' ');
                 break;
-            case 'x':
-                append_hex(cursor, end, va_arg(args, unsigned long long), pad16);
+            }
+            case 'x': {
+                uint64_t value = 0;
+                switch (length) {
+                    case 'z':
+                        value = static_cast<uint64_t>(va_arg(args, size_t));
+                        break;
+                    case 'l':
+                        value = static_cast<uint64_t>(va_arg(
+                            args, unsigned long));
+                        break;
+                    case 'L':
+                        value = va_arg(args, unsigned long long);
+                        break;
+                    default:
+                        value = va_arg(args, unsigned long long);
+                        break;
+                }
+                append_hex(cursor, end, value, pad16);
                 break;
+            }
             case 'p':
                 append_hex(cursor, end, va_arg(args, unsigned long long), true);
                 break;

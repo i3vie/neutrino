@@ -181,6 +181,20 @@ bool open_keyboard(process::Process&,
 
 }  // namespace
 
+bool transfer_console_owner(process::Process& from, process::Process& to) {
+    if (g_console_owner != &from) {
+        return false;
+    }
+    g_console_owner = &to;
+    g_console_refcount = 0;
+    return true;
+}
+
+void restore_console_owner(process::Process& proc) {
+    g_console_owner = &proc;
+    g_console_refcount = 1;
+}
+
 void register_builtin_types() {
     if (!register_type(kTypeConsole, open_console, &kConsoleOps)) {
         log_message(LogLevel::Warn,
