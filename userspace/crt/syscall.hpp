@@ -18,10 +18,12 @@ enum class SystemCall : long {
     FileRead         = 11,
     FileWrite        = 12,
     FileCreate       = 13,
-    DirectoryOpen    = 14,
-    DirectoryRead    = 15,
-    DirectoryClose   = 16,
-    Child            = 17,
+    ProcessExec      = 14,
+    Child            = 15,
+    ProcessSetCwd    = 16,
+    DirectoryOpen    = 17,
+    DirectoryRead    = 18,
+    DirectoryClose   = 19,
 };
 
 enum : uint32_t {
@@ -111,8 +113,15 @@ static inline long yield() {
     return raw_syscall0(SystemCall::Yield);
 }
 
-static inline long child() {
-    return raw_syscall0(SystemCall::Child);
+static inline long child(const char* path,
+                         const char* args,
+                         uint64_t flags,
+                         const char* cwd) {
+    return raw_syscall4(SystemCall::Child,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(args)),
+                        static_cast<long>(flags),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(cwd)));
 }
 
 // requests a descriptor of the given type. the optional parameters allow
@@ -188,6 +197,22 @@ static inline long file_write(uint32_t handle,
                         static_cast<long>(handle),
                         static_cast<long>(reinterpret_cast<uintptr_t>(buffer)),
                         static_cast<long>(length));
+}
+
+static inline long exec(const char* path,
+                        const char* args,
+                        uint64_t flags,
+                        const char* cwd) {
+    return raw_syscall4(SystemCall::ProcessExec,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(args)),
+                        static_cast<long>(flags),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(cwd)));
+}
+
+static inline long setcwd(const char* path) {
+    return raw_syscall1(SystemCall::ProcessSetCwd,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
 }
 
 static inline long directory_open(const char* path) {

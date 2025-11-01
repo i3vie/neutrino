@@ -9,34 +9,32 @@ SUDO     ?= sudo
 CRT_DIR  := crt
 OBJ_DIR  := build
 PROG_DIR := programs
+BIN_DIR  := binary
 
-# default program to build/install (override via `make PROGRAM=foo`)
-PROGRAM        ?= shell
-PROGRAM_SRC    := $(PROG_DIR)/$(PROGRAM).cpp
-PROGRAM_OUTPUT := $(PROG_DIR)/$(PROGRAM).elf
+PROGRAMS := shell ls cat
+PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
-# shared tool flags
 ASFLAGS  := -f elf64
 PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
                     -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
                     -fPIE -pie -Wall -Wextra -I$(CRT_DIR)
 
-# deployment configuration (override as needed)
 HDD_IMAGE ?= ../hdd.img
 MOUNT_DIR ?= $(HOME)/MountedImage
-INIT_ELF  ?= init.elf
 
-.PHONY: all clean install-init
+.PHONY: all clean install
 
-all: $(PROGRAM_OUTPUT)
+all: $(PROGRAM_OUTPUTS)
 
 $(OBJ_DIR)/crt0.o: $(CRT_DIR)/crt0.s $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(NASM) $(ASFLAGS) $< -o $@
 
-$(PROGRAM_OUTPUT): $(PROGRAM_SRC) $(OBJ_DIR)/crt0.o | $(PROG_DIR)
-	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(PROGRAM_SRC) -o $@
+$(PROG_DIR)/%.elf: $(PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o | $(PROG_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $< -o $@
+	@mkdir -p $(BIN_DIR)
+	@cp $@ $(BIN_DIR)/$*.elf
 
-install-init: $(PROGRAM_OUTPUT)
+install: all
 	@set -euo pipefail; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)"; \
 	mounted=0; \
@@ -44,7 +42,14 @@ install-init: $(PROGRAM_OUTPUT)
 	trap cleanup EXIT INT TERM; \
 	$(SUDO) mount -o loop,rw "$(HDD_IMAGE)" "$(MOUNT_DIR)"; \
 	mounted=1; \
-	$(SUDO) cp -f "$<" "$(MOUNT_DIR)/$(INIT_ELF)"; \
+	$(SUDO) rm -rf "$(MOUNT_DIR)/binary"; \
+	$(SUDO) mkdir -p "$(MOUNT_DIR)/binary"; \
+	for prog in $(PROGRAMS); do \
+		$(SUDO) install -m 0644 "$(PROG_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
+	done; \
+	if [[ -f "$(PROG_DIR)/shell.elf" ]]; then \
+		$(SUDO) install -m 0644 "$(PROG_DIR)/shell.elf" "$(MOUNT_DIR)/init.elf"; \
+	fi; \
 	sync
 
 $(OBJ_DIR):
@@ -54,4 +59,4 @@ $(PROG_DIR):
 	mkdir -p $(PROG_DIR)
 
 clean:
-	rm -rf $(OBJ_DIR) $(PROGRAM_OUTPUT)
+	rm -rf $(OBJ_DIR) $(PROGRAM_OUTPUTS) $(BIN_DIR)
