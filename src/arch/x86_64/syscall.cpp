@@ -56,6 +56,16 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
             process::Process* proc = process::current();
             if (proc != nullptr) {
                 proc->state = process::State::Terminated;
+                proc->has_exited = true;
+                proc->exit_code = static_cast<uint16_t>(frame->rax & 0xFFFFu);
+                process::Process* parent = proc->parent;
+                if (parent != nullptr && parent->waiting_on == proc) {
+                    parent->waiting_on = nullptr;
+                    parent->context.rax = proc->exit_code;
+                    parent->state = process::State::Ready;
+                    scheduler::enqueue(parent);
+                }
+                proc->parent = nullptr;
             }
             scheduler::reschedule(*frame);
             break;

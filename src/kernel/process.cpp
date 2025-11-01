@@ -26,6 +26,10 @@ void init() {
         g_process_table[i].kernel_stack_top =
             g_process_table[i].kernel_stack_base + kKernelStackSize;
         g_process_table[i].kernel_stack_top &= ~0xFULL;
+        g_process_table[i].parent = nullptr;
+        g_process_table[i].waiting_on = nullptr;
+        g_process_table[i].exit_code = 0;
+        g_process_table[i].has_exited = false;
         descriptor::init_table(g_process_table[i].descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             g_process_table[i].file_handles[fh].in_use = false;
@@ -50,6 +54,10 @@ Process* allocate() {
         proc.pid = g_next_pid++;
         proc.cr3 = 0;
         proc.has_context = false;
+        proc.parent = nullptr;
+        proc.waiting_on = nullptr;
+        proc.exit_code = 0;
+        proc.has_exited = false;
         descriptor::init_table(proc.descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             proc.file_handles[fh].in_use = false;

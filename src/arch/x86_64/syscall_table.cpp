@@ -3,7 +3,12 @@
 #include "../../drivers/log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
 #include "../../kernel/file_io.hpp"
+#include "../../kernel/loader.hpp"
 #include "../../kernel/process.hpp"
+#include "../../kernel/scheduler.hpp"
+#include "../../fs/vfs.hpp"
+#include "../../lib/mem.hpp"
+#include "../../kernel/string_util.hpp"
 
 namespace syscall {
 
@@ -11,6 +16,55 @@ namespace {
 
 constexpr uint64_t kAbiMajor = 0;
 constexpr uint64_t kAbiMinor = 1;
+
+constexpr size_t kMaxExecImageSize = 512 * 1024;
+alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
+
+bool load_program_image(const char* path, loader::ProgramImage& out_image) {
+    if (path == nullptr) {
+        return false;
+    }
+
+    vfs::FileHandle handle{};
+    if (!vfs::open_file(path, handle)) {
+        return false;
+    }
+
+    if (handle.size == 0 || handle.size > kMaxExecImageSize) {
+        vfs::close_file(handle);
+        return false;
+    }
+
+    size_t total = static_cast<size_t>(handle.size);
+    size_t offset = 0;
+    while (offset < total) {
+        size_t chunk = total - offset;
+        size_t read = 0;
+        if (!vfs::read_file(handle,
+                            offset,
+                            g_exec_buffer + offset,
+                            chunk,
+                            read)) {
+            vfs::close_file(handle);
+            return false;
+        }
+        if (read == 0) {
+            break;
+        }
+        offset += read;
+    }
+
+    vfs::close_file(handle);
+
+    if (offset != total) {
+        return false;
+    }
+
+    out_image.data = g_exec_buffer;
+    out_image.size = total;
+    out_image.entry_offset = 0;
+    return true;
+}
 
 }  // namespace
 
@@ -167,6 +221,113 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
             return Result::Continue;
         }
+        case SystemCall::ProcessExec: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            loader::ProgramImage image{};
+            if (!load_program_image(path, image)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            process::Process* child = process::allocate();
+            if (child == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            child->parent = proc;
+            child->waiting_on = nullptr;
+            child->exit_code = 0;
+            child->has_exited = false;
+
+            if (!loader::load_into_process(image, *child)) {
+                child->state = process::State::Unused;
+                child->pid = 0;
+                child->parent = nullptr;
+                child->waiting_on = nullptr;
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            child->state = process::State::Ready;
+            scheduler::enqueue(child);
+
+            proc->waiting_on = child;
+            proc->state = process::State::Blocked;
+            frame.rax = 0;
+            return Result::Reschedule;
+        }
+        case SystemCall::Child: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            const char* args = reinterpret_cast<const char*>(frame.rsi);
+            uint64_t flags = frame.rdx;
+            (void)flags;
+
+            loader::ProgramImage image{};
+            if (!load_program_image(path, image)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            process::Process* child = process::allocate();
+            if (child == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            child->parent = proc;
+            child->waiting_on = nullptr;
+            child->exit_code = 0;
+            child->has_exited = false;
+
+            if (!loader::load_into_process(image, *child)) {
+                child->state = process::State::Unused;
+                child->pid = 0;
+                child->parent = nullptr;
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            uint64_t arg_ptr = 0;
+            if (args != nullptr && args[0] != '\0' &&
+                child->stack_region.top > child->stack_region.base) {
+                size_t arg_len = string_util::length(args);
+                size_t total = arg_len + 1;
+                uint64_t available = child->stack_region.top - child->stack_region.base;
+                if (total < available) {
+                    uint64_t dest = child->stack_region.top - static_cast<uint64_t>(total);
+                    memcpy(reinterpret_cast<void*>(dest), args, total);
+                    arg_ptr = dest;
+                }
+            }
+
+            memset(&child->context, 0, sizeof(child->context));
+            child->context.user_rip = child->user_ip;
+            child->context.user_rsp = child->user_sp;
+            child->context.user_rflags = 0x202;
+            child->context.r11 = 0x202;
+            child->context.rdi = arg_ptr;
+            child->context.rsi = flags;
+            child->context.rax = 0;
+            child->has_context = true;
+
+            child->state = process::State::Ready;
+            scheduler::enqueue(child);
+
+            frame.rax = static_cast<uint64_t>(child->pid);
+            return Result::Continue;
+        }
         case SystemCall::DirectoryOpen: {
             process::Process* proc = process::current();
             if (proc == nullptr) {
@@ -200,26 +361,6 @@ Result handle_syscall(SyscallFrame& frame) {
             bool ok = file_io::close_directory(*proc,
                                                static_cast<uint32_t>(frame.rdi));
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
-            return Result::Continue;
-        }
-        case SystemCall::Child: {
-            process::Process* proc = process::current();
-            if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            process::Process* child = process::allocate();
-            if (child == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            child->parent = proc;
-            child->code_region = {};
-            child->stack_region = {};
-            child->user_ip = 0;
-            child->user_sp = 0;
-            child->has_context = false;
-            frame.rax = static_cast<uint64_t>(child->pid);
             return Result::Continue;
         }
         default: {

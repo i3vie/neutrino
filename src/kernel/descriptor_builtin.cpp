@@ -46,13 +46,34 @@ const Ops kConsoleOps{
     .write = console_write,
 };
 
-bool open_console(process::Process&, uint64_t, uint64_t, uint64_t, Allocation& alloc) {
+process::Process* g_console_owner = nullptr;
+size_t g_console_refcount = 0;
+
+void close_console(void*) {
+    if (g_console_refcount > 0) {
+        --g_console_refcount;
+    }
+    if (g_console_refcount == 0) {
+        g_console_owner = nullptr;
+    }
+}
+
+bool open_console(process::Process& proc,
+                  uint64_t,
+                  uint64_t,
+                  uint64_t,
+                  Allocation& alloc) {
     if (kconsole == nullptr) {
         return false;
     }
+    if (g_console_owner != nullptr && g_console_owner != &proc) {
+        return false;
+    }
+    g_console_owner = &proc;
+    ++g_console_refcount;
     alloc.info = make_info(kTypeConsole, CapabilityWritable);
     alloc.object = kconsole;
-    alloc.close = nullptr;
+    alloc.close = close_console;
     alloc.ops = &kConsoleOps;
     return true;
 }
