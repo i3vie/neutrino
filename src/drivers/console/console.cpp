@@ -2,6 +2,48 @@
 
 #include <stdarg.h>
 
+namespace {
+
+constexpr int kGlyphWidth = 8;
+constexpr int kGlyphHeight = 8;
+constexpr int kLineSpacing = 5;
+
+size_t cell_width_px() {
+    return static_cast<size_t>(kGlyphWidth * scale);
+}
+
+size_t cell_height_px() {
+    return static_cast<size_t>(kGlyphHeight * scale + kLineSpacing);
+}
+
+void fill_rect(Framebuffer* fb,
+               size_t x,
+               size_t y,
+               size_t width,
+               size_t height,
+               uint32_t color) {
+    if (fb == nullptr || fb->base == nullptr) {
+        return;
+    }
+    for (size_t row = 0; row < height; ++row) {
+        size_t py = y + row;
+        if (py >= fb->height) {
+            break;
+        }
+        uint32_t* dst =
+            reinterpret_cast<uint32_t*>(fb->base + py * fb->pitch);
+        for (size_t col = 0; col < width; ++col) {
+            size_t px = x + col;
+            if (px >= fb->width) {
+                break;
+            }
+            dst[px] = color;
+        }
+    }
+}
+
+}  // namespace
+
 Console* kconsole = nullptr;
 uint32_t DEFAULT_BG = 0x00000000;
 
@@ -15,17 +57,19 @@ Console::Console(Framebuffer* fb)
 void Console::draw_char(char c, size_t x, size_t y) {
     if ((unsigned char)c >= 128) return;
 
-    for (int row = 0; row < 8; ++row) {
-        uint8_t bits = font8x8_basic[(uint8_t)c][row];
-        for (int col = 0; col < 8; ++col) {
-            uint32_t color = (bits & (1 << col)) ? fg_color : bg_color;
-            size_t base_px = x * 8 * scale + col * scale;
-            size_t base_py = y * 8 * scale + row * scale;
+    size_t glyph_width = cell_width_px();
+    size_t glyph_height = static_cast<size_t>(kGlyphHeight * scale);
+    size_t base_px = x * glyph_width;
+    size_t base_py = y * cell_height_px();
 
+    for (int row = 0; row < kGlyphHeight; ++row) {
+        uint8_t bits = font8x8_basic[(uint8_t)c][row];
+        for (int col = 0; col < kGlyphWidth; ++col) {
+            uint32_t color = (bits & (1 << col)) ? fg_color : bg_color;
             for (int dy = 0; dy < scale; ++dy) {
                 for (int dx = 0; dx < scale; ++dx) {
-                    size_t px = base_px + dx;
-                    size_t py = base_py + dy;
+                    size_t px = base_px + col * scale + dx;
+                    size_t py = base_py + row * scale + dy;
                     if (px < fb->width && py < fb->height) {
                         ((uint32_t*)fb->base)[py * (fb->pitch / 4) + px] =
                             color;
@@ -33,6 +77,17 @@ void Console::draw_char(char c, size_t x, size_t y) {
                 }
             }
         }
+    }
+
+    // fill line spacing with background colour
+    size_t gap_start_y = base_py + glyph_height;
+    if (kLineSpacing > 0 && gap_start_y < fb->height) {
+        fill_rect(fb,
+                  base_px,
+                  gap_start_y,
+                  glyph_width,
+                  static_cast<size_t>(kLineSpacing),
+                  bg_color);
     }
 }
 
@@ -42,7 +97,7 @@ void Console::set_color(uint32_t fg, uint32_t bg = DEFAULT_BG) {
 }
 
 void Console::scroll() {
-    size_t row_bytes = 8 * scale * fb->pitch;
+    size_t row_bytes = cell_height_px() * fb->pitch;
     uint8_t* dst = fb->base;
     uint8_t* src = fb->base + row_bytes;
     size_t copy_bytes = (fb->height * fb->pitch) - row_bytes;
@@ -60,7 +115,7 @@ void Console::putc(char c) {
     if (c == '\n') {
         cursor_x = 0;
         cursor_y++;
-        if ((cursor_y + 1) * 8 * scale >= fb->height) scroll();
+        if ((cursor_y + 1) * cell_height_px() >= fb->height) scroll();
         return;
     }
     if (c == '\r') {
@@ -71,7 +126,7 @@ void Console::putc(char c) {
         if (cursor_x > 0) {
             cursor_x--;
         } else if (cursor_y > 0) {
-            size_t max_cols = fb->width / (8 * scale);
+            size_t max_cols = fb->width / cell_width_px();
             if (max_cols > 0) {
                 cursor_y--;
                 cursor_x = max_cols - 1;
@@ -83,10 +138,10 @@ void Console::putc(char c) {
 
     draw_char(c, cursor_x, cursor_y);
     cursor_x++;
-    if ((cursor_x + 1) * 8 * scale >= fb->width) {
+    if ((cursor_x + 1) * cell_width_px() >= fb->width) {
         cursor_x = 0;
         cursor_y++;
-        if ((cursor_y + 1) * 8 * scale >= fb->height) scroll();
+        if ((cursor_y + 1) * cell_height_px() >= fb->height) scroll();
     }
 }
 
