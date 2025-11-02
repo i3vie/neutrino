@@ -2,11 +2,78 @@
 
 #include <stdarg.h>
 
+#include "lib/mem.hpp"
+
 namespace {
 
 constexpr int kGlyphWidth = 8;
 constexpr int kGlyphHeight = 8;
-constexpr int kLineSpacing = 5;
+constexpr int kLineSpacing = 3 * scale;
+constexpr uint8_t kMemoryModelRgb = 1;
+
+size_t bytes_per_pixel(const Framebuffer* fb) {
+    if (fb == nullptr || fb->bpp == 0) {
+        return 4;
+    }
+    return static_cast<size_t>((fb->bpp + 7) / 8);
+}
+
+uint32_t scale_component(uint8_t value, uint8_t bits) {
+    if (bits == 0) {
+        return 0;
+    }
+    if (bits >= 8) {
+        return static_cast<uint32_t>(value) << (bits - 8);
+    }
+    uint32_t max_value = (1u << bits) - 1u;
+    return (static_cast<uint32_t>(value) * max_value + 127u) / 255u;
+}
+
+uint64_t pack_color(const Framebuffer* fb, uint32_t argb) {
+    if (fb == nullptr) {
+        return argb;
+    }
+
+    if (fb->memory_model != kMemoryModelRgb) {
+        return argb;
+    }
+
+    uint8_t red = static_cast<uint8_t>((argb >> 16) & 0xFF);
+    uint8_t green = static_cast<uint8_t>((argb >> 8) & 0xFF);
+    uint8_t blue = static_cast<uint8_t>(argb & 0xFF);
+
+    uint64_t packed = 0;
+    packed |= static_cast<uint64_t>(
+                  scale_component(red, fb->red_mask_size))
+              << fb->red_mask_shift;
+    packed |= static_cast<uint64_t>(
+                  scale_component(green, fb->green_mask_size))
+              << fb->green_mask_shift;
+    packed |= static_cast<uint64_t>(
+                  scale_component(blue, fb->blue_mask_size))
+              << fb->blue_mask_shift;
+    return packed;
+}
+
+void write_packed_pixel(Framebuffer* fb,
+                        size_t px,
+                        size_t py,
+                        uint64_t packed_color) {
+    if (fb == nullptr || fb->base == nullptr) {
+        return;
+    }
+    if (px >= fb->width || py >= fb->height) {
+        return;
+    }
+
+    size_t bpp_bytes = bytes_per_pixel(fb);
+    uint8_t* dst =
+        fb->base + py * fb->pitch + px * bpp_bytes;
+    for (size_t i = 0; i < bpp_bytes; ++i) {
+        dst[i] = static_cast<uint8_t>(
+            (packed_color >> (8 * i)) & 0xFF);
+    }
+}
 
 size_t cell_width_px() {
     return static_cast<size_t>(kGlyphWidth * scale);
@@ -25,19 +92,18 @@ void fill_rect(Framebuffer* fb,
     if (fb == nullptr || fb->base == nullptr) {
         return;
     }
+    uint64_t packed = pack_color(fb, color);
     for (size_t row = 0; row < height; ++row) {
         size_t py = y + row;
         if (py >= fb->height) {
             break;
         }
-        uint32_t* dst =
-            reinterpret_cast<uint32_t*>(fb->base + py * fb->pitch);
         for (size_t col = 0; col < width; ++col) {
             size_t px = x + col;
             if (px >= fb->width) {
                 break;
             }
-            dst[px] = color;
+            write_packed_pixel(fb, px, py, packed);
         }
     }
 }
@@ -52,28 +118,60 @@ Console::Console(Framebuffer* fb)
       cursor_x(0),
       cursor_y(0),
       fg_color(0xFFFFFFFF),
-      bg_color(0x00000000) {}  // white on black
+      bg_color(0x00000000),
+      columns(0),
+      rows(0),
+      text_width(0),
+      text_height(0) {  // white on black
+    size_t cw = cell_width_px();
+    size_t ch = cell_height_px();
+    if (cw == 0) {
+        cw = 1;
+    }
+    if (ch == 0) {
+        ch = 1;
+    }
+    columns = fb ? (fb->width / cw) : 0;
+    rows = fb ? (fb->height / ch) : 0;
+    text_width = columns * cw;
+    text_height = rows * ch;
+    
+    if (columns == 0) {
+        columns = 1;
+        text_width = cw;
+    }
+    if (rows == 0) {
+        rows = 1;
+        text_height = ch;
+    }
+}
 
 void Console::draw_char(char c, size_t x, size_t y) {
+    if (x >= columns || y >= rows) {
+        return;
+    }
     if ((unsigned char)c >= 128) return;
 
     size_t glyph_width = cell_width_px();
     size_t glyph_height = static_cast<size_t>(kGlyphHeight * scale);
     size_t base_px = x * glyph_width;
     size_t base_py = y * cell_height_px();
+    uint64_t packed_fg = pack_color(fb, fg_color);
+    uint64_t packed_bg = pack_color(fb, bg_color);
 
     for (int row = 0; row < kGlyphHeight; ++row) {
         uint8_t bits = font8x8_basic[(uint8_t)c][row];
         for (int col = 0; col < kGlyphWidth; ++col) {
-            uint32_t color = (bits & (1 << col)) ? fg_color : bg_color;
+            uint64_t packed =
+                (bits & (1 << col)) ? packed_fg : packed_bg;
             for (int dy = 0; dy < scale; ++dy) {
                 for (int dx = 0; dx < scale; ++dx) {
                     size_t px = base_px + col * scale + dx;
                     size_t py = base_py + row * scale + dy;
-                    if (px < fb->width && py < fb->height) {
-                        ((uint32_t*)fb->base)[py * (fb->pitch / 4) + px] =
-                            color;
+                    if (px >= text_width) {
+                        continue;
                     }
+                    write_packed_pixel(fb, px, py, packed);
                 }
             }
         }
@@ -82,10 +180,21 @@ void Console::draw_char(char c, size_t x, size_t y) {
     // fill line spacing with background colour
     size_t gap_start_y = base_py + glyph_height;
     if (kLineSpacing > 0 && gap_start_y < fb->height) {
+        size_t draw_width = glyph_width;
+        if (base_px + draw_width > text_width) {
+            if (base_px >= text_width) {
+                draw_width = 0;
+            } else {
+                draw_width = text_width - base_px;
+            }
+        }
+        if (draw_width == 0) {
+            return;
+        }
         fill_rect(fb,
                   base_px,
                   gap_start_y,
-                  glyph_width,
+                  draw_width,
                   static_cast<size_t>(kLineSpacing),
                   bg_color);
     }
@@ -97,16 +206,39 @@ void Console::set_color(uint32_t fg, uint32_t bg = DEFAULT_BG) {
 }
 
 void Console::scroll() {
-    size_t row_bytes = cell_height_px() * fb->pitch;
-    uint8_t* dst = fb->base;
-    uint8_t* src = fb->base + row_bytes;
-    size_t copy_bytes = (fb->height * fb->pitch) - row_bytes;
+    size_t row_height = cell_height_px();
+    if (row_height == 0 || fb == nullptr) {
+        return;
+    }
+    if (text_height == 0) {
+        text_height = fb->height - (fb->height % row_height);
+    }
+    if (row_height >= text_height) {
+        fill_rect(fb, 0, 0, fb->width, fb->height, bg_color);
+        cursor_y = 0;
+        return;
+    }
 
-    for (size_t i = 0; i < copy_bytes; i++) dst[i] = src[i];
+    size_t bpp = bytes_per_pixel(fb);
+    size_t copy_width = text_width > 0 ? text_width : fb->width;
+    size_t copy_bytes = copy_width * bpp;
+    if (copy_bytes > fb->pitch) {
+        copy_bytes = fb->pitch;
+    }
 
-    // clear last line
-    for (size_t i = copy_bytes; i < fb->height * fb->pitch; i++)
-        fb->base[i] = 0;
+    size_t total_rows = text_height - row_height;
+    for (size_t py = 0; py < total_rows; ++py) {
+        uint8_t* dst = fb->base + py * fb->pitch;
+        const uint8_t* src = fb->base + (py + row_height) * fb->pitch;
+        memcpy(dst, src, copy_bytes);
+    }
+
+    fill_rect(fb,
+              0,
+              text_height - row_height,
+              copy_width,
+              row_height,
+              bg_color);
 
     if (cursor_y > 0) cursor_y--;
 }
@@ -138,10 +270,10 @@ void Console::putc(char c) {
 
     draw_char(c, cursor_x, cursor_y);
     cursor_x++;
-    if ((cursor_x + 1) * cell_width_px() >= fb->width) {
+    if (cursor_x >= columns) {
         cursor_x = 0;
         cursor_y++;
-        if ((cursor_y + 1) * cell_height_px() >= fb->height) scroll();
+        if (cursor_y >= rows) scroll();
     }
 }
 
@@ -150,7 +282,7 @@ void Console::puts(const char* s) {
 }
 
 void Console::clear() {
-    for (size_t i = 0; i < fb->height * fb->pitch; i++) fb->base[i] = 0;
+    fill_rect(fb, 0, 0, fb->width, fb->height, bg_color);
     cursor_x = cursor_y = 0;
 }
 

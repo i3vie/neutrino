@@ -10,6 +10,14 @@ struct Framebuffer {
     size_t width;
     size_t height;
     size_t pitch;
+    uint16_t bpp;
+    uint8_t memory_model;
+    uint8_t red_mask_size;
+    uint8_t red_mask_shift;
+    uint8_t green_mask_size;
+    uint8_t green_mask_shift;
+    uint8_t blue_mask_size;
+    uint8_t blue_mask_shift;
 };
 
 class Console {
@@ -29,6 +37,10 @@ private:
     size_t cursor_y;
     uint32_t fg_color;
     uint32_t bg_color;
+    size_t columns;
+    size_t rows;
+    size_t text_width;
+    size_t text_height;
 
     void draw_char(char c, size_t x, size_t y);
     void scroll();
