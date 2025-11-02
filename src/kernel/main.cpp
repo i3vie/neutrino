@@ -208,12 +208,24 @@ static void kernel_main_stage2() {
     }
 
     auto fb = *framebuffer_request.response->framebuffers[0];
-    Framebuffer framebuffer = {(uint8_t*)fb.address, fb.width, fb.height,
-                               fb.pitch};
+    Framebuffer framebuffer = {
+        static_cast<uint8_t*>(fb.address),
+        static_cast<size_t>(fb.width),
+        static_cast<size_t>(fb.height),
+        static_cast<size_t>(fb.pitch),
+        static_cast<uint16_t>(fb.bpp),
+        fb.memory_model,
+        fb.red_mask_size,
+        fb.red_mask_shift,
+        fb.green_mask_size,
+        fb.green_mask_shift,
+        fb.blue_mask_size,
+        fb.blue_mask_shift};
     Console console = Console(&framebuffer);
     kconsole = &console;  // HAVE AT THEE
 
     log_init();
+
     log_message(LogLevel::Info, "Console online");
 
     log_message(LogLevel::Info, "Welcome to Neutrino");
@@ -380,6 +392,14 @@ static void kernel_main_stage2() {
                     "Boot: root filesystem '%s' was not mounted", root_ptr);
     }
 
+    char boot_mount_name[64] = {0};
+    if (root_ptr != nullptr && root_ok) {
+        string_util::copy(boot_mount_name, sizeof(boot_mount_name), root_ptr);
+    }
+    char boot_cwd[128];
+    boot_cwd[0] = '/';
+    boot_cwd[1] = '\0';
+
     config::Table kernel_config{};
     bool kernel_config_loaded = false;
     char init_task_path[64] = {0};
@@ -405,6 +425,31 @@ static void kernel_main_stage2() {
     if (fetch_mounts < total_mounts) {
         log_message(LogLevel::Info,
                     "VFS: additional mounts not listed due to buffer size");
+    }
+
+    if (boot_mount_name[0] == '\0') {
+        for (size_t i = 0; i < fetch_mounts; ++i) {
+            if (mount_names[i] != nullptr) {
+                string_util::copy(boot_mount_name,
+                                  sizeof(boot_mount_name),
+                                  mount_names[i]);
+                break;
+            }
+        }
+    }
+
+    if (boot_mount_name[0] != '\0') {
+        size_t idx = 1;
+        size_t mount_len = string_util::length(boot_mount_name);
+        if (mount_len + 1 >= sizeof(boot_cwd)) {
+            mount_len = sizeof(boot_cwd) - 2;
+        }
+        for (size_t i = 0; i < mount_len; ++i) {
+            boot_cwd[idx++] = boot_mount_name[i];
+        }
+        boot_cwd[idx] = '\0';
+    } else {
+        boot_cwd[1] = '\0';
     }
 
     if (root_ptr != nullptr && root_ok) {
@@ -561,15 +606,23 @@ for (size_t i = 0; i < init_candidate_count; ++i) {
 
 if (init_loaded) {
     loader::ProgramImage image{init_buffer, init_size, 0};
-    if (process::Process* proc = process::allocate();
-        proc != nullptr &&
-        loader::load_into_process(image, *proc)) {
-        log_message(LogLevel::Info,
-                    "Boot: launched init task from %s (%x bytes)",
-                    init_path_used,
-                    init_size);
-        scheduler::enqueue(proc);
-    } else {
+    process::Process* proc = process::allocate();
+    bool init_started = false;
+    if (proc != nullptr) {
+        string_util::copy(proc->cwd, sizeof(proc->cwd), boot_cwd);
+        if (loader::load_into_process(image, *proc)) {
+            log_message(LogLevel::Info,
+                        "Boot: launched init task from %s (%x bytes)",
+                        init_path_used,
+                        init_size);
+            scheduler::enqueue(proc);
+            init_started = true;
+        } else {
+            proc->state = process::State::Unused;
+            proc->pid = 0;
+        }
+    }
+    if (!init_started) {
         log_message(LogLevel::Error,
                     "Boot: failed to start init task (%s)",
                     init_path_used != nullptr ? init_path_used : "(unknown)");

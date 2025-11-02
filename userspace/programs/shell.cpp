@@ -120,6 +120,7 @@ bool strings_equal(const char* a, const char* b) {
 }
 
 char g_current_cwd[128] = "/";
+char g_boot_mount[64] = {0};
 
 bool is_space(char ch) {
     return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
@@ -213,7 +214,6 @@ bool build_mount_subpath(const char* mount,
 
 size_t build_search_directories(const char* cwd,
                                 char (&out)[kMaxSearchDirs][128]) {
-    constexpr const char* kFallbackMount = "IDE_PM_0";
     size_t count = 0;
 
     auto append = [&](const char* path) {
@@ -245,8 +245,9 @@ size_t build_search_directories(const char* cwd,
     if (mount_name[0] != '\0') {
         append_mount_dirs(mount_name);
     }
-    if (!strings_equal(mount_name, kFallbackMount)) {
-        append_mount_dirs(kFallbackMount);
+    if (g_boot_mount[0] != '\0' &&
+        !strings_equal(mount_name, g_boot_mount)) {
+        append_mount_dirs(g_boot_mount);
     }
     append("/binary");
     append("/BINARY");
@@ -728,7 +729,27 @@ void execute_command(long console, const char* line) {
             print_line(console, message);
         }
     } else if (equals_literal(command, "help")) {
-        print_line(console, "simple shell (PATH=/binary:IDE_PM_0/BINARY)");
+        char path_info[192];
+        size_t idx = 0;
+        auto append_literal = [&](const char* text) {
+            if (text == nullptr) {
+                return;
+            }
+            for (size_t i = 0; text[i] != '\0' && idx + 1 < sizeof(path_info); ++i) {
+                path_info[idx++] = text[i];
+            }
+        };
+        append_literal("simple shell (PATH=/binary:/BINARY");
+        if (g_boot_mount[0] != '\0') {
+            append_literal(":/");
+            append_literal(g_boot_mount);
+            append_literal("/binary:/");
+            append_literal(g_boot_mount);
+            append_literal("/BINARY");
+        }
+        append_literal(")");
+        path_info[idx] = '\0';
+        print_line(console, path_info);
         print_line(console, "builtins: cd, help, spawn");
     } else {
         const char* args = (cursor != nullptr && *cursor != '\0') ? cursor : nullptr;
@@ -758,6 +779,13 @@ int main(uint64_t, uint64_t) {
 
     long keyboard = descriptor_open(DESC_TYPE_KEYBOARD, 0);
     if (keyboard < 0) return 1;
+
+    long cwd_len = getcwd(g_current_cwd, sizeof(g_current_cwd));
+    if (cwd_len < 0 || g_current_cwd[0] == '\0') {
+        g_current_cwd[0] = '/';
+        g_current_cwd[1] = '\0';
+    }
+    extract_mount_name(g_current_cwd, g_boot_mount, sizeof(g_boot_mount));
 
     char prompt_buffer[160];
     size_t prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));

@@ -21,9 +21,10 @@ enum class SystemCall : long {
     ProcessExec      = 14,
     Child            = 15,
     ProcessSetCwd    = 16,
-    DirectoryOpen    = 17,
-    DirectoryRead    = 18,
-    DirectoryClose   = 19,
+    ProcessGetCwd    = 17,
+    DirectoryOpen    = 18,
+    DirectoryRead    = 19,
+    DirectoryClose   = 20,
 };
 
 enum : uint32_t {
@@ -213,6 +214,12 @@ static inline long exec(const char* path,
 static inline long setcwd(const char* path) {
     return raw_syscall1(SystemCall::ProcessSetCwd,
                         static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long getcwd(char* buffer, size_t length) {
+    return raw_syscall2(SystemCall::ProcessGetCwd,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(buffer)),
+                        static_cast<long>(length));
 }
 
 static inline long directory_open(const char* path) {

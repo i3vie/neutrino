@@ -11,6 +11,7 @@ namespace vfs {
 namespace {
 
 constexpr size_t kMaxMounts = 16;
+constexpr size_t kMaxRootDirHandles = 8;
 
 struct MountEntry {
     const char* name;
@@ -20,6 +21,15 @@ struct MountEntry {
 };
 
 MountEntry g_mounts[kMaxMounts]{};
+
+struct RootDirectoryContext {
+    size_t index;
+    size_t count;
+    const char* names[kMaxMounts];
+};
+
+RootDirectoryContext g_root_dir_contexts[kMaxRootDirHandles]{};
+bool g_root_dir_in_use[kMaxRootDirHandles]{};
 
 size_t string_length(const char* str) {
     size_t len = 0;
@@ -105,6 +115,55 @@ const char* normalize_relative_path(const char* path) {
     return path;
 }
 
+bool is_root_path(const char* path) {
+    if (path == nullptr) {
+        return true;
+    }
+    const char* trimmed = skip_leading_slash(path);
+    return trimmed == nullptr || *trimmed == '\0';
+}
+
+RootDirectoryContext* allocate_root_dir_context() {
+    for (size_t i = 0; i < kMaxRootDirHandles; ++i) {
+        if (!g_root_dir_in_use[i]) {
+            g_root_dir_in_use[i] = true;
+            RootDirectoryContext& ctx = g_root_dir_contexts[i];
+            memset(&ctx, 0, sizeof(RootDirectoryContext));
+            return &ctx;
+        }
+    }
+    return nullptr;
+}
+
+void release_root_dir_context(RootDirectoryContext* ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < kMaxRootDirHandles; ++i) {
+        if (&g_root_dir_contexts[i] == ctx) {
+            g_root_dir_in_use[i] = false;
+            return;
+        }
+    }
+}
+
+void populate_entry_from_mount(const char* name, DirEntry& entry) {
+    memset(&entry, 0, sizeof(DirEntry));
+    if (name == nullptr) {
+        entry.name[0] = '\0';
+    } else {
+        size_t len = string_length(name);
+        if (len >= sizeof(entry.name)) {
+            len = sizeof(entry.name) - 1;
+        }
+        memcpy(entry.name, name, len);
+        entry.name[len] = '\0';
+    }
+    entry.flags = kDirEntryFlagDirectory;
+    entry.size = 0;
+    entry.reserved = 0;
+}
+
 }  // namespace
 
 void init() {
@@ -165,6 +224,19 @@ bool list(const char* path,
     out_count = 0;
     if (entries == nullptr || max_entries == 0) {
         return false;
+    }
+
+    if (is_root_path(path)) {
+        const char* names[kMaxMounts];
+        size_t mount_count = enumerate_mounts(names, kMaxMounts);
+        size_t stored =
+            (mount_count < kMaxMounts) ? mount_count : kMaxMounts;
+        size_t limit = (stored < max_entries) ? stored : max_entries;
+        for (size_t i = 0; i < limit; ++i) {
+            populate_entry_from_mount(names[i], entries[i]);
+        }
+        out_count = limit;
+        return true;
     }
 
     const char* remainder = nullptr;
@@ -337,6 +409,24 @@ bool write_file(FileHandle& handle,
 bool open_directory(const char* path, DirectoryHandle& out_handle) {
     out_handle = {};
 
+    if (is_root_path(path)) {
+        RootDirectoryContext* ctx = allocate_root_dir_context();
+        if (ctx == nullptr) {
+            log_message(LogLevel::Warn,
+                        "VFS: no free root directory contexts");
+            return false;
+        }
+        size_t mount_count = enumerate_mounts(ctx->names, kMaxMounts);
+        ctx->count = (mount_count < kMaxMounts) ? mount_count : kMaxMounts;
+        ctx->index = 0;
+
+        out_handle.dir_context = ctx;
+        out_handle.fs_context = nullptr;
+        out_handle.ops = nullptr;
+        out_handle.is_root = true;
+        return true;
+    }
+
     const char* remainder = nullptr;
     MountEntry* mount = find_mount_for_path(path, remainder);
     if (mount == nullptr) {
@@ -363,10 +453,21 @@ bool open_directory(const char* path, DirectoryHandle& out_handle) {
     out_handle.ops = mount->ops;
     out_handle.fs_context = mount->fs_context;
     out_handle.dir_context = dir_context;
+    out_handle.is_root = false;
     return true;
 }
 
 bool read_directory(DirectoryHandle& handle, DirEntry& out_entry) {
+    if (handle.is_root) {
+        auto* ctx = static_cast<RootDirectoryContext*>(handle.dir_context);
+        if (ctx == nullptr || ctx->index >= ctx->count) {
+            return false;
+        }
+        populate_entry_from_mount(ctx->names[ctx->index], out_entry);
+        ++ctx->index;
+        return true;
+    }
+
     if (handle.ops == nullptr || handle.ops->directory_next == nullptr ||
         handle.dir_context == nullptr) {
         return false;
@@ -375,6 +476,13 @@ bool read_directory(DirectoryHandle& handle, DirEntry& out_entry) {
 }
 
 void close_directory(DirectoryHandle& handle) {
+    if (handle.is_root) {
+        release_root_dir_context(
+            static_cast<RootDirectoryContext*>(handle.dir_context));
+        handle = {};
+        return;
+    }
+
     if (handle.ops != nullptr && handle.ops->close_directory != nullptr &&
         handle.dir_context != nullptr) {
         handle.ops->close_directory(handle.dir_context);

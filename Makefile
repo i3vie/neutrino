@@ -16,6 +16,10 @@ TARGET_ISO := $(OUT_DIR)/neutrino.iso
 CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
+TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
+ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
+RAMFS_TRUNCATE_SIZE ?= 64M
+
 # === Source discovery ===
 SRC_CPP := $(shell find $(SRC_DIR) -type f -name '*.cpp')
 SRC_ASM := $(shell find $(SRC_DIR) -type f -name '*.S')
@@ -81,6 +85,43 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 	
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO)
 
+$(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img
+	@echo "[ISO] Building $@ (RAMFS)"
+
+	rm -rf $(ISO_ROOT_RAMFS)
+	mkdir -p $(ISO_ROOT_RAMFS)/boot
+	cp -v out/kernel.elf $(ISO_ROOT_RAMFS)/boot/kernel.elf
+	mkdir -p $(ISO_ROOT_RAMFS)/boot/limine
+	cp -v $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT_RAMFS)/boot/limine/
+
+	cp -v hdd.img $(ISO_ROOT_RAMFS)/boot/rootfs.img
+	truncate -s $(RAMFS_TRUNCATE_SIZE) $(ISO_ROOT_RAMFS)/boot/rootfs.img
+
+	printf 'timeout: 1\n\n' > $(ISO_ROOT_RAMFS)/limine.conf
+	printf '/Neutrino\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    cmdline: ROOT=IDE_PM_0\n\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '/Neutrino (rootfs in memory)\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    cmdline: ROOT=MEMDISK_0_0\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+
+	mkdir -p $(ISO_ROOT_RAMFS)/EFI/BOOT
+	cp -v $(LIMINE_DIR)/BOOTX64.EFI $(ISO_ROOT_RAMFS)/EFI/BOOT/
+	cp -v $(LIMINE_DIR)/BOOTIA32.EFI $(ISO_ROOT_RAMFS)/EFI/BOOT/
+
+	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+        -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
+        -efi-boot-part --efi-boot-image --protective-msdos-label \
+        $(ISO_ROOT_RAMFS) -o $(TARGET_ISO_RAMFS)
+	
+	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO_RAMFS)
+
 run: $(TARGET_ISO)
 	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) \
 		-serial stdio  \
@@ -101,4 +142,7 @@ iso: $(TARGET_ISO)
 clean:
 	rm -rf $(BUILD_DIR) $(OUT_DIR)
 
-.PHONY: all clean iso run
+iso-ramfs: $(TARGET_ISO_RAMFS)
+	@echo ISO with RAMFS created at $(TARGET_ISO_RAMFS)
+
+.PHONY: all clean iso iso-ramfs run

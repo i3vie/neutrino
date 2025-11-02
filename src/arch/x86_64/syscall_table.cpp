@@ -481,6 +481,36 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = 0;
             return Result::Continue;
         }
+        case SystemCall::ProcessGetCwd: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char* buffer = reinterpret_cast<char*>(frame.rdi);
+            uint64_t buffer_size = frame.rsi;
+            if (buffer == nullptr || buffer_size == 0) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            size_t cwd_len = string_util::length(proc->cwd);
+            if (cwd_len + 1 > buffer_size) {
+                if (buffer_size == 0) {
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+                cwd_len = static_cast<size_t>(buffer_size - 1);
+            }
+
+            for (size_t i = 0; i < cwd_len; ++i) {
+                buffer[i] = proc->cwd[i];
+            }
+            buffer[cwd_len] = '\0';
+            frame.rax = static_cast<uint64_t>(cwd_len);
+            return Result::Continue;
+        }
         case SystemCall::DirectoryOpen: {
             process::Process* proc = process::current();
             if (proc == nullptr) {

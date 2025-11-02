@@ -29,6 +29,7 @@ struct DirectoryHandle {
     const FilesystemOps* ops;
     void* fs_context;
     void* dir_context;
+    bool is_root;
 };
 
 struct FilesystemOps {

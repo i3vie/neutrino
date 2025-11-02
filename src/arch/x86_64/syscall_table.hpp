@@ -24,9 +24,10 @@ enum class SystemCall : uint64_t {
     ProcessExec      = 14,
     Child            = 15,
     ProcessSetCwd    = 16,
-    DirectoryOpen    = 17,
-    DirectoryRead    = 18,
-    DirectoryClose   = 19,
+    ProcessGetCwd    = 17,
+    DirectoryOpen    = 18,
+    DirectoryRead    = 19,
+    DirectoryClose   = 20,
 };
 
 Result handle_syscall(SyscallFrame& frame);
