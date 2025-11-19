@@ -125,31 +125,17 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            uint32_t type = static_cast<uint32_t>(frame.rdi) &
-                            descriptor::kTypeMask;
-            int32_t handle =
+            uint32_t type = static_cast<uint32_t>(frame.rdi & 0xFFFFu);
+            uint32_t handle =
                 descriptor::open(*proc,
                                  proc->descriptors,
                                  type,
                                  frame.rsi,
                                  frame.rdx,
                                  frame.r10);
-            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
-            return Result::Continue;
-        }
-        case SystemCall::DescriptorQuery: {
-            process::Process* proc = process::current();
-            if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            bool ok = false;
-            uint32_t info = descriptor::query(
-                proc->descriptors,
-                static_cast<uint32_t>(frame.rdi),
-                &ok);
-            frame.rax =
-                ok ? static_cast<uint64_t>(info) : static_cast<uint64_t>(-1);
+            frame.rax = (handle == descriptor::kInvalidHandle)
+                            ? static_cast<uint64_t>(-1)
+                            : static_cast<uint64_t>(handle);
             return Result::Continue;
         }
         case SystemCall::DescriptorRead: {
@@ -160,7 +146,8 @@ Result handle_syscall(SyscallFrame& frame) {
             }
             int64_t result = descriptor::read(*proc,
                                               proc->descriptors,
-                                              static_cast<uint32_t>(frame.rdi),
+                                              static_cast<uint32_t>(frame.rdi &
+                                                                     0xFFFFFFFFu),
                                               frame.rsi,
                                               frame.rdx,
                                               frame.r10);
@@ -175,7 +162,8 @@ Result handle_syscall(SyscallFrame& frame) {
             }
             int64_t result = descriptor::write(*proc,
                                                proc->descriptors,
-                                               static_cast<uint32_t>(frame.rdi),
+                                               static_cast<uint32_t>(frame.rdi &
+                                                                      0xFFFFFFFFu),
                                                frame.rsi,
                                                frame.rdx,
                                                frame.r10);
@@ -190,8 +178,91 @@ Result handle_syscall(SyscallFrame& frame) {
             }
             bool ok = descriptor::close(*proc,
                                         proc->descriptors,
-                                        static_cast<uint32_t>(frame.rdi));
+                                        static_cast<uint32_t>(frame.rdi &
+                                                               0xFFFFFFFFu));
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorGetType: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint16_t type = 0;
+            bool ok = descriptor::get_type(
+                proc->descriptors,
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                type);
+            frame.rax =
+                ok ? static_cast<uint64_t>(type) : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorTestFlag: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool value = false;
+            bool ok = descriptor::test_flag(
+                proc->descriptors,
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                static_cast<uint64_t>(frame.rsi),
+                value);
+            if (!ok) {
+                frame.rax = static_cast<uint64_t>(-1);
+            } else {
+                frame.rax = value ? 1 : 0;
+            }
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorGetFlags: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint64_t flags = 0;
+            bool ok = descriptor::get_flags(
+                proc->descriptors,
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                frame.rsi != 0,
+                flags);
+            frame.rax =
+                ok ? flags : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorGetProperty: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int result = descriptor::get_property(
+                *proc,
+                proc->descriptors,
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                static_cast<uint32_t>(frame.rsi & 0xFFFFFFFFu),
+                frame.rdx,
+                frame.r10);
+            frame.rax = (result == 0) ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorSetProperty: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int result = descriptor::set_property(
+                *proc,
+                proc->descriptors,
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                static_cast<uint32_t>(frame.rsi & 0xFFFFFFFFu),
+                frame.rdx,
+                frame.r10);
+            frame.rax = (result == 0) ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
         case SystemCall::FileOpen: {

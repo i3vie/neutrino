@@ -2,6 +2,7 @@
 
 #include "arch/x86_64/io.hpp"
 #include "../interrupts/pic.hpp"
+#include "../log/logging.hpp"
 
 namespace keyboard {
 namespace {
@@ -14,6 +15,8 @@ size_t g_tail = 0;
 bool g_shift = false;
 bool g_caps_lock = false;
 bool g_initialized = false;
+bool g_left_shift_down = false;
+bool g_right_shift_down = false;
 
 constexpr char kScancodeMap[129] = {
     0,
@@ -59,6 +62,10 @@ bool dequeue(char& ch) {
     return true;
 }
 
+void update_shift_state() {
+    g_shift = g_left_shift_down || g_right_shift_down;
+}
+
 }  // namespace
 
 void init() {
@@ -69,7 +76,10 @@ void init() {
     g_tail = 0;
     g_shift = false;
     g_caps_lock = false;
+    g_left_shift_down = false;
+    g_right_shift_down = false;
     g_initialized = true;
+
     pic::set_mask(1, false);
 }
 
@@ -88,7 +98,12 @@ void handle_irq() {
     if (scancode & 0x80) {
         uint8_t code = static_cast<uint8_t>(scancode & 0x7F);
         if (code == 0x2A || code == 0x36) {
-            g_shift = false;
+            if (code == 0x2A) {
+                g_left_shift_down = false;
+            } else {
+                g_right_shift_down = false;
+            }
+            update_shift_state();
         }
         return;
     }
@@ -96,7 +111,12 @@ void handle_irq() {
     switch (scancode) {
         case 0x2A:  // Left Shift
         case 0x36:  // Right Shift
-            g_shift = true;
+            if (scancode == 0x2A) {
+                g_left_shift_down = true;
+            } else {
+                g_right_shift_down = true;
+            }
+            update_shift_state();
             return;
         case 0x3A:  // Caps Lock
             g_caps_lock = !g_caps_lock;
@@ -147,5 +167,8 @@ size_t read(char* buffer, size_t max_length) {
     return count;
 }
 
-}  // namespace keyboard
+void inject_char(char ch) {
+    enqueue(ch);
+}
 
+}  // namespace keyboard

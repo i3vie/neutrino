@@ -20,8 +20,14 @@ constexpr uint64_t PAGE_LARGE_MASK = PAGE_LARGE_SIZE - 1;
 constexpr uint64_t PTE_PRESENT = 1ull << 0;
 constexpr uint64_t PTE_WRITE = 1ull << 1;
 constexpr uint64_t PTE_USER = 1ull << 2;
+constexpr uint64_t PTE_PWT = 1ull << 3;
+constexpr uint64_t PTE_PCD = 1ull << 4;
+constexpr uint64_t PTE_PAT = 1ull << 7;
 constexpr uint64_t PTE_LARGE = 1ull << 7;
 constexpr uint64_t PTE_GLOBAL = 1ull << 8;
+constexpr uint64_t PTE_NX = 1ull << 63;
+
+constexpr size_t PAGE_TABLE_ENTRIES = 512;
 
 constexpr size_t BOOT_POOL_PAGES = 4096;
 constexpr size_t BOOT_POOL_SIZE = BOOT_POOL_PAGES * PAGE_SIZE;
@@ -88,13 +94,27 @@ uint64_t* ensure_table(uint64_t* table, size_t index, uint64_t flags) {
     }
 
     if (entry & PTE_LARGE) {
-        // We should never treat a large page mapping as a pointer to a table.
-        // Jesus fucking christ I'm gonna do it this time
-        if (kconsole != nullptr) {
-            kconsole->set_color(0xFFFF0000, 0x00000000);
-            kconsole->printf("Attempted to treat large page entry as table.\n");
+        auto* child = static_cast<uint64_t*>(alloc_boot_page());
+        uint64_t phys_base = entry & ~PAGE_LARGE_MASK;
+        uint64_t base_flags = entry & ((1ull << 12) - 1);
+        base_flags &= ~PTE_LARGE;
+        base_flags |= PTE_PRESENT;
+        uint64_t nx_flag = entry & PTE_NX;
+
+        for (size_t i = 0; i < PAGE_TABLE_ENTRIES; ++i) {
+            uint64_t child_phys = phys_base + (i * PAGE_SIZE);
+            uint64_t child_entry = (child_phys & ~PAGE_MASK) | base_flags;
+            child_entry |= nx_flag;
+            child[i] = child_entry;
         }
-        halt_system();
+
+        uint64_t child_phys_addr =
+            virt_to_phys(reinterpret_cast<uint64_t>(child));
+        uint64_t pointer_flags = entry & ((1ull << 12) - 1);
+        pointer_flags &= ~PTE_LARGE;
+        pointer_flags |= PTE_PRESENT | PTE_WRITE;
+        table[index] = child_phys_addr | pointer_flags;
+        entry = table[index];
     }
 
     if ((flags & PTE_USER) != 0 && (entry & PTE_USER) == 0) {
@@ -268,4 +288,37 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
 
 void* paging_alloc_page() {
     return alloc_boot_page();
+}
+
+bool paging_mark_wc(uint64_t virt, uint64_t length) {
+    if (length == 0) {
+        return false;
+    }
+
+    uint64_t start = align_down(virt, PAGE_SIZE);
+    uint64_t end = align_up(virt + length, PAGE_SIZE);
+
+    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+        size_t pml4_index = (addr >> 39) & 0x1FF;
+        size_t pdpt_index = (addr >> 30) & 0x1FF;
+        size_t pd_index = (addr >> 21) & 0x1FF;
+        size_t pt_index = (addr >> 12) & 0x1FF;
+
+        uint64_t* pdpt = ensure_table(pml4_table, pml4_index, PTE_WRITE);
+        uint64_t* pd = ensure_table(pdpt, pdpt_index, PTE_WRITE);
+        uint64_t* pt = ensure_table(pd, pd_index, PTE_WRITE);
+
+        uint64_t entry = pt[pt_index];
+        if ((entry & PTE_PRESENT) == 0) {
+            continue;
+        }
+
+        entry &= ~(PTE_PWT | PTE_PCD);
+        entry |= PTE_PAT;
+        pt[pt_index] = entry;
+
+        asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(addr)) : "memory");
+    }
+
+    return true;
 }

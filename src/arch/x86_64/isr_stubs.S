@@ -47,7 +47,7 @@ isr_common_stub:
     push r14
     push r15
 
-    mov rdi, rsp ; the stack coincidentally is shaped like a C struct so we can just throw that into C
+    mov rdi, rsp ; the stack coincidentally is shaped like a C struct so we can just throw that into C if desires
     extern isr_handler
     call isr_handler
 

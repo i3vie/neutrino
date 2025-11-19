@@ -6,6 +6,7 @@
 #include "drivers/storage/ide_provider.hpp"
 #include "drivers/storage/ramdisk_provider.hpp"
 #include "drivers/fs/fat32/driver.hpp"
+#include "kernel/descriptor.hpp"
 
 namespace fs {
 namespace {
@@ -81,6 +82,7 @@ bool mount_requested_filesystems(const char* root_spec,
                                  size_t mount_count,
                                  size_t& out_total_mounted) {
     ensure_builtins_registered();
+    descriptor::reset_block_device_registry();
 
     BlockDevice discovered[kMaxDiscoveredDevices];
     size_t device_count = 0;
@@ -93,12 +95,22 @@ bool mount_requested_filesystems(const char* root_spec,
         }
 
         size_t remaining = kMaxDiscoveredDevices - device_count;
+        size_t start_index = device_count;
         size_t added =
             g_providers[i](discovered + device_count, remaining);
         if (added > remaining) {
             added = remaining;
         }
         device_count += added;
+        for (size_t j = 0; j < added; ++j) {
+            if (!descriptor::register_block_device(discovered[start_index + j], true)) {
+                log_message(LogLevel::Warn,
+                            "MountManager: failed to register descriptor for %s",
+                            discovered[start_index + j].name != nullptr
+                                ? discovered[start_index + j].name
+                                : "(unnamed)");
+            }
+        }
     }
 
     constexpr size_t kMaxMountSpecs = 16;

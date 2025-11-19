@@ -1,12 +1,15 @@
 // build with:
 // g++ -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -m64 -fPIE -pie -I../crt ../build/crt0.o shell.cpp -o shell.elf
 
-#include "../crt/syscall.hpp"
 #include <stddef.h>
 #include <stdint.h>
+#include "descriptors.hpp"
+#include "../crt/syscall.hpp"
 
-#define DESC_TYPE_CONSOLE  1  // In the future, these would ideally be in
-#define DESC_TYPE_KEYBOARD 3  // kernel-provided headers
+constexpr uint32_t kDescConsole =
+    static_cast<uint32_t>(descriptor_defs::Type::Console);
+constexpr uint32_t kDescKeyboard =
+    static_cast<uint32_t>(descriptor_defs::Type::Keyboard);
 
 namespace {
 
@@ -774,10 +777,10 @@ void execute_command(long console, const char* line) {
 }  // namespace
 
 int main(uint64_t, uint64_t) {
-    long console = descriptor_open(DESC_TYPE_CONSOLE, 0);
+    long console = descriptor_open(kDescConsole, 0);
     if (console < 0) return 1;
 
-    long keyboard = descriptor_open(DESC_TYPE_KEYBOARD, 0);
+    long keyboard = descriptor_open(kDescKeyboard, 0);
     if (keyboard < 0) return 1;
 
     long cwd_len = getcwd(g_current_cwd, sizeof(g_current_cwd));

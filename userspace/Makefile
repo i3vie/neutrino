@@ -17,7 +17,7 @@ PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 ASFLAGS  := -f elf64
 PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
                     -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
-                    -fPIE -pie -Wall -Wextra -I$(CRT_DIR)
+                    -fPIE -pie -Wall -Wextra -I$(CRT_DIR) -I../include
 
 HDD_IMAGE ?= ../hdd.img
 MOUNT_DIR ?= $(HOME)/MountedImage

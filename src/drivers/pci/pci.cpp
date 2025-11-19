@@ -261,6 +261,16 @@ uint32_t read_config32_raw(uint8_t bus,
     return inl(kConfigDataPort);
 }
 
+void write_config32_raw(uint8_t bus,
+                        uint8_t slot,
+                        uint8_t function,
+                        uint8_t offset,
+                        uint32_t value) {
+    uint32_t config_address = build_config_address(bus, slot, function, offset);
+    outl(kConfigAddressPort, config_address);
+    outl(kConfigDataPort, value);
+}
+
 uint16_t read_config16_raw(uint8_t bus,
                            uint8_t slot,
                            uint8_t function,
@@ -270,6 +280,19 @@ uint16_t read_config16_raw(uint8_t bus,
     return static_cast<uint16_t>((value >> shift) & 0xFFFFu);
 }
 
+void write_config16_raw(uint8_t bus,
+                        uint8_t slot,
+                        uint8_t function,
+                        uint8_t offset,
+                        uint16_t value) {
+    uint32_t shift = static_cast<uint32_t>(offset & 0x02u) * 8;
+    uint32_t mask = 0xFFFFu << shift;
+    uint32_t current = read_config32_raw(bus, slot, function, offset);
+    uint32_t combined =
+        (current & ~mask) | ((static_cast<uint32_t>(value) << shift) & mask);
+    write_config32_raw(bus, slot, function, offset, combined);
+}
+
 uint8_t read_config8_raw(uint8_t bus,
                          uint8_t slot,
                          uint8_t function,
@@ -277,6 +300,19 @@ uint8_t read_config8_raw(uint8_t bus,
     uint32_t value = read_config32_raw(bus, slot, function, offset);
     uint32_t shift = static_cast<uint32_t>(offset & 0x03u) * 8;
     return static_cast<uint8_t>((value >> shift) & 0xFFu);
+}
+
+void write_config8_raw(uint8_t bus,
+                       uint8_t slot,
+                       uint8_t function,
+                       uint8_t offset,
+                       uint8_t value) {
+    uint32_t shift = static_cast<uint32_t>(offset & 0x03u) * 8;
+    uint32_t mask = 0xFFu << shift;
+    uint32_t current = read_config32_raw(bus, slot, function, offset);
+    uint32_t combined =
+        (current & ~mask) | ((static_cast<uint32_t>(value) << shift) & mask);
+    write_config32_raw(bus, slot, function, offset, combined);
 }
 
 void enumerate_function(uint8_t bus, uint8_t slot, uint8_t function) {
@@ -411,14 +447,29 @@ uint32_t read_config32(uint8_t bus, uint8_t slot, uint8_t function,
     return read_config32_raw(bus, slot, function, offset);
 }
 
+void write_config32(uint8_t bus, uint8_t slot, uint8_t function,
+                    uint8_t offset, uint32_t value) {
+    write_config32_raw(bus, slot, function, offset, value);
+}
+
 uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t function,
                        uint8_t offset) {
     return read_config16_raw(bus, slot, function, offset);
 }
 
+void write_config16(uint8_t bus, uint8_t slot, uint8_t function,
+                    uint8_t offset, uint16_t value) {
+    write_config16_raw(bus, slot, function, offset, value);
+}
+
 uint8_t read_config8(uint8_t bus, uint8_t slot, uint8_t function,
                      uint8_t offset) {
     return read_config8_raw(bus, slot, function, offset);
+}
+
+void write_config8(uint8_t bus, uint8_t slot, uint8_t function,
+                   uint8_t offset, uint8_t value) {
+    write_config8_raw(bus, slot, function, offset, value);
 }
 
 uint32_t read_config32(const PciDevice& device, uint8_t offset) {
@@ -431,6 +482,18 @@ uint16_t read_config16(const PciDevice& device, uint8_t offset) {
 
 uint8_t read_config8(const PciDevice& device, uint8_t offset) {
     return read_config8(device.bus, device.slot, device.function, offset);
+}
+
+void write_config32(const PciDevice& device, uint8_t offset, uint32_t value) {
+    write_config32(device.bus, device.slot, device.function, offset, value);
+}
+
+void write_config16(const PciDevice& device, uint8_t offset, uint16_t value) {
+    write_config16(device.bus, device.slot, device.function, offset, value);
+}
+
+void write_config8(const PciDevice& device, uint8_t offset, uint8_t value) {
+    write_config8(device.bus, device.slot, device.function, offset, value);
 }
 
 const char* class_name(uint8_t class_code) {

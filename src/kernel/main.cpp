@@ -14,8 +14,11 @@
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/idt.hpp"
 #include "arch/x86_64/memory/paging.hpp"
+#include "arch/x86_64/pat.hpp"
+#include "arch/x86_64/mtrr.hpp"
 #include "arch/x86_64/syscall.hpp"
 #include "arch/x86_64/tss.hpp"
+#include "arch/x86_64/io.hpp"
 #include "config.hpp"
 #include "descriptor.hpp"
 #include "loader.hpp"
@@ -208,8 +211,18 @@ static void kernel_main_stage2() {
     }
 
     auto fb = *framebuffer_request.response->framebuffers[0];
+    uint8_t* fb_virtual = static_cast<uint8_t*>(fb.address);
+    uint64_t fb_phys_addr = reinterpret_cast<uint64_t>(fb.address);
+    if (hhdm_request.response != nullptr &&
+        hhdm_request.response->offset != 0 &&
+        fb_phys_addr >= hhdm_request.response->offset) {
+        fb_phys_addr -= hhdm_request.response->offset;
+    }
+    uint64_t fb_length =
+        static_cast<uint64_t>(fb.pitch) * static_cast<uint64_t>(fb.height);
+
     Framebuffer framebuffer = {
-        static_cast<uint8_t*>(fb.address),
+        fb_virtual,
         static_cast<size_t>(fb.width),
         static_cast<size_t>(fb.height),
         static_cast<size_t>(fb.pitch),
@@ -221,7 +234,18 @@ static void kernel_main_stage2() {
         fb.green_mask_shift,
         fb.blue_mask_size,
         fb.blue_mask_shift};
-    Console console = Console(&framebuffer);
+
+    descriptor::init();
+    descriptor::register_builtin_types();
+
+    descriptor::register_framebuffer_device(framebuffer, fb_phys_addr);
+    uint32_t framebuffer_handle =
+        descriptor::open_kernel(descriptor::kTypeFramebuffer, 0, 0, 0);
+    if (framebuffer_handle == descriptor::kInvalidHandle) {
+        log_message(LogLevel::Warn,
+                    "Console: failed to open framebuffer descriptor");
+    }
+    Console console = Console(framebuffer_handle);
     kconsole = &console;  // HAVE AT THEE
 
     log_init();
@@ -286,7 +310,35 @@ static void kernel_main_stage2() {
 
     log_message(LogLevel::Info, "Initializing paging");
     paging_init();
+    if (kconsole != nullptr) {
+        kconsole->enable_back_buffer();
+    }
     log_message(LogLevel::Info, "Paging initialized");
+
+    bool pat_ok = cpu::configure_pat_write_combining();
+    bool wc_pages = false;
+    if (pat_ok && fb_virtual != nullptr) {
+        wc_pages = paging_mark_wc(reinterpret_cast<uint64_t>(fb_virtual),
+                                  fb_length);
+    }
+    bool mtrr_ok = cpu::configure_write_combining(fb_phys_addr, fb_length);
+
+    if (!pat_ok) {
+        log_message(LogLevel::Warn,
+                    "PAT: failed to configure write-combining entry");
+    } else if (!wc_pages) {
+        log_message(LogLevel::Warn,
+                    "PAT: failed to mark framebuffer pages WC (virt=%016llx len=%llu)",
+                    reinterpret_cast<unsigned long long>(fb_virtual),
+                    static_cast<unsigned long long>(fb_length));
+    }
+
+    if (!mtrr_ok) {
+        log_message(LogLevel::Warn,
+                    "Framebuffer WC configuration failed (phys=%016llx len=%llu)",
+                    static_cast<unsigned long long>(fb_phys_addr),
+                    static_cast<unsigned long long>(fb_length));
+    }
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
     pci::init();
@@ -523,8 +575,6 @@ if (root_ptr != nullptr && root_ok && !kernel_config_loaded) {
                 root_ptr);
 }
 
-descriptor::init();
-descriptor::register_builtin_types();
 process::init();
 scheduler::init();
 

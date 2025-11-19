@@ -35,9 +35,20 @@ uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t function,
 uint8_t read_config8(uint8_t bus, uint8_t slot, uint8_t function,
                      uint8_t offset);
 
+void write_config32(uint8_t bus, uint8_t slot, uint8_t function,
+                    uint8_t offset, uint32_t value);
+void write_config16(uint8_t bus, uint8_t slot, uint8_t function,
+                    uint8_t offset, uint16_t value);
+void write_config8(uint8_t bus, uint8_t slot, uint8_t function,
+                   uint8_t offset, uint8_t value);
+
 uint32_t read_config32(const PciDevice& device, uint8_t offset);
 uint16_t read_config16(const PciDevice& device, uint8_t offset);
 uint8_t read_config8(const PciDevice& device, uint8_t offset);
+
+void write_config32(const PciDevice& device, uint8_t offset, uint32_t value);
+void write_config16(const PciDevice& device, uint8_t offset, uint16_t value);
+void write_config8(const PciDevice& device, uint8_t offset, uint8_t value);
 
 const char* class_name(uint8_t class_code);
 const char* subclass_name(uint8_t class_code, uint8_t subclass);

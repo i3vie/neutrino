@@ -1,8 +1,10 @@
-#include "../crt/syscall.hpp"
 #include <stddef.h>
 #include <stdint.h>
+#include "descriptors.hpp"
+#include "../crt/syscall.hpp"
 
-#define DESC_TYPE_CONSOLE 1
+constexpr uint32_t kDescConsole =
+    static_cast<uint32_t>(descriptor_defs::Type::Console);
 
 namespace {
 
@@ -39,7 +41,7 @@ int main(uint64_t arg_ptr, uint64_t /*flags*/) {
         return 1;
     }
 
-    long console = descriptor_open(DESC_TYPE_CONSOLE, 0);
+    long console = descriptor_open(kDescConsole, 0);
     if (console < 0) {
         return 1;
     }

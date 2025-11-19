@@ -3,6 +3,7 @@
 #include <stdarg.h>
 
 #include "lib/mem.hpp"
+#include "../../arch/x86_64/memory/paging.hpp"
 
 namespace {
 
@@ -10,6 +11,7 @@ constexpr int kGlyphWidth = 8;
 constexpr int kGlyphHeight = 8;
 constexpr int kLineSpacing = 3 * scale;
 constexpr uint8_t kMemoryModelRgb = 1;
+constexpr size_t kPageSize = 0x1000;
 
 size_t bytes_per_pixel(const Framebuffer* fb) {
     if (fb == nullptr || fb->bpp == 0) {
@@ -55,25 +57,32 @@ uint64_t pack_color(const Framebuffer* fb, uint32_t argb) {
     return packed;
 }
 
-void write_packed_pixel(Framebuffer* fb,
-                        size_t px,
-                        size_t py,
-                        uint64_t packed_color) {
-    if (fb == nullptr || fb->base == nullptr) {
-        return;
+inline void store_pixel(uint8_t* dst, size_t bpp, uint64_t packed_color) {
+    for (size_t i = 0; i < bpp; ++i) {
+        dst[i] = static_cast<uint8_t>((packed_color >> (8 * i)) & 0xFFu);
     }
-    if (px >= fb->width || py >= fb->height) {
+}
+
+void fill_span(uint8_t* dst,
+               size_t pixel_count,
+               size_t bpp,
+               uint64_t packed_color) {
+    if (dst == nullptr || pixel_count == 0 || bpp == 0) {
         return;
     }
 
-    size_t bpp_bytes = bytes_per_pixel(fb);
-    uint8_t* dst =
-        fb->base + py * fb->pitch + px * bpp_bytes;
-    for (size_t i = 0; i < bpp_bytes; ++i) {
-        dst[i] = static_cast<uint8_t>(
-            (packed_color >> (8 * i)) & 0xFF);
+    size_t total_bytes = pixel_count * bpp;
+    store_pixel(dst, bpp, packed_color);
+    size_t filled = bpp;
+
+    while (filled < total_bytes) {
+        size_t copy = (filled < total_bytes - filled) ? filled
+                                                      : (total_bytes - filled);
+        memcpy(dst + filled, dst, copy);
+        filled += copy;
     }
 }
+
 
 size_t cell_width_px() {
     return static_cast<size_t>(kGlyphWidth * scale);
@@ -92,19 +101,42 @@ void fill_rect(Framebuffer* fb,
     if (fb == nullptr || fb->base == nullptr) {
         return;
     }
+    if (width == 0 || height == 0) {
+        return;
+    }
+
+    size_t bpp = bytes_per_pixel(fb);
+    if (bpp == 0) {
+        return;
+    }
+
+    if (x >= fb->width || y >= fb->height) {
+        return;
+    }
+
+    if (width > fb->width - x) {
+        width = fb->width - x;
+    }
+
     uint64_t packed = pack_color(fb, color);
     for (size_t row = 0; row < height; ++row) {
         size_t py = y + row;
         if (py >= fb->height) {
             break;
         }
-        for (size_t col = 0; col < width; ++col) {
-            size_t px = x + col;
-            if (px >= fb->width) {
-                break;
+
+        uint8_t* dst = fb->base + py * fb->pitch + x * bpp;
+        size_t max_bytes = fb->pitch - x * bpp;
+        size_t row_pixels = width;
+        size_t needed_bytes = row_pixels * bpp;
+        if (needed_bytes > max_bytes) {
+            row_pixels = max_bytes / bpp;
+            if (row_pixels == 0) {
+                continue;
             }
-            write_packed_pixel(fb, px, py, packed);
         }
+
+        fill_span(dst, row_pixels, bpp, packed);
     }
 }
 
@@ -113,8 +145,166 @@ void fill_rect(Framebuffer* fb,
 Console* kconsole = nullptr;
 uint32_t DEFAULT_BG = 0x00000000;
 
-Console::Console(Framebuffer* fb)
-    : fb(fb),
+bool Console::allocate_back_buffer() {
+    if (back_buffer != nullptr) {
+        return true;
+    }
+    if (primary_fb.base == nullptr || frame_bytes == 0) {
+        return false;
+    }
+
+    size_t pages = (frame_bytes + kPageSize - 1) / kPageSize;
+    uint8_t* start = nullptr;
+
+    for (size_t i = 0; i < pages; ++i) {
+        auto* page = static_cast<uint8_t*>(paging_alloc_page());
+        if (page == nullptr) {
+            return false;
+        }
+        if (i == 0) {
+            start = page;
+        }
+    }
+
+    back_buffer = start;
+    back_buffer_capacity = pages * kPageSize;
+    back_fb = primary_fb;
+    back_fb.base = back_buffer;
+    return true;
+}
+
+Framebuffer* Console::draw_target() {
+    if (back_buffer != nullptr) {
+        return &back_fb;
+    }
+    return &primary_fb;
+}
+
+bool Console::enable_back_buffer() {
+    if (back_buffer != nullptr) {
+        return true;
+    }
+    if (!allocate_back_buffer()) {
+        return false;
+    }
+    if (frame_bytes == 0 || primary_fb.base == nullptr) {
+        return true;
+    }
+
+    size_t bytes = frame_bytes;
+    if (bytes > back_buffer_capacity) {
+        bytes = back_buffer_capacity;
+    }
+    if (bytes == 0) {
+        return true;
+    }
+
+    memcpy(back_buffer, primary_fb.base, bytes);
+    return true;
+}
+
+void Console::flush_region(size_t x, size_t y, size_t width, size_t height) {
+    if (back_buffer == nullptr || primary_fb.base == nullptr) {
+        return;
+    }
+    if (width == 0 || height == 0) {
+        return;
+    }
+    if (x >= primary_fb.width || y >= primary_fb.height) {
+        return;
+    }
+
+    size_t bpp = bytes_per_pixel(&primary_fb);
+    if (bpp == 0) {
+        return;
+    }
+
+    size_t max_width = primary_fb.width - x;
+    size_t copy_width = width > max_width ? max_width : width;
+    size_t max_height = primary_fb.height - y;
+    size_t copy_height = height > max_height ? max_height : height;
+
+    size_t row_bytes = copy_width * bpp;
+
+    for (size_t row = 0; row < copy_height; ++row) {
+        size_t offset = (y + row) * primary_fb.pitch + x * bpp;
+        if (offset >= frame_bytes || offset >= back_buffer_capacity) {
+            break;
+        }
+
+        size_t usable = frame_bytes - offset;
+        size_t cap_remaining = back_buffer_capacity - offset;
+        if (usable > cap_remaining) {
+            usable = cap_remaining;
+        }
+
+        size_t to_copy = row_bytes;
+        if (to_copy > usable) {
+            to_copy = usable;
+        }
+        if (to_copy == 0) {
+            break;
+        }
+
+        memcpy_fast(primary_fb.base + offset, back_buffer + offset, to_copy);
+    }
+}
+
+void Console::flush_all() {
+    if (back_buffer == nullptr || primary_fb.base == nullptr) {
+        return;
+    }
+
+    if (frame_bytes == 0 || back_buffer_capacity == 0) {
+        return;
+    }
+
+    size_t bytes = frame_bytes;
+    if (bytes > back_buffer_capacity) {
+        bytes = back_buffer_capacity;
+    }
+    if (bytes == 0) {
+        return;
+    }
+
+    memcpy_fast(primary_fb.base, back_buffer, bytes);
+}
+
+bool Console::refresh_framebuffer_info() {
+    descriptor_defs::FramebufferInfo info{};
+    int result = descriptor::get_property_kernel(
+        framebuffer_handle,
+        static_cast<uint32_t>(descriptor_defs::Property::FramebufferInfo),
+        &info,
+        sizeof(info));
+    if (result != 0) {
+        primary_fb = {};
+        frame_bytes = 0;
+        return false;
+    }
+
+    primary_fb.base = reinterpret_cast<uint8_t*>(info.virtual_base);
+    primary_fb.width = static_cast<size_t>(info.width);
+    primary_fb.height = static_cast<size_t>(info.height);
+    primary_fb.pitch = static_cast<size_t>(info.pitch);
+    primary_fb.bpp = info.bpp;
+    primary_fb.memory_model = info.memory_model;
+    primary_fb.red_mask_size = info.red_mask_size;
+    primary_fb.red_mask_shift = info.red_mask_shift;
+    primary_fb.green_mask_size = info.green_mask_size;
+    primary_fb.green_mask_shift = info.green_mask_shift;
+    primary_fb.blue_mask_size = info.blue_mask_size;
+    primary_fb.blue_mask_shift = info.blue_mask_shift;
+
+    frame_bytes = (primary_fb.pitch != 0)
+                      ? primary_fb.pitch * primary_fb.height
+                      : 0;
+    return primary_fb.base != nullptr;
+}
+
+Console::Console(uint32_t framebuffer_handle)
+    : framebuffer_handle(framebuffer_handle),
+      primary_fb{},
       cursor_x(0),
       cursor_y(0),
       fg_color(0xFFFFFFFF),
@@ -122,7 +312,13 @@ Console::Console(Framebuffer* fb)
       columns(0),
       rows(0),
       text_width(0),
-      text_height(0) {  // white on black
+      text_height(0),
+      back_fb{},
+      back_buffer(nullptr),
+      frame_bytes(0),
+      back_buffer_capacity(0) {  // white on black
+    refresh_framebuffer_info();
+
     size_t cw = cell_width_px();
     size_t ch = cell_height_px();
     if (cw == 0) {
@@ -131,11 +327,11 @@ Console::Console(Framebuffer* fb)
     if (ch == 0) {
         ch = 1;
     }
-    columns = fb ? (fb->width / cw) : 0;
-    rows = fb ? (fb->height / ch) : 0;
+    columns = (primary_fb.width != 0) ? (primary_fb.width / cw) : 0;
+    rows = (primary_fb.height != 0) ? (primary_fb.height / ch) : 0;
     text_width = columns * cw;
     text_height = rows * ch;
-    
+
     if (columns == 0) {
         columns = 1;
         text_width = cw;
@@ -144,96 +340,150 @@ Console::Console(Framebuffer* fb)
         rows = 1;
         text_height = ch;
     }
+
+    if (frame_bytes == 0 && primary_fb.pitch != 0) {
+        frame_bytes = primary_fb.pitch * primary_fb.height;
+    }
 }
 
 void Console::draw_char(char c, size_t x, size_t y) {
+    Framebuffer* target = draw_target();
+    if (target == nullptr || target->base == nullptr) {
+        return;
+    }
     if (x >= columns || y >= rows) {
         return;
     }
-    if ((unsigned char)c >= 128) return;
+    uint8_t uc = static_cast<uint8_t>(c);
+    if (uc >= 128) return;
 
     size_t glyph_width = cell_width_px();
     size_t glyph_height = static_cast<size_t>(kGlyphHeight * scale);
     size_t base_px = x * glyph_width;
     size_t base_py = y * cell_height_px();
-    uint64_t packed_fg = pack_color(fb, fg_color);
-    uint64_t packed_bg = pack_color(fb, bg_color);
+    if (base_px >= text_width || base_py >= target->height) {
+        return;
+    }
+
+    size_t bpp = bytes_per_pixel(target);
+    if (bpp == 0) {
+        return;
+    }
+
+    size_t max_draw_width = text_width - base_px;
+    if (max_draw_width == 0) {
+        return;
+    }
+
+    size_t glyph_draw_width = glyph_width;
+    if (glyph_draw_width > max_draw_width) {
+        glyph_draw_width = max_draw_width;
+    }
+    if (glyph_draw_width == 0) {
+        return;
+    }
+
+    uint64_t packed_fg = pack_color(target, fg_color);
+    uint64_t packed_bg = pack_color(target, bg_color);
 
     for (int row = 0; row < kGlyphHeight; ++row) {
-        uint8_t bits = font8x8_basic[(uint8_t)c][row];
-        for (int col = 0; col < kGlyphWidth; ++col) {
-            uint64_t packed =
-                (bits & (1 << col)) ? packed_fg : packed_bg;
-            for (int dy = 0; dy < scale; ++dy) {
-                for (int dx = 0; dx < scale; ++dx) {
-                    size_t px = base_px + col * scale + dx;
-                    size_t py = base_py + row * scale + dy;
-                    if (px >= text_width) {
-                        continue;
-                    }
-                    write_packed_pixel(fb, px, py, packed);
+        uint8_t bits = font8x8_basic[uc][row];
+        for (int dy = 0; dy < scale; ++dy) {
+            size_t py = base_py + static_cast<size_t>(row) * scale + dy;
+            if (py >= target->height) {
+                continue;
+            }
+
+            uint8_t* dst = target->base + py * target->pitch + base_px * bpp;
+            size_t px_offset = 0;
+            for (int col = 0; col < kGlyphWidth && px_offset < glyph_draw_width; ++col) {
+                bool bit_set = (bits & (1u << col)) != 0;
+                size_t span = static_cast<size_t>(scale);
+                if (px_offset + span > glyph_draw_width) {
+                    span = glyph_draw_width - px_offset;
                 }
+                fill_span(dst + px_offset * bpp,
+                          span,
+                          bpp,
+                          bit_set ? packed_fg : packed_bg);
+                px_offset += span;
+            }
+            if (px_offset < glyph_draw_width) {
+                fill_span(dst + px_offset * bpp,
+                          glyph_draw_width - px_offset,
+                          bpp,
+                          packed_bg);
             }
         }
     }
 
     // fill line spacing with background colour
     size_t gap_start_y = base_py + glyph_height;
-    if (kLineSpacing > 0 && gap_start_y < fb->height) {
-        size_t draw_width = glyph_width;
-        if (base_px + draw_width > text_width) {
-            if (base_px >= text_width) {
-                draw_width = 0;
-            } else {
-                draw_width = text_width - base_px;
-            }
-        }
-        if (draw_width == 0) {
-            return;
-        }
-        fill_rect(fb,
+    if (kLineSpacing > 0 && gap_start_y < target->height && glyph_draw_width > 0) {
+        fill_rect(target,
                   base_px,
                   gap_start_y,
-                  draw_width,
+                  glyph_draw_width,
                   static_cast<size_t>(kLineSpacing),
                   bg_color);
     }
+
+    if (back_buffer != nullptr) {
+        size_t flush_height = glyph_height + kLineSpacing;
+        size_t remaining_height = (base_py < target->height)
+                                      ? (target->height - base_py)
+                                      : 0;
+        if (flush_height > remaining_height) {
+            flush_height = remaining_height;
+        }
+        if (flush_height == 0) {
+            flush_height = glyph_height;
+        }
+        size_t flush_width = glyph_draw_width;
+        if (flush_width == 0) {
+            flush_width = glyph_width;
+        }
+        flush_region(base_px, base_py, flush_width, flush_height);
+    }
 }
 
-void Console::set_color(uint32_t fg, uint32_t bg = DEFAULT_BG) {
+void Console::set_color(uint32_t fg, uint32_t bg) {
     fg_color = fg;
     bg_color = bg;
 }
 
 void Console::scroll() {
     size_t row_height = cell_height_px();
-    if (row_height == 0 || fb == nullptr) {
+    Framebuffer* target = draw_target();
+    if (row_height == 0 || target == nullptr || target->base == nullptr) {
         return;
     }
     if (text_height == 0) {
-        text_height = fb->height - (fb->height % row_height);
+        text_height = target->height - (target->height % row_height);
     }
     if (row_height >= text_height) {
-        fill_rect(fb, 0, 0, fb->width, fb->height, bg_color);
+        fill_rect(target, 0, 0, target->width, target->height, bg_color);
+        if (back_buffer != nullptr) {
+            flush_all();
+        }
         cursor_y = 0;
         return;
     }
 
-    size_t bpp = bytes_per_pixel(fb);
-    size_t copy_width = text_width > 0 ? text_width : fb->width;
-    size_t copy_bytes = copy_width * bpp;
-    if (copy_bytes > fb->pitch) {
-        copy_bytes = fb->pitch;
+    size_t rows_to_copy = text_height - row_height;
+    size_t bytes_to_copy = rows_to_copy * target->pitch;
+    if (bytes_to_copy > 0) {
+        memmove_fast(target->base,
+                     target->base + row_height * target->pitch,
+                     bytes_to_copy);
     }
 
-    size_t total_rows = text_height - row_height;
-    for (size_t py = 0; py < total_rows; ++py) {
-        uint8_t* dst = fb->base + py * fb->pitch;
-        const uint8_t* src = fb->base + (py + row_height) * fb->pitch;
-        memcpy(dst, src, copy_bytes);
+    size_t copy_width = text_width > 0 ? text_width : target->width;
+    if (copy_width > target->width) {
+        copy_width = target->width;
     }
 
-    fill_rect(fb,
+    fill_rect(target,
               0,
               text_height - row_height,
               copy_width,
@@ -241,13 +491,21 @@ void Console::scroll() {
               bg_color);
 
     if (cursor_y > 0) cursor_y--;
+
+    if (back_buffer != nullptr) {
+        flush_all();
+    }
 }
 
 void Console::putc(char c) {
+    Framebuffer* target = draw_target();
     if (c == '\n') {
         cursor_x = 0;
         cursor_y++;
-        if ((cursor_y + 1) * cell_height_px() >= fb->height) scroll();
+        if (target != nullptr &&
+            (cursor_y + 1) * cell_height_px() >= target->height) {
+            scroll();
+        }
         return;
     }
     if (c == '\r') {
@@ -258,7 +516,8 @@ void Console::putc(char c) {
         if (cursor_x > 0) {
             cursor_x--;
         } else if (cursor_y > 0) {
-            size_t max_cols = fb->width / cell_width_px();
+            size_t max_cols = target != nullptr ? (target->width / cell_width_px())
+                                                : 0;
             if (max_cols > 0) {
                 cursor_y--;
                 cursor_x = max_cols - 1;
@@ -282,7 +541,14 @@ void Console::puts(const char* s) {
 }
 
 void Console::clear() {
-    fill_rect(fb, 0, 0, fb->width, fb->height, bg_color);
+    Framebuffer* target = draw_target();
+    if (target == nullptr || target->base == nullptr) {
+        return;
+    }
+    fill_rect(target, 0, 0, target->width, target->height, bg_color);
+    if (back_buffer != nullptr) {
+        flush_all();
+    }
     cursor_x = cursor_y = 0;
 }
 

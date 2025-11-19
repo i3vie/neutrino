@@ -3,33 +3,41 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "descriptors.hpp"
+
 enum class SystemCall : long {
     AbiMajor         = 0,
     AbiMinor         = 1,
     Exit             = 2,
     Yield            = 3,
     DescriptorOpen   = 4,
-    DescriptorQuery  = 5,
-    DescriptorRead   = 6,
-    DescriptorWrite  = 7,
-    DescriptorClose  = 8,
-    FileOpen         = 9,
-    FileClose        = 10,
-    FileRead         = 11,
-    FileWrite        = 12,
-    FileCreate       = 13,
-    ProcessExec      = 14,
-    Child            = 15,
-    ProcessSetCwd    = 16,
-    ProcessGetCwd    = 17,
-    DirectoryOpen    = 18,
-    DirectoryRead    = 19,
-    DirectoryClose   = 20,
+    DescriptorRead   = 5,
+    DescriptorWrite      = 6,
+    DescriptorClose      = 7,
+    DescriptorGetType    = 8,
+    DescriptorTestFlag   = 9,
+    DescriptorGetFlags   = 10,
+    DescriptorGetProperty= 11,
+    DescriptorSetProperty= 12,
+    FileOpen             = 13,
+    FileClose            = 14,
+    FileRead             = 15,
+    FileWrite            = 16,
+    FileCreate           = 17,
+    ProcessExec          = 18,
+    Child                = 19,
+    ProcessSetCwd        = 20,
+    ProcessGetCwd        = 21,
+    DirectoryOpen        = 22,
+    DirectoryRead        = 23,
+    DirectoryClose       = 24,
 };
 
 enum : uint32_t {
     DIR_ENTRY_FLAG_DIRECTORY = 1u << 0,
 };
+
+constexpr uint32_t kInvalidDescriptor = 0xFFFFFFFFu;
 
 struct DirEntry {
     char name[64];
@@ -127,22 +135,56 @@ static inline long child(const char* path,
 
 // requests a descriptor of the given type. the optional parameters allow
 // callers to select a specific resource instance, request particular
-// capability bits, or pass type-specific context understood by the kernel
+// flag bits, or pass type-specific context understood by the kernel
 // or provider.
 static inline long descriptor_open(uint32_t type,
                                    uint64_t resource_selector = 0,
-                                   uint64_t requested_capabilities = 0,
+                                   uint64_t requested_flags = 0,
                                    uint64_t open_context = 0) {
     return raw_syscall4(SystemCall::DescriptorOpen,
                         static_cast<long>(type),
                         static_cast<long>(resource_selector),
-                        static_cast<long>(requested_capabilities),
+                        static_cast<long>(requested_flags),
                         static_cast<long>(open_context));
 }
 
-static inline long descriptor_query(uint32_t handle) {
-    return raw_syscall1(SystemCall::DescriptorQuery,
+static inline long descriptor_get_type(uint32_t handle) {
+    return raw_syscall1(SystemCall::DescriptorGetType,
                         static_cast<long>(handle));
+}
+
+static inline long descriptor_test_flag(uint32_t handle, uint64_t flag) {
+    return raw_syscall2(SystemCall::DescriptorTestFlag,
+                        static_cast<long>(handle),
+                        static_cast<long>(flag));
+}
+
+static inline long descriptor_get_flags(uint32_t handle, bool extended) {
+    return raw_syscall2(SystemCall::DescriptorGetFlags,
+                        static_cast<long>(handle),
+                        static_cast<long>(extended ? 1 : 0));
+}
+
+static inline long descriptor_get_property(uint32_t handle,
+                                           uint32_t property,
+                                           void* out,
+                                           size_t size) {
+    return raw_syscall4(SystemCall::DescriptorGetProperty,
+                        static_cast<long>(handle),
+                        static_cast<long>(property),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(out)),
+                        static_cast<long>(size));
+}
+
+static inline long descriptor_set_property(uint32_t handle,
+                                           uint32_t property,
+                                           const void* in,
+                                           size_t size) {
+    return raw_syscall4(SystemCall::DescriptorSetProperty,
+                        static_cast<long>(handle),
+                        static_cast<long>(property),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(in)),
+                        static_cast<long>(size));
 }
 
 static inline long descriptor_read(uint32_t handle,
