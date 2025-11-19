@@ -207,6 +207,7 @@ void map_identity_range(uint64_t phys_start, uint64_t length, uint64_t flags) {
 bool should_map(uint64_t type) {
     switch (type) {
         case LIMINE_MEMMAP_USABLE:
+        case LIMINE_MEMMAP_RESERVED:
         case LIMINE_MEMMAP_ACPI_RECLAIMABLE:
         case LIMINE_MEMMAP_ACPI_NVS:
         case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE:

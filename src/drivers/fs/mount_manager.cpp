@@ -4,6 +4,7 @@
 
 #include "drivers/log/logging.hpp"
 #include "drivers/storage/ide_provider.hpp"
+#include "drivers/storage/emmc_provider.hpp"
 #include "drivers/storage/ramdisk_provider.hpp"
 #include "drivers/fs/fat32/driver.hpp"
 #include "kernel/descriptor.hpp"
@@ -29,6 +30,7 @@ void ensure_builtins_registered() {
     }
     register_ramdisk_block_device_provider();
     register_ide_block_device_provider();
+    register_emmc_block_device_provider();
     register_fat32_filesystem_driver();
     g_builtins_registered = true;
 }
