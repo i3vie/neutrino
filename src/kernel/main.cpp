@@ -651,6 +651,8 @@ if (root_ptr != nullptr) {
 bool init_loaded = false;
 const char* init_path_used = nullptr;
 
+//asm volatile("ud2");
+
 for (size_t i = 0; i < init_candidate_count; ++i) {
     const char* candidate = init_candidates[i];
     if (candidate == nullptr) {
