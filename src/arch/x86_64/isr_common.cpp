@@ -5,6 +5,8 @@
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "../../kernel/scheduler.hpp"
+#include "percpu.hpp"
+#include "lapic.hpp"
 #include "isr.hpp"
 
 // Interrupt number to name mapping
@@ -51,23 +53,49 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     if (regs->int_no >= 32) {
         uint64_t irq = regs->int_no - 32;
         if (irq == 0) {
-            if ((regs->cs & 0x3) != 0) {
-                scheduler::reschedule_from_interrupt(*regs);
-            }
+            scheduler::tick(*regs);
+            pic::send_eoi(0);
+            lapic::eoi();
+            return;
         } else if (irq == 1) {
             keyboard::handle_irq();
+            pic::send_eoi(1);
+            lapic::eoi();
+            return;
+        } else if (regs->int_no == 0x40) {
+            scheduler::tick(*regs);
+            lapic::eoi();
+            return;
         }
-        if (irq < 16) {
-            pic::send_eoi(static_cast<uint8_t>(irq));
-        }
+        lapic::eoi();
         return;
     }
 
     log_message(LogLevel::Error, "Exception %x %s",
                 static_cast<unsigned int>(regs->int_no),
                 regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown");
-    log_message(LogLevel::Error, "Error code: %x",
-                static_cast<unsigned int>(regs->err_code));
+    if (auto* cpu = percpu::current_cpu()) {
+        log_message(LogLevel::Error,
+                    "CPU: lapic=%u processor=%u",
+                    cpu->lapic_id,
+                    cpu->processor_id);
+    }
+    uint16_t selector = static_cast<uint16_t>(regs->err_code & 0xFFF8);
+    bool external = (regs->err_code & 0x1) != 0;
+    bool idt = (regs->err_code & 0x2) != 0;
+    bool ldt = (regs->err_code & 0x4) != 0;
+    log_message(LogLevel::Error, "Error code: %x (sel=%04x ext=%d idt=%d ldt=%d)",
+                static_cast<unsigned int>(regs->err_code),
+                static_cast<unsigned int>(selector),
+                external ? 1 : 0,
+                idt ? 1 : 0,
+                ldt ? 1 : 0);
+    if (regs->int_no == 14) {
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        log_message(LogLevel::Error, "CR2=%016llx",
+                    static_cast<unsigned long long>(cr2));
+    }
 
     log_message(LogLevel::Debug, "RAX=%016x     RBX=%016x     RCX=%016x",
                 static_cast<unsigned long long>(regs->rax),
@@ -96,6 +124,18 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     log_message(LogLevel::Debug, "CS=%04x    SS=%04x",
                 static_cast<unsigned int>(regs->cs),
                 static_cast<unsigned int>(regs->ss));
+
+    uint64_t* stack = reinterpret_cast<uint64_t*>(regs->rsp);
+    if (stack != nullptr) {
+        log_message(LogLevel::Debug,
+                    "Stack[0..5]: %016llx %016llx %016llx %016llx %016llx %016llx",
+                    static_cast<unsigned long long>(stack[0]),
+                    static_cast<unsigned long long>(stack[1]),
+                    static_cast<unsigned long long>(stack[2]),
+                    static_cast<unsigned long long>(stack[3]),
+                    static_cast<unsigned long long>(stack[4]),
+                    static_cast<unsigned long long>(stack[5]));
+    }
 
     for (;;) asm("hlt");
 }

@@ -4,7 +4,6 @@
 #include <stdint.h>
 
 #include "arch/x86_64/io.hpp"
-#include "drivers/log/logging.hpp"
 #include "lib/mem.hpp"
 
 namespace {
@@ -95,9 +94,6 @@ bool wait_not_busy(IdeDeviceId device, uint32_t timeout = 100000) {
             return true;
         }
     }
-    log_message(LogLevel::Warn,
-                "IDE %s: timeout waiting for BSY to clear",
-                device_name(device));
     return false;
 }
 
@@ -106,18 +102,12 @@ bool wait_drq(IdeDeviceId device, uint32_t timeout = 100000) {
     while (timeout--) {
         uint8_t status = io_read8(desc, ATA_REG_STATUS);
         if (status & ATA_SR_ERR) {
-            log_message(LogLevel::Error,
-                        "IDE %s: status error: %02x",
-                        device_name(device), status);
             return false;
         }
         if (status & ATA_SR_DRQ) {
             return true;
         }
     }
-    log_message(LogLevel::Warn,
-                "IDE %s: timeout waiting for DRQ",
-                device_name(device));
     return false;
 }
 
@@ -163,13 +153,9 @@ bool identify_device(IdeDeviceId device) {
     state.identify.sector_count = 0;
 
     const auto& desc = device_desc(device);
-    const char* name = device_name(device);
 
     uint8_t status = io_read8(desc, ATA_REG_STATUS);
     if (status == 0xFF) {
-        log_message(LogLevel::Warn,
-                    "IDE %s: bus floating (no device)",
-                    name);
         state.probed = true;
         return false;
     }
@@ -189,9 +175,6 @@ bool identify_device(IdeDeviceId device) {
 
     status = io_read8(desc, ATA_REG_STATUS);
     if (status == 0) {
-        log_message(LogLevel::Warn,
-                    "IDE %s: identify returned zero status",
-                    name);
         state.probed = true;
         return false;
     }
@@ -206,17 +189,8 @@ bool identify_device(IdeDeviceId device) {
     status = io_read8(desc, ATA_REG_STATUS);
     if (status & ATA_SR_ERR) {
         if (signature_lba1 == 0x14 && signature_lba2 == 0xEB) {
-            log_message(LogLevel::Info,
-                        "IDE %s: ATAPI device detected (unsupported)",
-                        name);
         } else if (signature_lba1 == 0x69 && signature_lba2 == 0x96) {
-            log_message(LogLevel::Info,
-                        "IDE %s: SATA device detected (unsupported)",
-                        name);
         } else {
-            log_message(LogLevel::Warn,
-                        "IDE %s: identify reported error (status=%02x lba1=%02x lba2=%02x)",
-                        name, status, signature_lba1, signature_lba2);
         }
         state.probed = true;
         return false;
@@ -239,12 +213,6 @@ bool identify_device(IdeDeviceId device) {
 
     state.identify.present = true;
     state.probed = true;
-
-    log_message(LogLevel::Info,
-                "IDE %s: %s (%u sectors)",
-                name,
-                state.identify.model,
-                state.identify.sector_count);
     return true;
 }
 
@@ -292,9 +260,6 @@ IdeStatus ide_read_sectors(IdeDeviceId device, uint32_t lba,
         uint64_t last_lba =
             static_cast<uint64_t>(lba) + static_cast<uint64_t>(sector_count);
         if (lba >= max_sector || last_lba > max_sector) {
-            log_message(LogLevel::Warn,
-                        "IDE %s: read beyond device size (lba=%u count=%u max=%u)",
-                        device_name(device), lba, sector_count, max_sector);
             return IdeStatus::IoError;
         }
     }
@@ -354,9 +319,6 @@ IdeStatus ide_write_sectors(IdeDeviceId device, uint32_t lba,
         uint64_t last_lba =
             static_cast<uint64_t>(lba) + static_cast<uint64_t>(sector_count);
         if (lba >= max_sector || last_lba > max_sector) {
-            log_message(LogLevel::Warn,
-                        "IDE %s: write beyond device size (lba=%u count=%u max=%u)",
-                        device_name(device), lba, sector_count, max_sector);
             return IdeStatus::IoError;
         }
     }

@@ -30,6 +30,23 @@ struct RootDirectoryContext {
 
 RootDirectoryContext g_root_dir_contexts[kMaxRootDirHandles]{};
 bool g_root_dir_in_use[kMaxRootDirHandles]{};
+volatile int g_vfs_lock = 0;
+
+void lock() {
+    while (__atomic_test_and_set(&g_vfs_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock() {
+    __atomic_clear(&g_vfs_lock, __ATOMIC_RELEASE);
+}
+
+class LockGuard {
+public:
+    LockGuard() { lock(); }
+    ~LockGuard() { unlock(); }
+};
 
 size_t string_length(const char* str) {
     size_t len = 0;

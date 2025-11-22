@@ -49,5 +49,20 @@ volatile struct limine_module_request module_request = {
     .revision = 0
 };
 
+__attribute__((used, section(".limine_requests")))
+#ifdef LIMINE_MP_REQUEST
+volatile struct LIMINE_MP(request) smp_request = {
+    .id = LIMINE_MP_REQUEST,
+    .revision = 0,
+    .flags = 0
+};
+#else
+volatile struct LIMINE_MP(request) smp_request = {
+    .id = LIMINE_SMP_REQUEST,
+    .revision = 0,
+    .flags = 0
+};
+#endif
+
 __attribute__((used, section(".limine_requests_end")))
 static volatile LIMINE_REQUESTS_END_MARKER;

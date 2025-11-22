@@ -151,6 +151,9 @@ Result handle_syscall(SyscallFrame& frame) {
                                               frame.rsi,
                                               frame.rdx,
                                               frame.r10);
+            if (result == descriptor::kWouldBlock) {
+                return Result::Reschedule;
+            }
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
             return Result::Continue;
         }
@@ -167,6 +170,9 @@ Result handle_syscall(SyscallFrame& frame) {
                                                frame.rsi,
                                                frame.rdx,
                                                frame.r10);
+            if (result == descriptor::kWouldBlock) {
+                return Result::Reschedule;
+            }
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
             return Result::Continue;
         }

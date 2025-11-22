@@ -11,7 +11,7 @@ OBJ_DIR  := build
 PROG_DIR := programs
 BIN_DIR  := binary
 
-PROGRAMS := shell ls cat
+PROGRAMS := shell ls cat noop
 PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64

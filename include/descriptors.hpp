@@ -11,6 +11,7 @@ enum class Type : uint16_t {
     Keyboard    = 0x003,
     Framebuffer = 0x010,
     BlockDevice = 0x020,
+    Pipe        = 0x030,
 };
 
 enum class Property : uint32_t {

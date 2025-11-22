@@ -14,6 +14,7 @@ constexpr size_t LOG_BUFFER_CAPACITY = 32 * 1024;
 constexpr size_t LOG_LINE_MAX = 512;
 
 char g_buffer[LOG_BUFFER_CAPACITY];
+volatile int g_console_lock = 0;
 size_t g_write_pos = 0;
 size_t g_start_pos = 0;
 size_t g_size = 0;
@@ -45,6 +46,16 @@ uint32_t level_color(LogLevel level) {
         default:
             return 0xFFFF6060;
     }
+}
+
+void lock_console() {
+    while (__atomic_test_and_set(&g_console_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_console() {
+    __atomic_clear(&g_console_lock, __ATOMIC_RELEASE);
 }
 
 void push_char(char c) {
@@ -377,9 +388,12 @@ void log_message(LogLevel level, const char* fmt, ...) {
     va_end(args);
 
     const char* tag = level_tag(level);
+
+    lock_console();
     emit_to_serial(tag, buffer);
     emit_to_console(level, tag, buffer);
     store_log_line(tag, buffer);
+    unlock_console();
 }
 
 size_t log_copy_recent(char* out, size_t max_len) {

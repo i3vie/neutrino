@@ -32,6 +32,8 @@ constexpr size_t PAGE_TABLE_ENTRIES = 512;
 constexpr size_t BOOT_POOL_PAGES = 4096;
 constexpr size_t BOOT_POOL_SIZE = BOOT_POOL_PAGES * PAGE_SIZE;
 
+constexpr uint64_t LAPIC_BASE = 0xFEE00000;
+
 alignas(PAGE_SIZE) uint8_t boot_pool[BOOT_POOL_SIZE];
 size_t boot_pool_off = 0;
 
@@ -39,6 +41,7 @@ uint64_t g_kernel_phys_base = 0;
 uint64_t g_kernel_virt_base = 0;
 uint64_t g_kernel_size = 0;
 uint64_t g_hhdm_offset = 0;
+uint64_t g_cr3_value = 0;
 
 uint64_t* pml4_table = nullptr;
 
@@ -273,8 +276,16 @@ void paging_init() {
                   map_flags);
     }
 
+    // Map Local APIC MMIO (identity + HHDM) with cache disabled.
+    const uint64_t lapic_flags = PTE_PRESENT | PTE_WRITE | PTE_PCD | PTE_PWT;
+    map_page(LAPIC_BASE, LAPIC_BASE, lapic_flags);
+    if (g_hhdm_offset != 0) {
+        map_page(LAPIC_BASE + g_hhdm_offset, LAPIC_BASE, lapic_flags);
+    }
+
     uint64_t new_cr3 = virt_to_phys(reinterpret_cast<uint64_t>(pml4_table));
     asm volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
+    g_cr3_value = new_cr3;
 }
 
 bool paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
@@ -322,4 +333,8 @@ bool paging_mark_wc(uint64_t virt, uint64_t length) {
     }
 
     return true;
+}
+
+uint64_t paging_cr3() {
+    return g_cr3_value;
 }

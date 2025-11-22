@@ -1,5 +1,6 @@
 #include "process.hpp"
 
+#include "arch/x86_64/percpu.hpp"
 #include "lib/mem.hpp"
 
 namespace {
@@ -7,7 +8,6 @@ namespace {
 process::Process g_process_table[process::kMaxProcesses];
 alignas(16) uint8_t g_kernel_stacks[process::kMaxProcesses][process::kKernelStackSize];
 uint32_t g_next_pid = 1;
-process::Process* g_current_process = nullptr;
 
 }  // namespace
 
@@ -16,7 +16,6 @@ namespace process {
 void init() {
     memset(g_process_table, 0, sizeof(g_process_table));
     g_next_pid = 1;
-    g_current_process = nullptr;
     for (size_t i = 0; i < kMaxProcesses; ++i) {
         g_process_table[i].state = State::Unused;
         g_process_table[i].has_context = false;
@@ -31,6 +30,7 @@ void init() {
         g_process_table[i].exit_code = 0;
         g_process_table[i].has_exited = false;
         g_process_table[i].console_transferred = false;
+        g_process_table[i].preferred_cpu = UINT32_MAX;
         g_process_table[i].cwd[0] = '/';
         g_process_table[i].cwd[1] = '\0';
         descriptor::init_table(g_process_table[i].descriptors);
@@ -57,6 +57,7 @@ Process* allocate() {
         proc.pid = g_next_pid++;
         proc.cr3 = 0;
         proc.has_context = false;
+        proc.preferred_cpu = UINT32_MAX;
         proc.parent = nullptr;
         proc.waiting_on = nullptr;
         proc.exit_code = 0;
@@ -80,11 +81,11 @@ Process* allocate() {
 }
 
 Process* current() {
-    return g_current_process;
+    return percpu::get_current_process();
 }
 
 void set_current(Process* proc) {
-    g_current_process = proc;
+    percpu::set_current_process(proc);
     if (proc != nullptr) {
         proc->state = State::Running;
     }

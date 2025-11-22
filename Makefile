@@ -123,7 +123,7 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO_RAMFS)
 
 run: $(TARGET_ISO)
-	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) \
+	qemu-system-x86_64 -m 1G -smp 4 -bios ~/Downloads/OVMF.4m.fd -cdrom $(TARGET_ISO) \
 		-serial stdio  \
 		-drive file=hdd.img,format=raw,if=ide \
 

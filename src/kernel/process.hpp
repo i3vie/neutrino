@@ -10,7 +10,7 @@
 
 namespace process {
 
-constexpr size_t kMaxProcesses = 16;
+constexpr size_t kMaxProcesses = 256;
 constexpr size_t kKernelStackSize = 0x4000;
 constexpr size_t kMaxFileHandles = 16;
 constexpr size_t kMaxDirectoryHandles = 8;
@@ -46,11 +46,12 @@ struct Process {
     vm::Stack stack_region;
     syscall::SyscallFrame context;
     Process* parent;
-    Process* waiting_on;
+    void* waiting_on;
     uint16_t exit_code;
     bool has_exited;
     bool console_transferred;
     bool has_context;
+    uint32_t preferred_cpu;  // UINT32_MAX means unassigned
     char cwd[128];
     descriptor::Table descriptors;
     FileHandle file_handles[kMaxFileHandles];

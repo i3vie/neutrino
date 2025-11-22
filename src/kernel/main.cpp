@@ -19,6 +19,9 @@
 #include "arch/x86_64/syscall.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "arch/x86_64/io.hpp"
+#include "arch/x86_64/lapic.hpp"
+#include "arch/x86_64/percpu.hpp"
+#include "arch/x86_64/smp.hpp"
 #include "config.hpp"
 #include "descriptor.hpp"
 #include "loader.hpp"
@@ -271,13 +274,18 @@ static void kernel_main_stage2() {
     idt_install();
     log_message(LogLevel::Info, "IDT installed");
 
-    log_message(LogLevel::Info, "Initializing TSS");
-    init_tss();
-    log_message(LogLevel::Info, "TSS initialized");
-
-    log_message(LogLevel::Info, "Installing GDT");
-    gdt_install();
-    log_message(LogLevel::Info, "GDT installed");
+    log_message(LogLevel::Info, "Initializing per-CPU state (BSP)");
+    uint32_t bsp_lapic = lapic::id();
+    percpu::Cpu* bsp_cpu = percpu::find_by_lapic(bsp_lapic);
+    if (bsp_cpu == nullptr) {
+        bsp_cpu = percpu::register_cpu(bsp_lapic, 0);
+    }
+    percpu::set_current_cpu(bsp_cpu);
+    percpu::setup_cpu_tss(*bsp_cpu);
+    percpu::setup_cpu_gdt(*bsp_cpu);
+    scheduler::register_cpu(bsp_cpu);
+    log_message(LogLevel::Info, "BSP per-CPU GDT/TSS installed (LAPIC=%u)",
+                bsp_lapic);
 
     log_message(LogLevel::Info, "Initializing syscall interface");
     syscall::init();
@@ -314,6 +322,11 @@ static void kernel_main_stage2() {
         kconsole->enable_back_buffer();
     }
     log_message(LogLevel::Info, "Paging initialized");
+
+    lapic::init(hhdm_request.response->offset);
+    log_message(LogLevel::Info, "Local APIC initialized");
+
+    smp::init();
 
     bool pat_ok = cpu::configure_pat_write_combining();
     bool wc_pages = false;

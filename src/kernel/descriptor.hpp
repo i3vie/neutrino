@@ -34,6 +34,10 @@ constexpr uint32_t kTypeFramebuffer =
     static_cast<uint32_t>(descriptor_defs::Type::Framebuffer);
 constexpr uint32_t kTypeBlockDevice =
     static_cast<uint32_t>(descriptor_defs::Type::BlockDevice);
+constexpr uint32_t kTypePipe =
+    static_cast<uint32_t>(descriptor_defs::Type::Pipe);
+
+constexpr int64_t kWouldBlock = -2;
 
 enum class Flag : uint64_t {
     Readable   = 1ull << 0,

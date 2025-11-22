@@ -245,15 +245,14 @@ size_t build_search_directories(const char* cwd,
 
     char mount_name[64];
     extract_mount_name(cwd, mount_name, sizeof(mount_name));
-    if (mount_name[0] != '\0') {
-        append_mount_dirs(mount_name);
+    if (mount_name[0] == '\0' && g_boot_mount[0] != '\0') {
+        copy_string(mount_name, sizeof(mount_name), g_boot_mount);
     }
+    append_mount_dirs(mount_name);
     if (g_boot_mount[0] != '\0' &&
         !strings_equal(mount_name, g_boot_mount)) {
         append_mount_dirs(g_boot_mount);
     }
-    append("/binary");
-    append("/BINARY");
 
     return count;
 }
@@ -753,7 +752,27 @@ void execute_command(long console, const char* line) {
         append_literal(")");
         path_info[idx] = '\0';
         print_line(console, path_info);
-        print_line(console, "builtins: cd, help, spawn");
+        print_line(console, "builtins: cd, help, spawn, burst");
+    } else if (equals_literal(command, "burst")) {
+        // Spawn multiple no-op tasks without waiting.
+        int spawned = 0;
+        for (int i = 0; i < 5; ++i) {
+            long r = run_with_search("noop",
+                                     g_current_cwd,
+                                     nullptr,
+                                     0,
+                                     false,
+                                     nullptr,
+                                     0);
+            if (r >= 0) {
+                ++spawned;
+            }
+        }
+        print(console, "burst: spawned ");
+        char buf[8];
+        uint64_to_string(static_cast<uint64_t>(spawned), buf, sizeof(buf));
+        print(console, buf);
+        print_line(console, " noop task(s)");
     } else {
         const char* args = (cursor != nullptr && *cursor != '\0') ? cursor : nullptr;
         char resolved_path[128];

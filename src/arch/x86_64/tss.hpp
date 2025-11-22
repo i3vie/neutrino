@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 struct TSS {
     uint32_t reserved0;
@@ -22,3 +23,4 @@ struct TSS {
 extern TSS tss;
 extern "C" void set_rsp0(uint64_t rsp);
 void init_tss();
+void init_tss_for_cpu(TSS& tss_obj, uint8_t* stack, size_t stack_size);

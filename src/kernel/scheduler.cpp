@@ -1,51 +1,118 @@
 #include "scheduler.hpp"
 
+#include <stdint.h>
+
 #include "drivers/log/logging.hpp"
 #include "lib/mem.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "userspace.hpp"
+#include "arch/x86_64/percpu.hpp"
 
 namespace {
 
-process::Process* g_ready_queue[process::kMaxProcesses];
-size_t g_ready_head = 0;
-size_t g_ready_count = 0;
+struct RunQueue {
+    process::Process* items[process::kMaxProcesses];
+    size_t head = 0;
+    size_t count = 0;
+};
 
-void halt_system() {
+RunQueue g_run_queues[percpu::kMaxCpus];
+size_t g_cpu_total = 0;
+volatile int g_queue_lock = 0;
+uint32_t g_rr_assign = 0;
+
+[[maybe_unused]] void halt_system() {
     for (;;) {
         asm volatile("hlt");
     }
 }
 
+RunQueue& queue_for_cpu(size_t idx) {
+    if (idx >= percpu::kMaxCpus) {
+        return g_run_queues[0];
+    }
+    return g_run_queues[idx];
+}
+
 bool queue_contains(process::Process* proc) {
-    size_t idx = g_ready_head;
-    for (size_t i = 0; i < g_ready_count; ++i) {
-        if (g_ready_queue[idx] == proc) {
-            return true;
+    for (size_t q = 0; q < percpu::kMaxCpus; ++q) {
+        RunQueue& rq = g_run_queues[q];
+        size_t idx = rq.head;
+        for (size_t i = 0; i < rq.count; ++i) {
+            if (rq.items[idx] == proc) {
+                return true;
+            }
+            idx = (idx + 1) % process::kMaxProcesses;
         }
-        idx = (idx + 1) % process::kMaxProcesses;
     }
     return false;
 }
 
-void queue_push(process::Process* proc) {
-    if (g_ready_count >= process::kMaxProcesses) {
+void queue_push(RunQueue& rq, process::Process* proc) {
+    if (rq.count >= process::kMaxProcesses) {
         return;
     }
-    size_t tail = (g_ready_head + g_ready_count) % process::kMaxProcesses;
-    g_ready_queue[tail] = proc;
-    ++g_ready_count;
+    size_t tail = (rq.head + rq.count) % process::kMaxProcesses;
+    rq.items[tail] = proc;
+    ++rq.count;
 }
 
-process::Process* queue_pop() {
-    if (g_ready_count == 0) {
+process::Process* queue_pop(RunQueue& rq) {
+    if (rq.count == 0) {
         return nullptr;
     }
-    process::Process* proc = g_ready_queue[g_ready_head];
-    g_ready_head = (g_ready_head + 1) % process::kMaxProcesses;
-    --g_ready_count;
+    process::Process* proc = rq.items[rq.head];
+    rq.head = (rq.head + 1) % process::kMaxProcesses;
+    --rq.count;
     return proc;
+}
+
+void lock_queue() {
+    while (__atomic_test_and_set(&g_queue_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_queue() {
+    __atomic_clear(&g_queue_lock, __ATOMIC_RELEASE);
+}
+
+class QueueGuard {
+public:
+    QueueGuard() { lock_queue(); }
+    ~QueueGuard() { unlock_queue(); }
+};
+
+void enqueue_locked(process::Process* proc) {
+    size_t total = g_cpu_total;
+    if (total == 0) {
+        total = 1;
+    }
+    if (proc->preferred_cpu == UINT32_MAX || proc->preferred_cpu >= total) {
+        uint32_t choice = __atomic_fetch_add(&g_rr_assign, 1, __ATOMIC_RELAXED);
+        proc->preferred_cpu = static_cast<uint32_t>(choice % total);
+    }
+    size_t target = static_cast<size_t>(proc->preferred_cpu % total);
+    queue_push(queue_for_cpu(target), proc);
+}
+
+process::Process* pop_locked() {
+    percpu::Cpu* cpu = percpu::current_cpu();
+    size_t idx = cpu ? cpu->index : 0;
+
+    process::Process* proc = queue_pop(queue_for_cpu(idx));
+    if (proc != nullptr) {
+        return proc;
+    }
+    for (size_t q = 0; q < g_cpu_total; ++q) {
+        if (q == idx) continue;
+        proc = queue_pop(queue_for_cpu(q));
+        if (proc != nullptr) {
+            return proc;
+        }
+    }
+    return nullptr;
 }
 
 void prepare_frame_for_process(process::Process& proc,
@@ -113,12 +180,40 @@ void apply_to_interrupt(const syscall::SyscallFrame& in,
 namespace scheduler {
 
 void init() {
-    g_ready_head = 0;
-    g_ready_count = 0;
+    for (size_t i = 0; i < percpu::kMaxCpus; ++i) {
+        g_run_queues[i].head = 0;
+        g_run_queues[i].count = 0;
+    }
 }
 
 process::Process* current() {
     return process::current();
+}
+
+void register_cpu(percpu::Cpu* cpu) {
+    if (cpu == nullptr) {
+        return;
+    }
+    if (cpu->registered) {
+        return;
+    }
+    size_t idx = __atomic_fetch_add(&g_cpu_total, 1, __ATOMIC_SEQ_CST);
+    if (idx >= percpu::kMaxCpus) {
+        __atomic_fetch_sub(&g_cpu_total, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+    cpu->index = static_cast<uint32_t>(idx);
+    g_run_queues[idx].head = 0;
+    g_run_queues[idx].count = 0;
+    cpu->registered = true;
+    log_message(LogLevel::Info,
+                "Scheduler: registered CPU (LAPIC=%u total=%u)",
+                cpu->lapic_id,
+                static_cast<unsigned int>(__atomic_load_n(&g_cpu_total, __ATOMIC_SEQ_CST)));
+}
+
+size_t cpu_total() {
+    return __atomic_load_n(&g_cpu_total, __ATOMIC_SEQ_CST);
 }
 
 void enqueue(process::Process* proc) {
@@ -128,19 +223,24 @@ void enqueue(process::Process* proc) {
     if (proc->state == process::State::Terminated) {
         return;
     }
+    QueueGuard guard;
     if (!queue_contains(proc)) {
-        queue_push(proc);
+        enqueue_locked(proc);
     }
     proc->state = process::State::Ready;
 }
 
-[[noreturn]] void run() {
+[[noreturn]] static void run_loop() {
     for (;;) {
-        process::Process* next = queue_pop();
+        process::Process* next = nullptr;
+        {
+            QueueGuard guard;
+            next = pop_locked();
+        }
         if (next == nullptr) {
-            log_message(LogLevel::Error,
-                        "Scheduler: no runnable processes, halting");
-            halt_system();
+            asm volatile("pause");
+            asm volatile("sti; hlt");
+            continue;
         }
         if (next->state == process::State::Terminated) {
             continue;
@@ -171,28 +271,29 @@ void reschedule(syscall::SyscallFrame& frame) {
         current_proc->has_context = false;
     }
 
-    if (!terminated) {
-        if (current_proc->state == process::State::Running) {
-            current_proc->state = process::State::Ready;
+    process::Process* next = nullptr;
+    {
+        QueueGuard guard;
+        if (!terminated) {
+            if (current_proc->state == process::State::Running) {
+                current_proc->state = process::State::Ready;
+            }
+            if (current_proc->state == process::State::Ready &&
+                !queue_contains(current_proc)) {
+                enqueue_locked(current_proc);
+            }
         }
-        if (current_proc->state == process::State::Ready) {
-            enqueue(current_proc);
-        }
-    }
 
-    process::Process* next = queue_pop();
-    while (next != nullptr && next->state == process::State::Terminated) {
-        next = queue_pop();
+        next = pop_locked();
+        while (next != nullptr && next->state == process::State::Terminated) {
+            next = pop_locked();
+        }
     }
 
     if (next == nullptr) {
-        if (terminated) {
-            log_message(LogLevel::Error,
-                        "Scheduler: no runnable processes after termination, halting");
-            halt_system();
-        }
         process::set_current(current_proc);
         prepare_frame_for_process(*current_proc, frame);
+        asm volatile("pause");
         return;
     }
 
@@ -209,6 +310,29 @@ void reschedule_from_interrupt(InterruptFrame& frame) {
     capture_from_interrupt(frame, state);
     reschedule(state);
     apply_to_interrupt(state, frame);
+}
+
+void tick(InterruptFrame& frame) {
+    if ((frame.cs & 0x3) != 0) {
+        scheduler::reschedule_from_interrupt(frame);
+    } else {
+        process::Process* cur = process::current();
+        if (cur == nullptr) {
+            return;
+        }
+        syscall::SyscallFrame state{};
+        prepare_frame_for_process(*cur, state);
+        reschedule(state);
+    }
+}
+
+[[noreturn]] void run_cpu() {
+    asm volatile("sti");
+    run_loop();
+}
+
+[[noreturn]] void run() {
+    run_cpu();
 }
 
 }  // namespace scheduler
