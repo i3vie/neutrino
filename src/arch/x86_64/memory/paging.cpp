@@ -36,6 +36,8 @@ constexpr uint64_t LAPIC_BASE = 0xFEE00000;
 
 alignas(PAGE_SIZE) uint8_t boot_pool[BOOT_POOL_SIZE];
 size_t boot_pool_off = 0;
+void* boot_pool_freelist[BOOT_POOL_PAGES];
+size_t boot_pool_free_count = 0;
 
 uint64_t g_kernel_phys_base = 0;
 uint64_t g_kernel_virt_base = 0;
@@ -61,6 +63,11 @@ constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
 }
 
 void* alloc_boot_page() {
+    if (boot_pool_free_count > 0) {
+        void* v = boot_pool_freelist[--boot_pool_free_count];
+        memset(v, 0, PAGE_SIZE);
+        return v;
+    }
     if (boot_pool_off + PAGE_SIZE > BOOT_POOL_SIZE) {
         if (kconsole != nullptr) {
             kconsole->set_color(0xFFFF0000, 0x00000000);
@@ -75,12 +82,33 @@ void* alloc_boot_page() {
     return v;
 }
 
+void free_boot_page(void* page) {
+    if (page == nullptr) {
+        return;
+    }
+    auto* ptr = reinterpret_cast<uint8_t*>(page);
+    auto* pool_begin = &boot_pool[0];
+    auto* pool_end = pool_begin + BOOT_POOL_SIZE;
+    if (ptr < pool_begin || ptr >= pool_end) {
+        return;
+    }
+    if (boot_pool_free_count >= BOOT_POOL_PAGES) {
+        return;
+    }
+    boot_pool_freelist[boot_pool_free_count++] = page;
+}
+
 uint64_t virt_to_phys(uint64_t virt) {
     return virt - g_kernel_virt_base + g_kernel_phys_base;
 }
 
 uint64_t phys_to_virt(uint64_t phys) {
     return phys - g_kernel_phys_base + g_kernel_virt_base;
+}
+
+uint64_t* table_from_entry(uint64_t entry) {
+    uint64_t phys = entry & ~PAGE_MASK;
+    return reinterpret_cast<uint64_t*>(phys_to_virt(phys));
 }
 
 uint64_t* ensure_table(uint64_t* table, size_t index, uint64_t flags) {
@@ -300,6 +328,49 @@ uint64_t paging_virt_to_phys(uint64_t virt) {
 
 void* paging_alloc_page() {
     return alloc_boot_page();
+}
+
+bool paging_unmap_page(uint64_t virt, uint64_t& phys_out) {
+    phys_out = 0;
+    size_t pml4_index = (virt >> 39) & 0x1FF;
+    size_t pdpt_index = (virt >> 30) & 0x1FF;
+    size_t pd_index = (virt >> 21) & 0x1FF;
+    size_t pt_index = (virt >> 12) & 0x1FF;
+
+    uint64_t pml4_entry = pml4_table[pml4_index];
+    if ((pml4_entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    uint64_t* pdpt = table_from_entry(pml4_entry);
+
+    uint64_t pdpt_entry = pdpt[pdpt_index];
+    if ((pdpt_entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    uint64_t* pd = table_from_entry(pdpt_entry);
+
+    uint64_t pd_entry = pd[pd_index];
+    if ((pd_entry & PTE_PRESENT) == 0 || (pd_entry & PTE_LARGE) != 0) {
+        return false;
+    }
+    uint64_t* pt = table_from_entry(pd_entry);
+
+    uint64_t pt_entry = pt[pt_index];
+    if ((pt_entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    phys_out = pt_entry & ~PAGE_MASK;
+    pt[pt_index] = 0;
+    asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
+    return true;
+}
+
+void paging_free_physical(uint64_t phys) {
+    if (phys == 0) {
+        return;
+    }
+    void* page = reinterpret_cast<void*>(phys_to_virt(phys));
+    free_boot_page(page);
 }
 
 bool paging_mark_wc(uint64_t virt, uint64_t length) {

@@ -13,17 +13,18 @@
 #include "../fs/vfs.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/idt.hpp"
-#include "arch/x86_64/memory/paging.hpp"
-#include "arch/x86_64/pat.hpp"
-#include "arch/x86_64/mtrr.hpp"
-#include "arch/x86_64/syscall.hpp"
-#include "arch/x86_64/tss.hpp"
 #include "arch/x86_64/io.hpp"
 #include "arch/x86_64/lapic.hpp"
+#include "arch/x86_64/memory/paging.hpp"
+#include "arch/x86_64/mtrr.hpp"
+#include "arch/x86_64/pat.hpp"
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/smp.hpp"
+#include "arch/x86_64/syscall.hpp"
+#include "arch/x86_64/tss.hpp"
 #include "config.hpp"
 #include "descriptor.hpp"
+#include "error.hpp"
 #include "loader.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
@@ -50,10 +51,7 @@ bool matches_literal(const char* str, size_t len, const char* literal) {
     return (idx == len) && (literal[idx] == '\0');
 }
 
-bool append_chunk(const char* data,
-                  size_t length,
-                  char* out,
-                  size_t out_size,
+bool append_chunk(const char* data, size_t length, char* out, size_t out_size,
                   size_t& index) {
     if (data == nullptr || out == nullptr) {
         return false;
@@ -70,9 +68,7 @@ bool append_chunk(const char* data,
     return true;
 }
 
-bool build_mount_path(const char* spec,
-                      const char* default_mount,
-                      char* out,
+bool build_mount_path(const char* spec, const char* default_mount, char* out,
                       size_t out_size) {
     if (spec == nullptr || out == nullptr || out_size == 0) {
         return false;
@@ -103,9 +99,7 @@ bool build_mount_path(const char* spec,
 
         const char* mount_value = mount_start;
         size_t mount_value_len = mount_len;
-        if (matches_literal(mount_start,
-                            mount_len,
-                            kRootDevicePlaceholder)) {
+        if (matches_literal(mount_start, mount_len, kRootDevicePlaceholder)) {
             if (default_mount == nullptr || default_mount[0] == '\0') {
                 return false;
             }
@@ -114,22 +108,14 @@ bool build_mount_path(const char* spec,
         }
 
         size_t idx = 0;
-        if (!append_chunk(mount_value,
-                          mount_value_len,
-                          out,
-                          out_size,
-                          idx)) {
+        if (!append_chunk(mount_value, mount_value_len, out, out_size, idx)) {
             return false;
         }
         if (idx + 1 >= out_size) {
             return false;
         }
         out[idx++] = '/';
-        if (!append_chunk(remainder,
-                          remainder_len,
-                          out,
-                          out_size,
-                          idx)) {
+        if (!append_chunk(remainder, remainder_len, out, out_size, idx)) {
             return false;
         }
         if (idx >= out_size) {
@@ -163,22 +149,14 @@ bool build_mount_path(const char* spec,
     }
 
     size_t idx = 0;
-    if (!append_chunk(default_mount,
-                      mount_len,
-                      out,
-                      out_size,
-                      idx)) {
+    if (!append_chunk(default_mount, mount_len, out, out_size, idx)) {
         return false;
     }
     if (idx + 1 >= out_size) {
         return false;
     }
     out[idx++] = '/';
-    if (!append_chunk(spec,
-                      spec_len,
-                      out,
-                      out_size,
-                      idx)) {
+    if (!append_chunk(spec, spec_len, out, out_size, idx)) {
         return false;
     }
     if (idx >= out_size) {
@@ -224,19 +202,18 @@ static void kernel_main_stage2() {
     uint64_t fb_length =
         static_cast<uint64_t>(fb.pitch) * static_cast<uint64_t>(fb.height);
 
-    Framebuffer framebuffer = {
-        fb_virtual,
-        static_cast<size_t>(fb.width),
-        static_cast<size_t>(fb.height),
-        static_cast<size_t>(fb.pitch),
-        static_cast<uint16_t>(fb.bpp),
-        fb.memory_model,
-        fb.red_mask_size,
-        fb.red_mask_shift,
-        fb.green_mask_size,
-        fb.green_mask_shift,
-        fb.blue_mask_size,
-        fb.blue_mask_shift};
+    Framebuffer framebuffer = {fb_virtual,
+                               static_cast<size_t>(fb.width),
+                               static_cast<size_t>(fb.height),
+                               static_cast<size_t>(fb.pitch),
+                               static_cast<uint16_t>(fb.bpp),
+                               fb.memory_model,
+                               fb.red_mask_size,
+                               fb.red_mask_shift,
+                               fb.green_mask_size,
+                               fb.green_mask_shift,
+                               fb.blue_mask_size,
+                               fb.blue_mask_shift};
 
     descriptor::init();
     descriptor::register_builtin_types();
@@ -331,8 +308,8 @@ static void kernel_main_stage2() {
     bool pat_ok = cpu::configure_pat_write_combining();
     bool wc_pages = false;
     if (pat_ok && fb_virtual != nullptr) {
-        wc_pages = paging_mark_wc(reinterpret_cast<uint64_t>(fb_virtual),
-                                  fb_length);
+        wc_pages =
+            paging_mark_wc(reinterpret_cast<uint64_t>(fb_virtual), fb_length);
     }
     bool mtrr_ok = cpu::configure_write_combining(fb_phys_addr, fb_length);
 
@@ -340,17 +317,19 @@ static void kernel_main_stage2() {
         log_message(LogLevel::Warn,
                     "PAT: failed to configure write-combining entry");
     } else if (!wc_pages) {
-        log_message(LogLevel::Warn,
-                    "PAT: failed to mark framebuffer pages WC (virt=%016llx len=%llu)",
-                    reinterpret_cast<unsigned long long>(fb_virtual),
-                    static_cast<unsigned long long>(fb_length));
+        log_message(
+            LogLevel::Warn,
+            "PAT: failed to mark framebuffer pages WC (virt=%016llx len=%llu) (ancient CPU?)",
+            reinterpret_cast<unsigned long long>(fb_virtual),
+            static_cast<unsigned long long>(fb_length));
     }
 
     if (!mtrr_ok) {
-        log_message(LogLevel::Warn,
-                    "Framebuffer WC configuration failed (phys=%016llx len=%llu)",
-                    static_cast<unsigned long long>(fb_phys_addr),
-                    static_cast<unsigned long long>(fb_length));
+        log_message(
+            LogLevel::Warn,
+            "Framebuffer WC configuration failed (phys=%016llx len=%llu) (ancient CPU?)",
+            static_cast<unsigned long long>(fb_phys_addr),
+            static_cast<unsigned long long>(fb_length));
     }
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
@@ -414,9 +393,8 @@ static void kernel_main_stage2() {
                 if (*value == '\0') {
                     continue;
                 }
-                bool duplicate =
-                    (root_spec[0] != '\0' &&
-                     string_util::equals(root_spec, value));
+                bool duplicate = (root_spec[0] != '\0' &&
+                                  string_util::equals(root_spec, value));
                 for (size_t i = 0; i < mount_spec_count && !duplicate; ++i) {
                     if (string_util::equals(mount_buffers[i], value)) {
                         duplicate = true;
@@ -444,6 +422,7 @@ static void kernel_main_stage2() {
     if (root_spec[0] == '\0') {
         log_message(LogLevel::Warn,
                     "boot: ROOT= not specified on kernel command line");
+        error_screen::display("NO_ROOT_SPECIFIED", nullptr, nullptr);
     } else {
         log_message(LogLevel::Info, "boot: ROOT=%s", root_spec);
     }
@@ -455,6 +434,7 @@ static void kernel_main_stage2() {
     if (root_ptr != nullptr && !root_ok) {
         log_message(LogLevel::Warn,
                     "Boot: root filesystem '%s' was not mounted", root_ptr);
+        error_screen::display("FAILED_ROOT_MOUNT_", root_ptr, nullptr);
     }
 
     char boot_mount_name[64] = {0};
@@ -495,8 +475,7 @@ static void kernel_main_stage2() {
     if (boot_mount_name[0] == '\0') {
         for (size_t i = 0; i < fetch_mounts; ++i) {
             if (mount_names[i] != nullptr) {
-                string_util::copy(boot_mount_name,
-                                  sizeof(boot_mount_name),
+                string_util::copy(boot_mount_name, sizeof(boot_mount_name),
                                   mount_names[i]);
                 break;
             }
@@ -547,8 +526,7 @@ static void kernel_main_stage2() {
                     log_message(LogLevel::Info, "VFS: read %s (%u bytes)", path,
                                 (unsigned int)file_size);
                     bool parse_ok = config::parse(
-                        reinterpret_cast<const char*>(file_buffer),
-                        file_size,
+                        reinterpret_cast<const char*>(file_buffer), file_size,
                         kernel_config);
                     kernel_config_loaded = true;
                     if (!parse_ok) {
@@ -556,9 +534,9 @@ static void kernel_main_stage2() {
                                     "Boot: KERNEL.CFG parse reported errors");
                     }
                     const char* init_spec = nullptr;
-                    if (config::get(kernel_config, "KERNEL.INIT_TASK", init_spec)) {
-                        if (build_mount_path(init_spec,
-                                             root_ptr,
+                    if (config::get(kernel_config, "KERNEL.INIT_TASK",
+                                    init_spec)) {
+                        if (build_mount_path(init_spec, root_ptr,
                                              init_task_path,
                                              sizeof(init_task_path))) {
                             init_task_path_valid = true;
@@ -566,141 +544,143 @@ static void kernel_main_stage2() {
                                         "Boot: init task set to %s",
                                         init_task_path);
                         } else {
-                            log_message(LogLevel::Warn,
-                                        "Boot: invalid KERNEL.INIT_TASK value '%s'",
-                                        init_spec);
+                            log_message(
+                                LogLevel::Warn,
+                                "Boot: invalid KERNEL.INIT_TASK value '%s'",
+                                init_spec);
                         }
                     }
                 } else {
                     log_message(LogLevel::Debug,
                                 "VFS: %s not present or read failed", path);
                 }
+            }
+        }
+    } else {
+        log_message(LogLevel::Warn,
+                    "Boot: skipping KERNEL.CFG lookup (root not mounted)");
+    }
+
+    if (root_ptr != nullptr && root_ok && !kernel_config_loaded) {
+        log_message(LogLevel::Warn, "Boot: KERNEL.CFG not found on '%s'",
+                    root_ptr);
+    }
+
+    process::init();
+    scheduler::init();
+
+    constexpr size_t kInitMaxSize = 64 * 1024;
+    alignas(16) static uint8_t init_buffer[kInitMaxSize];
+    size_t init_size = 0;
+
+    constexpr size_t kMaxInitCandidates = 4;
+    const char* init_candidates[kMaxInitCandidates];
+    size_t init_candidate_count = 0;
+
+    if (init_task_path_valid) {
+        init_candidates[init_candidate_count++] = init_task_path;
+    }
+
+    char default_init_paths[2][64] = {{0}};
+    size_t default_paths_used = 0;
+
+    if (root_ptr != nullptr) {
+        constexpr const char* kDefaultInitFiles[] = {"init.elf", "init.bin"};
+
+        for (const char* fallback : kDefaultInitFiles) {
+            if (default_paths_used >= 2) {
+                break;
+            }
+
+            char* buffer = default_init_paths[default_paths_used];
+            string_util::copy(buffer,
+                              sizeof(default_init_paths[default_paths_used]),
+                              root_ptr);
+            size_t len = string_util::length(buffer);
+            if (len + 1 >= sizeof(default_init_paths[default_paths_used])) {
+                log_message(LogLevel::Warn,
+                            "Boot: init path truncated for root mount '%s'",
+                            root_ptr);
+                continue;
+            }
+            buffer[len++] = '/';
+
+            size_t fallback_len = string_util::length(fallback);
+            if (len + fallback_len >=
+                sizeof(default_init_paths[default_paths_used])) {
+                log_message(
+                    LogLevel::Warn,
+                    "Boot: init filename '%s' truncated for root mount '%s'",
+                    fallback, root_ptr);
+                continue;
+            }
+            for (size_t idx = 0; idx < fallback_len; ++idx) {
+                buffer[len + idx] = fallback[idx];
+            }
+            buffer[len + fallback_len] = '\0';
+
+            bool duplicate = init_task_path_valid &&
+                             string_util::equals(init_task_path, buffer);
+            if (!duplicate && init_candidate_count < kMaxInitCandidates) {
+                init_candidates[init_candidate_count++] = buffer;
+            }
+            ++default_paths_used;
         }
     }
-} else {
-    log_message(LogLevel::Warn,
-                "Boot: skipping KERNEL.CFG lookup (root not mounted)");
-}
 
-if (root_ptr != nullptr && root_ok && !kernel_config_loaded) {
-    log_message(LogLevel::Warn,
-                "Boot: KERNEL.CFG not found on '%s'",
-                root_ptr);
-}
+    bool init_loaded = false;
+    const char* init_path_used = nullptr;
 
-process::init();
-scheduler::init();
-
-constexpr size_t kInitMaxSize = 64 * 1024;
-alignas(16) static uint8_t init_buffer[kInitMaxSize];
-size_t init_size = 0;
-
-constexpr size_t kMaxInitCandidates = 4;
-const char* init_candidates[kMaxInitCandidates];
-size_t init_candidate_count = 0;
-
-if (init_task_path_valid) {
-    init_candidates[init_candidate_count++] = init_task_path;
-}
-
-char default_init_paths[2][64] = {{0}};
-size_t default_paths_used = 0;
-
-if (root_ptr != nullptr) {
-    constexpr const char* kDefaultInitFiles[] = {"init.elf", "init.bin"};
-
-    for (const char* fallback : kDefaultInitFiles) {
-        if (default_paths_used >= 2) {
+    for (size_t i = 0; i < init_candidate_count; ++i) {
+        const char* candidate = init_candidates[i];
+        if (candidate == nullptr) {
+            continue;
+        }
+        if (vfs::read_file(candidate, init_buffer, sizeof(init_buffer),
+                           init_size)) {
+            init_loaded = true;
+            init_path_used = candidate;
             break;
         }
-
-        char* buffer = default_init_paths[default_paths_used];
-        string_util::copy(buffer, sizeof(default_init_paths[default_paths_used]),
-                          root_ptr);
-        size_t len = string_util::length(buffer);
-        if (len + 1 >= sizeof(default_init_paths[default_paths_used])) {
-            log_message(LogLevel::Warn,
-                        "Boot: init path truncated for root mount '%s'",
-                        root_ptr);
-            continue;
-        }
-        buffer[len++] = '/';
-
-        size_t fallback_len = string_util::length(fallback);
-        if (len + fallback_len >= sizeof(default_init_paths[default_paths_used])) {
-            log_message(LogLevel::Warn,
-                        "Boot: init filename '%s' truncated for root mount '%s'",
-                        fallback,
-                        root_ptr);
-            continue;
-        }
-        for (size_t idx = 0; idx < fallback_len; ++idx) {
-            buffer[len + idx] = fallback[idx];
-        }
-        buffer[len + fallback_len] = '\0';
-
-        bool duplicate = init_task_path_valid &&
-                         string_util::equals(init_task_path, buffer);
-        if (!duplicate && init_candidate_count < kMaxInitCandidates) {
-            init_candidates[init_candidate_count++] = buffer;
-        }
-        ++default_paths_used;
+        log_message(LogLevel::Warn, "Boot: init task not found at %s",
+                    candidate);
     }
-}
 
-bool init_loaded = false;
-const char* init_path_used = nullptr;
-
-for (size_t i = 0; i < init_candidate_count; ++i) {
-    const char* candidate = init_candidates[i];
-    if (candidate == nullptr) {
-        continue;
-    }
-    if (vfs::read_file(candidate, init_buffer, sizeof(init_buffer),
-                       init_size)) {
-        init_loaded = true;
-        init_path_used = candidate;
-        break;
-    }
-    log_message(LogLevel::Warn,
-                "Boot: init task not found at %s",
-                candidate);
-}
-
-if (init_loaded) {
-    loader::ProgramImage image{init_buffer, init_size, 0};
-    process::Process* proc = process::allocate();
-    bool init_started = false;
-    if (proc != nullptr) {
-        string_util::copy(proc->cwd, sizeof(proc->cwd), boot_cwd);
-        if (loader::load_into_process(image, *proc)) {
-            log_message(LogLevel::Info,
-                        "Boot: launched init task from %s (%x bytes)",
-                        init_path_used,
-                        init_size);
-            scheduler::enqueue(proc);
-            init_started = true;
-        } else {
-            proc->state = process::State::Unused;
-            proc->pid = 0;
+    if (init_loaded) {
+        loader::ProgramImage image{init_buffer, init_size, 0};
+        process::Process* proc = process::allocate();
+        bool init_started = false;
+        if (proc != nullptr) {
+            string_util::copy(proc->cwd, sizeof(proc->cwd), boot_cwd);
+            if (loader::load_into_process(image, *proc)) {
+                log_message(LogLevel::Info,
+                            "Boot: launched init task from %s (%x bytes)",
+                            init_path_used, init_size);
+                scheduler::enqueue(proc);
+                init_started = true;
+            } else {
+                proc->state = process::State::Unused;
+                proc->pid = 0;
+            }
         }
+        if (!init_started) {
+            log_message(
+                LogLevel::Error, "Boot: failed to start init task (%s)",
+                init_path_used != nullptr ? init_path_used : "(unknown)");
+            error_screen::display("FAILED_INIT_START", nullptr, nullptr);
+        }
+    } else if (init_candidate_count > 0) {
+        log_message(LogLevel::Error, "Boot: no init task could be loaded");
+        error_screen::display("FAILED_INIT_LOAD", nullptr, nullptr);
+    } else {
+        log_message(LogLevel::Warn,
+                    "Boot: init task not attempted (no path configured)");
+        error_screen::display("FAILED_INIT_PATH", nullptr, nullptr);
     }
-    if (!init_started) {
-        log_message(LogLevel::Error,
-                    "Boot: failed to start init task (%s)",
-                    init_path_used != nullptr ? init_path_used : "(unknown)");
-    }
-} else if (init_candidate_count > 0) {
-    log_message(LogLevel::Error,
-                "Boot: no init task could be loaded");
-} else {
-    log_message(LogLevel::Warn,
-                "Boot: init task not attempted (no path configured)");
-}
 
     scheduler::run();
 
-    log_message(LogLevel::Error,
-                "Scheduler failed to start or was exited, halting");
+    error_screen::display("SCHEDULER_EXITED", nullptr, nullptr);
+
     hcf();
 }

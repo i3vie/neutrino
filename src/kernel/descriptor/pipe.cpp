@@ -33,6 +33,7 @@ struct Pipe {
     volatile int lock;
     PipeWaiter* read_waiters;
     PipeWaiter* write_waiters;
+    uint32_t id;
 };
 
 struct PipeEndpoint {
@@ -46,6 +47,7 @@ struct PipeEndpoint {
 Pipe g_pipes[kMaxPipes]{};
 PipeEndpoint g_pipe_endpoints[kMaxPipes * 2]{};
 PipeWaiter g_pipe_waiters[kMaxPipeWaiters]{};
+uint32_t g_next_pipe_id = 1;
 
 inline size_t min_size(size_t a, size_t b) {
     return (a < b) ? a : b;
@@ -76,6 +78,10 @@ Pipe* allocate_pipe() {
         pipe.read_waiters = nullptr;
         pipe.write_waiters = nullptr;
         pipe.lock = 0;
+        if (g_next_pipe_id == 0) {
+            g_next_pipe_id = 1;
+        }
+        pipe.id = g_next_pipe_id++;
         memset(pipe.buffer, 0, sizeof(pipe.buffer));
         return &pipe;
     }
@@ -96,6 +102,21 @@ PipeEndpoint* allocate_pipe_endpoint(Pipe* pipe,
         endpoint.can_read = can_read;
         endpoint.can_write = can_write;
         return &endpoint;
+    }
+    return nullptr;
+}
+
+Pipe* find_pipe_by_id(uint32_t id) {
+    if (id == 0) {
+        return nullptr;
+    }
+    for (auto& pipe : g_pipes) {
+        if (!pipe.in_use) {
+            continue;
+        }
+        if (pipe.id == id) {
+            return &pipe;
+        }
     }
     return nullptr;
 }
@@ -425,6 +446,31 @@ int64_t pipe_write(process::Process&,
     return kWouldBlock;
 }
 
+int pipe_get_property(DescriptorEntry& entry,
+                      uint32_t property,
+                      void* out,
+                      size_t size) {
+    if (property !=
+        static_cast<uint32_t>(descriptor_defs::Property::PipeInfo)) {
+        return -1;
+    }
+    auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
+    if (endpoint == nullptr || !endpoint->in_use) {
+        return -1;
+    }
+    Pipe* pipe = endpoint->pipe;
+    if (pipe == nullptr || !pipe->in_use) {
+        return -1;
+    }
+    if (out == nullptr || size < sizeof(descriptor_defs::PipeInfo)) {
+        return -1;
+    }
+    auto* info = reinterpret_cast<descriptor_defs::PipeInfo*>(out);
+    info->id = pipe->id;
+    info->flags = static_cast<uint32_t>(entry.flags & 0xFFFFFFFFu);
+    return 0;
+}
+
 void close_pipe(DescriptorEntry& entry) {
     auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
     if (endpoint == nullptr || !endpoint->in_use) {
@@ -489,13 +535,13 @@ void close_pipe(DescriptorEntry& entry) {
 const Ops kPipeOps{
     .read = pipe_read,
     .write = pipe_write,
-    .get_property = nullptr,
+    .get_property = pipe_get_property,
     .set_property = nullptr,
 };
 
 bool open_pipe(process::Process&,
                uint64_t flags,
-               uint64_t,
+               uint64_t existing_id,
                uint64_t,
                Allocation& alloc) {
     bool want_read = (flags & static_cast<uint64_t>(Flag::Readable)) != 0;
@@ -505,15 +551,19 @@ bool open_pipe(process::Process&,
         return false;
     }
 
-    Pipe* pipe = allocate_pipe();
-    if (pipe == nullptr) {
+    bool created_pipe = (existing_id == 0);
+    Pipe* pipe = created_pipe ? allocate_pipe()
+                              : find_pipe_by_id(static_cast<uint32_t>(existing_id));
+    if (pipe == nullptr || !pipe->in_use) {
         return false;
     }
 
     PipeEndpoint* endpoint =
         allocate_pipe_endpoint(pipe, process::current(), want_read, want_write);
     if (endpoint == nullptr) {
-        pipe->in_use = false;
+        if (created_pipe) {
+            pipe->in_use = false;
+        }
         return false;
     }
 

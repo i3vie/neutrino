@@ -187,6 +187,55 @@ static inline long descriptor_set_property(uint32_t handle,
                         static_cast<long>(size));
 }
 
+static inline long shared_memory_open(const char* name, size_t length) {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::SharedMemory),
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(name)),
+        static_cast<uint64_t>(length),
+        0);
+}
+
+static inline long shared_memory_get_info(
+    uint32_t handle,
+    descriptor_defs::SharedMemoryInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::SharedMemoryInfo),
+        info,
+        sizeof(*info));
+}
+
+static inline long pipe_open_new(uint64_t flags) {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Pipe),
+        flags,
+        0,
+        0);
+}
+
+static inline long pipe_open_existing(uint64_t flags, uint64_t pipe_id) {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Pipe),
+        flags,
+        pipe_id,
+        0);
+}
+
+static inline long pipe_get_info(uint32_t handle,
+                                 descriptor_defs::PipeInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::PipeInfo),
+        info,
+        sizeof(*info));
+}
+
 static inline long descriptor_read(uint32_t handle,
                                        void* buffer,
                                        size_t length,

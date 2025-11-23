@@ -232,7 +232,22 @@ uint32_t open(process::Process& proc,
     if (alloc.ops == nullptr) {
         alloc.ops = reg->ops;
     }
-    return install(proc, table, alloc);
+    uint32_t handle = install(proc, table, alloc);
+    if (handle == kInvalidHandle && alloc.close != nullptr) {
+        DescriptorEntry temp{};
+        temp.type = alloc.type;
+        temp.flags = alloc.flags;
+        temp.extended_flags = alloc.extended_flags;
+        temp.has_extended_flags = alloc.has_extended_flags;
+        temp.object = alloc.object;
+        temp.subsystem_data = alloc.subsystem_data;
+        temp.name = alloc.name;
+        temp.ops = alloc.ops;
+        temp.close = alloc.close;
+        temp.in_use = true;
+        alloc.close(temp);
+    }
+    return handle;
 }
 
 int64_t read(process::Process& proc,

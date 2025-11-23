@@ -11,3 +11,5 @@ uint64_t paging_virt_to_phys(uint64_t virt);
 void* paging_alloc_page();
 bool paging_mark_wc(uint64_t virt, uint64_t length);
 uint64_t paging_cr3();
+bool paging_unmap_page(uint64_t virt, uint64_t& phys_out);
+void paging_free_physical(uint64_t phys);

@@ -8,8 +8,8 @@ namespace {
 constexpr uint64_t kPageSize = 0x1000;
 constexpr uint64_t kPageMask = kPageSize - 1;
 
-constexpr uint64_t kUserCodeBase = 0x0000000040000000ull;
-constexpr uint64_t kUserStackCeiling = 0x00007ffffff00000ull;
+constexpr uint64_t kUserCodeBase = vm::kUserAddressSpaceBase;
+constexpr uint64_t kUserStackCeiling = vm::kUserAddressSpaceTop;
 
 uint64_t g_next_user_code = kUserCodeBase;
 uint64_t g_next_user_stack = kUserStackCeiling;
@@ -119,6 +119,62 @@ Stack allocate_user_stack(size_t length) {
 
     g_next_user_stack = base;
     return Stack{base, top, total};
+}
+
+void release_user_region(const Region& region) {
+    if (region.base == 0 || region.length == 0) {
+        return;
+    }
+    uint64_t base = align_down(region.base, kPageSize);
+    uint64_t limit = align_up(region.length, kPageSize);
+    for (uint64_t offset = 0; offset < limit; offset += kPageSize) {
+        uint64_t virt = base + offset;
+        uint64_t phys = 0;
+        if (!paging_unmap_page(virt, phys)) {
+            continue;
+        }
+        paging_free_physical(phys);
+    }
+}
+
+bool is_user_range(uint64_t address, uint64_t length) {
+    if (address < kUserAddressSpaceBase ||
+        address >= kUserAddressSpaceTop) {
+        return false;
+    }
+    if (length == 0) {
+        return true;
+    }
+    uint64_t max_len = kUserAddressSpaceTop - address;
+    if (length > max_len) {
+        return false;
+    }
+    return true;
+}
+
+bool copy_user_string(const char* user, char* dest, size_t dest_size) {
+    if (dest == nullptr || dest_size == 0) {
+        return false;
+    }
+    dest[0] = '\0';
+    if (user == nullptr) {
+        return false;
+    }
+    size_t idx = 0;
+    while (idx + 1 < dest_size) {
+        uint64_t addr = reinterpret_cast<uint64_t>(user + idx);
+        if (!is_user_range(addr, 1)) {
+            dest[0] = '\0';
+            return false;
+        }
+        char ch = user[idx];
+        dest[idx++] = ch;
+        if (ch == '\0') {
+            return true;
+        }
+    }
+    dest[dest_size - 1] = '\0';
+    return false;
 }
 
 }  // namespace vm

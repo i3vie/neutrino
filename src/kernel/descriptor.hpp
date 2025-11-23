@@ -36,6 +36,8 @@ constexpr uint32_t kTypeBlockDevice =
     static_cast<uint32_t>(descriptor_defs::Type::BlockDevice);
 constexpr uint32_t kTypePipe =
     static_cast<uint32_t>(descriptor_defs::Type::Pipe);
+constexpr uint32_t kTypeSharedMemory =
+    static_cast<uint32_t>(descriptor_defs::Type::SharedMemory);
 
 constexpr int64_t kWouldBlock = -2;
 

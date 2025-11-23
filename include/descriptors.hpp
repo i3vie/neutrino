@@ -12,12 +12,15 @@ enum class Type : uint16_t {
     Framebuffer = 0x010,
     BlockDevice = 0x020,
     Pipe        = 0x030,
+    SharedMemory = 0x040,
 };
 
 enum class Property : uint32_t {
     CommonName        = 0x00000001,
     FramebufferInfo   = 0x00010001,
     BlockGeometry     = 0x00020001,
+    SharedMemoryInfo  = 0x00030001,
+    PipeInfo          = 0x00040001,
 };
 
 struct FramebufferInfo {
@@ -40,6 +43,16 @@ struct FramebufferInfo {
 struct BlockGeometry {
     uint64_t sector_size;
     uint64_t sector_count;
+};
+
+struct SharedMemoryInfo {
+    uint64_t base;
+    uint64_t length;
+};
+
+struct PipeInfo {
+    uint32_t id;
+    uint32_t flags;
 };
 
 }  // namespace descriptor_defs
