@@ -11,7 +11,7 @@ OBJ_DIR  := build
 PROG_DIR := programs
 BIN_DIR  := binary
 
-PROGRAMS := shell ls cat noop shm_demo
+PROGRAMS := shell ls cat noop shm_parent shm_writer shm_reader
 PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
@@ -29,7 +29,7 @@ all: $(PROGRAM_OUTPUTS)
 $(OBJ_DIR)/crt0.o: $(CRT_DIR)/crt0.s $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(NASM) $(ASFLAGS) $< -o $@
 
-$(PROG_DIR)/%.elf: $(PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o | $(PROG_DIR)
+$(PROG_DIR)/%.elf: $(PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(CRT_DIR)/syscall.hpp | $(PROG_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $< -o $@
 	@mkdir -p $(BIN_DIR)
 	@cp $@ $(BIN_DIR)/$*.elf

@@ -5,6 +5,7 @@
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "../../kernel/error.hpp"
+#include "../../kernel/process.hpp"
 #include "../../kernel/scheduler.hpp"
 #include "percpu.hpp"
 #include "lapic.hpp"
@@ -91,6 +92,18 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                 external ? 1 : 0,
                 idt ? 1 : 0,
                 ldt ? 1 : 0);
+    uint64_t cr3_reg = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3_reg));
+    if (auto* cur = process::current()) {
+        log_message(LogLevel::Error,
+                    "Faulting process pid=%u cr3=%016llx",
+                    static_cast<unsigned int>(cur->pid),
+                    static_cast<unsigned long long>(cr3_reg));
+    } else {
+        log_message(LogLevel::Error,
+                    "Faulting process unknown (cr3=%016llx)",
+                    static_cast<unsigned long long>(cr3_reg));
+    }
     if (regs->int_no == 14) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));

@@ -24,6 +24,7 @@
 section .text
 global syscall_entry
 extern syscall_dispatch
+extern syscall_kernel_stack
 
 syscall_entry:
     sub rsp, FRAME_SIZE
@@ -48,6 +49,17 @@ syscall_entry:
     mov [rsp + FRAME_USER_RSP], r10
     mov [rsp + FRAME_USER_RIP], rcx
     mov [rsp + FRAME_USER_RFLAGS], r11
+
+    mov r12, rsp
+    call syscall_kernel_stack
+    test rax, rax
+    jz .panic
+    mov rsp, rax
+    sub rsp, FRAME_SIZE
+    mov rsi, r12
+    mov rdi, rsp
+    mov rcx, FRAME_SIZE / 8
+    rep movsq
 
     mov r15, rsp
     mov rdi, rsp
@@ -82,3 +94,9 @@ syscall_entry:
     mov r15, [r15 + FRAME_R15]
 
     iretq
+
+.panic:
+    cli
+.halt_loop:
+    hlt
+    jmp .halt_loop

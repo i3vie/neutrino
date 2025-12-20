@@ -101,7 +101,7 @@ bool looks_like_elf(const uint8_t* data, size_t size) {
 }
 
 bool setup_user_stack(process::Process& proc) {
-    proc.stack_region = vm::allocate_user_stack(16 * 1024);
+    proc.stack_region = vm::allocate_user_stack(proc.cr3, 16 * 1024);
     if (proc.stack_region.top == 0) {
         log_message(LogLevel::Error,
                     "Loader: failed to allocate stack for process %u",
@@ -116,7 +116,7 @@ bool setup_user_stack(process::Process& proc) {
 bool load_flat_binary(const loader::ProgramImage& image,
                       process::Process& proc) {
     uint64_t entry_point = 0;
-    proc.code_region = vm::map_user_code(image.data, image.size,
+    proc.code_region = vm::map_user_code(proc.cr3, image.data, image.size,
                                          image.entry_offset, entry_point);
     if (proc.code_region.base == 0) {
         log_message(LogLevel::Error,
@@ -258,7 +258,8 @@ bool load_elf_binary(const loader::ProgramImage& image,
     uint64_t aligned_span = aligned_max - aligned_min;
 
     vm::Region region =
-        vm::allocate_user_region(static_cast<size_t>(aligned_span));
+        vm::allocate_user_region(proc.cr3,
+                                 static_cast<size_t>(aligned_span));
     if (region.base == 0) {
         log_message(LogLevel::Error,
                     "Loader: failed to allocate region for ELF process %u",
@@ -276,14 +277,26 @@ bool load_elf_binary(const loader::ProgramImage& image,
         }
 
         uint64_t dest = load_bias + ph->vaddr;
-        void* dest_ptr = reinterpret_cast<void*>(dest);
         if (ph->filesz != 0) {
             const uint8_t* src = image.data + ph->offset;
-            memcpy(dest_ptr, src, static_cast<size_t>(ph->filesz));
+            if (!vm::copy_into_address_space(proc.cr3,
+                                             dest,
+                                             src,
+                                             static_cast<size_t>(ph->filesz))) {
+                log_message(LogLevel::Error,
+                            "Loader: failed to copy ELF segment data");
+                return false;
+            }
         }
         if (ph->memsz > ph->filesz) {
-            void* bss_ptr = reinterpret_cast<void*>(dest + ph->filesz);
-            memset(bss_ptr, 0, static_cast<size_t>(ph->memsz - ph->filesz));
+            uint64_t zero_base = dest + ph->filesz;
+            uint64_t zero_len = ph->memsz - ph->filesz;
+            if (!vm::zero_address_space(proc.cr3, zero_base,
+                                        static_cast<size_t>(zero_len))) {
+                log_message(LogLevel::Error,
+                            "Loader: failed to zero ELF segment");
+                return false;
+            }
         }
     }
 
@@ -328,9 +341,17 @@ bool load_elf_binary(const loader::ProgramImage& image,
                 uint32_t type = static_cast<uint32_t>(rela.info & 0xFFFFFFFFu);
                 switch (type) {
                     case R_X86_64_RELATIVE: {
-                        uint64_t* target =
-                            reinterpret_cast<uint64_t*>(load_bias + rela.offset);
-                        *target = load_bias + static_cast<uint64_t>(rela.addend);
+                        uint64_t value =
+                            load_bias + static_cast<uint64_t>(rela.addend);
+                        if (!vm::copy_into_address_space(
+                                proc.cr3,
+                                load_bias + rela.offset,
+                                &value,
+                                sizeof(value))) {
+                            log_message(LogLevel::Error,
+                                        "Loader: failed to apply relocation");
+                            return false;
+                        }
                         break;
                     }
                     default:

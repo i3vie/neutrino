@@ -126,6 +126,14 @@ void prepare_frame_for_process(process::Process& proc,
         frame.user_rflags = 0x202;
         frame.r11 = 0x202;
     }
+    if (!proc.has_context) {
+        log_message(LogLevel::Debug,
+                    "Scheduler: starting pid=%u rip=%llx rsp=%llx",
+                    static_cast<unsigned int>(proc.pid),
+                    static_cast<unsigned long long>(proc.user_ip),
+                    static_cast<unsigned long long>(proc.user_sp));
+    }
+
     set_rsp0(proc.kernel_stack_top);
 }
 
@@ -295,6 +303,15 @@ void reschedule(syscall::SyscallFrame& frame) {
         prepare_frame_for_process(*current_proc, frame);
         asm volatile("pause");
         return;
+    }
+
+    if (current_proc != next) {
+        log_message(LogLevel::Debug,
+                    "Scheduler: context switch pid=%u->%u cr3=%llx->%llx",
+                    static_cast<unsigned int>(current_proc ? current_proc->pid : 0),
+                    static_cast<unsigned int>(next ? next->pid : 0),
+                    static_cast<unsigned long long>(current_proc ? current_proc->cr3 : 0),
+                    static_cast<unsigned long long>(next ? next->cr3 : 0));
     }
 
     process::set_current(next);

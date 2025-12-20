@@ -16,6 +16,17 @@ TARGET_ISO := $(OUT_DIR)/neutrino.iso
 CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Iinclude -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
+# === QEMU configuration ===
+QEMU ?= qemu-system-x86_64
+QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
+QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
+		-smp 4 -bios $(QEMU_BIOS) \
+		-drive file=hdd.img,format=raw,if=ide \
+		-enable-kvm
+QEMU_DEBUG_ARGS := -d int \
+		-monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot
+QEMU_DEBUG_WAIT_ARGS := -s -S
+
 TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 RAMFS_TRUNCATE_SIZE ?= 64M
@@ -123,13 +134,15 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO_RAMFS)
 
 run: $(TARGET_ISO)
-	qemu-system-x86_64 -m 1G -smp 4 -bios ~/Downloads/OVMF.4m.fd -cdrom $(TARGET_ISO) \
-		-serial stdio  \
-		-drive file=hdd.img,format=raw,if=ide \
+	$(QEMU) $(QEMU_COMMON_ARGS)
 
 # === Run but wait for debugger to attach ===
 debug: $(TARGET_ISO)
-	qemu-system-x86_64 -m 1G -bios /usr/share/edk2/x64/OVMF.4m.fd -cdrom $(TARGET_ISO) -serial stdio -d int -s -S -monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot
+	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_DEBUG_ARGS) $(QEMU_DEBUG_WAIT_ARGS)
+
+# === Run with -d int, do not wait for debugger to attach ===
+debug-nostop: $(TARGET_ISO)
+	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_DEBUG_ARGS)
 
 # === Utility targets ===
 iso: $(TARGET_ISO)
