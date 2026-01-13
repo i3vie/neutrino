@@ -4,7 +4,8 @@ SHELL := /bin/bash
 
 CXX      ?= g++
 NASM     ?= nasm
-SUDO     ?= sudo
+SUDO     ?=
+MOUNT_SUDO ?= sudo
 
 CRT_DIR  := crt
 OBJ_DIR  := build
@@ -21,8 +22,11 @@ PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
 
 HDD_IMAGE ?= ../hdd.img
 MOUNT_DIR ?= $(HOME)/MountedImage
+MOUNT_UID ?= $(shell id -u)
+MOUNT_GID ?= $(shell id -g)
+MOUNT_OPTS ?= loop,rw,uid=$(MOUNT_UID),gid=$(MOUNT_GID),umask=022
 
-.PHONY: all clean install
+.PHONY: all clean install install-mount install-mtools
 
 all: $(PROGRAM_OUTPUTS)
 
@@ -36,11 +40,11 @@ $(PROG_DIR)/%.elf: $(PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(CRT_DIR)/syscall.hpp | 
 
 install: all
 	@set -euo pipefail; \
-	$(SUDO) mkdir -p "$(MOUNT_DIR)"; \
+	mkdir -p "$(MOUNT_DIR)"; \
 	mounted=0; \
-	cleanup() { if [[ $$mounted -eq 1 ]]; then $(SUDO) umount "$(MOUNT_DIR)"; fi; }; \
+	cleanup() { if [[ $$mounted -eq 1 ]]; then $(MOUNT_SUDO) umount "$(MOUNT_DIR)"; fi; }; \
 	trap cleanup EXIT INT TERM; \
-	$(SUDO) mount -o loop,rw "$(HDD_IMAGE)" "$(MOUNT_DIR)"; \
+	$(MOUNT_SUDO) mount -o "$(MOUNT_OPTS)" "$(HDD_IMAGE)" "$(MOUNT_DIR)"; \
 	mounted=1; \
 	$(SUDO) rm -rf "$(MOUNT_DIR)/binary"; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/binary"; \
@@ -48,7 +52,7 @@ install: all
 		$(SUDO) install -m 0644 "$(PROG_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
 	done; \
 	if [[ -f "$(PROG_DIR)/shell.elf" ]]; then \
-		$(SUDO) install -m 0644 "$(PROG_DIR)/shell.elf" "$(MOUNT_DIR)/init.elf"; \
+		$(SUDO) install -m 0644 "$(PROG_DIR)/compositor.elf" "$(MOUNT_DIR)/init.elf"; \
 	fi; \
 	sync
 
