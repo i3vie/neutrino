@@ -1,6 +1,7 @@
 #include "vm.hpp"
 
 #include "arch/x86_64/memory/paging.hpp"
+#include "kernel/memory/physical_allocator.hpp"
 #include "lib/mem.hpp"
 #include "process.hpp"
 
@@ -74,12 +75,12 @@ Region map_user_code(uint64_t cr3, const uint8_t* data, size_t length,
     size_t pages = padded / kPageSize;
 
     for (size_t i = 0; i < pages; ++i) {
-        auto page = static_cast<uint8_t*>(paging_alloc_page());
-        if (page == nullptr) {
+        uint64_t phys = memory::alloc_user_page();
+        if (phys == 0) {
             entry_point = 0;
             return Region{0, 0};
         }
-        uint64_t phys = paging_virt_to_phys(reinterpret_cast<uint64_t>(page));
+        auto* page = static_cast<uint8_t*>(paging_phys_to_virt(phys));
         uint64_t virt = base + static_cast<uint64_t>(i) * kPageSize;
         paging_map_page_in_space(cr3, virt, phys,
                                  PAGE_FLAG_WRITE | PAGE_FLAG_USER);
@@ -207,8 +208,12 @@ Stack allocate_user_stack(uint64_t cr3, size_t length) {
     uint64_t base = top - static_cast<uint64_t>(total);
 
     for (size_t i = 0; i < pages; ++i) {
-        auto page = static_cast<uint8_t*>(paging_alloc_page());
-        if (page == nullptr) {
+        uint64_t phys = memory::alloc_user_page();
+        if (phys == 0) {
+            log_message(LogLevel::Error,
+                        "VM: stack alloc failed (page %zu/%zu)",
+                        i + 1,
+                        pages);
             return Stack{0, 0, 0};
         }
         uint64_t phys = paging_virt_to_phys(reinterpret_cast<uint64_t>(page));
@@ -367,6 +372,104 @@ bool copy_user_string(const char* user, char* dest, size_t dest_size) {
     }
     dest[dest_size - 1] = '\0';
     return false;
+}
+
+bool copy_to_user(uint64_t cr3,
+                  uint64_t dest,
+                  const void* src,
+                  size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (cr3 == 0 || src == nullptr || dest == 0) {
+        return false;
+    }
+    if (!is_user_range(dest, static_cast<uint64_t>(length))) {
+        return false;
+    }
+    const auto* src_bytes = reinterpret_cast<const uint8_t*>(src);
+    size_t offset = 0;
+    while (offset < length) {
+        uint64_t dest_addr = dest + offset;
+        uint64_t phys = 0;
+        if (!paging_resolve_cr3(cr3, dest_addr, phys)) {
+            return false;
+        }
+        size_t page_off = static_cast<size_t>(dest_addr & kPageMask);
+        size_t chunk = kPageSize - page_off;
+        if (chunk > length - offset) {
+            chunk = length - offset;
+        }
+        void* dest_ptr = paging_phys_to_virt(phys);
+        memcpy(dest_ptr, src_bytes + offset, chunk);
+        offset += chunk;
+    }
+    return true;
+}
+
+bool copy_from_user(uint64_t cr3,
+                    void* dest,
+                    uint64_t src,
+                    size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (cr3 == 0 || dest == nullptr || src == 0) {
+        return false;
+    }
+    if (!is_user_range(src, static_cast<uint64_t>(length))) {
+        return false;
+    }
+    auto* dest_bytes = reinterpret_cast<uint8_t*>(dest);
+    size_t offset = 0;
+    while (offset < length) {
+        uint64_t src_addr = src + offset;
+        uint64_t phys = 0;
+        if (!paging_resolve_cr3(cr3, src_addr, phys)) {
+            return false;
+        }
+        size_t page_off = static_cast<size_t>(src_addr & kPageMask);
+        size_t chunk = kPageSize - page_off;
+        if (chunk > length - offset) {
+            chunk = length - offset;
+        }
+        void* src_ptr = paging_phys_to_virt(phys);
+        memcpy(dest_bytes + offset, src_ptr, chunk);
+        offset += chunk;
+    }
+    return true;
+}
+
+bool fill_user(uint64_t cr3,
+               uint64_t dest,
+               uint8_t value,
+               size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (cr3 == 0 || dest == 0) {
+        return false;
+    }
+    if (!is_user_range(dest, static_cast<uint64_t>(length))) {
+        return false;
+    }
+    size_t offset = 0;
+    while (offset < length) {
+        uint64_t dest_addr = dest + offset;
+        uint64_t phys = 0;
+        if (!paging_resolve_cr3(cr3, dest_addr, phys)) {
+            return false;
+        }
+        size_t page_off = static_cast<size_t>(dest_addr & kPageMask);
+        size_t chunk = kPageSize - page_off;
+        if (chunk > length - offset) {
+            chunk = length - offset;
+        }
+        void* dest_ptr = paging_phys_to_virt(phys);
+        memset(dest_ptr, value, chunk);
+        offset += chunk;
+    }
+    return true;
 }
 
 }  // namespace vm

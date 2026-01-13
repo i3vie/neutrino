@@ -34,5 +34,8 @@ inline constexpr uint64_t kUserAddressSpaceTop = 0x00007ffffff00000ull;
 
 bool is_user_range(uint64_t address, uint64_t length);
 bool copy_user_string(const char* user, char* dest, size_t dest_size);
+bool copy_to_user(uint64_t cr3, uint64_t dest, const void* src, size_t length);
+bool copy_from_user(uint64_t cr3, void* dest, uint64_t src, size_t length);
+bool fill_user(uint64_t cr3, uint64_t dest, uint8_t value, size_t length);
 
 }  // namespace vm

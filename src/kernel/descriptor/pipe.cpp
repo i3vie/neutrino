@@ -3,6 +3,7 @@
 #include "../../lib/mem.hpp"
 #include "../process.hpp"
 #include "../scheduler.hpp"
+#include "../vm.hpp"
 
 namespace descriptor {
 
@@ -217,6 +218,57 @@ size_t pipe_copy_in(Pipe& pipe, const uint8_t* src, size_t max_bytes) {
     return copied;
 }
 
+int64_t pipe_copy_out_to_user(Pipe& pipe,
+                              process::Process& proc,
+                              uint64_t user_address,
+                              size_t max_bytes) {
+    if (user_address == 0 || proc.cr3 == 0) {
+        return -1;
+    }
+    size_t copied = 0;
+    while (copied < max_bytes && pipe.count > 0) {
+        size_t chunk = min_size(
+            min_size(max_bytes - copied, pipe.count),
+            kPipeBufferSize - pipe.head);
+        if (!vm::copy_to_user(proc.cr3,
+                              user_address + copied,
+                              pipe.buffer + pipe.head,
+                              chunk)) {
+            return (copied > 0) ? static_cast<int64_t>(copied) : -1;
+        }
+        pipe.head = (pipe.head + chunk) % kPipeBufferSize;
+        pipe.count -= chunk;
+        copied += chunk;
+    }
+    return static_cast<int64_t>(copied);
+}
+
+int64_t pipe_copy_in_from_user(Pipe& pipe,
+                               process::Process& proc,
+                               uint64_t user_address,
+                               size_t max_bytes) {
+    if (user_address == 0 || proc.cr3 == 0) {
+        return -1;
+    }
+    size_t copied = 0;
+    while (copied < max_bytes && pipe.count < kPipeBufferSize) {
+        size_t space = kPipeBufferSize - pipe.count;
+        size_t chunk = min_size(
+            min_size(max_bytes - copied, space),
+            kPipeBufferSize - pipe.tail);
+        if (!vm::copy_from_user(proc.cr3,
+                                pipe.buffer + pipe.tail,
+                                user_address + copied,
+                                chunk)) {
+            return (copied > 0) ? static_cast<int64_t>(copied) : -1;
+        }
+        pipe.tail = (pipe.tail + chunk) % kPipeBufferSize;
+        pipe.count += chunk;
+        copied += chunk;
+    }
+    return static_cast<int64_t>(copied);
+}
+
 void drop_waiters_for_owner_locked(Pipe& pipe, process::Process* owner) {
     PipeWaiter* prev = nullptr;
     PipeWaiter* cur = pipe.read_waiters;
@@ -267,17 +319,20 @@ void wake_read_waiters_locked(Pipe& pipe) {
         if (pipe.count == 0) {
             break;
         }
-        uint8_t* dest = reinterpret_cast<uint8_t*>(waiter->user_address);
-        if (dest == nullptr) {
+        if (waiter->proc == nullptr) {
             pipe.read_waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, -1);
             continue;
         }
-        size_t copied = pipe_copy_out(pipe, dest, static_cast<size_t>(waiter->length));
+        int64_t copied =
+            pipe_copy_out_to_user(pipe,
+                                  *waiter->proc,
+                                  waiter->user_address,
+                                  static_cast<size_t>(waiter->length));
         pipe.read_waiters = waiter->next;
         waiter->next = nullptr;
-        complete_waiter(waiter, static_cast<int64_t>(copied));
+        complete_waiter(waiter, copied);
     }
 }
 
@@ -293,24 +348,27 @@ void wake_write_waiters_locked(Pipe& pipe) {
         if (pipe.count >= kPipeBufferSize) {
             break;
         }
-        const uint8_t* src = reinterpret_cast<const uint8_t*>(waiter->user_address);
-        if (src == nullptr) {
+        if (waiter->proc == nullptr) {
             pipe.write_waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, -1);
             continue;
         }
-        size_t copied = pipe_copy_in(pipe, src, static_cast<size_t>(waiter->length));
+        int64_t copied =
+            pipe_copy_in_from_user(pipe,
+                                   *waiter->proc,
+                                   waiter->user_address,
+                                   static_cast<size_t>(waiter->length));
         pipe.write_waiters = waiter->next;
         waiter->next = nullptr;
-        complete_waiter(waiter, static_cast<int64_t>(copied));
+        complete_waiter(waiter, copied);
         if (pipe.count >= kPipeBufferSize) {
             break;
         }
     }
 }
 
-int64_t pipe_read(process::Process&,
+int64_t pipe_read(process::Process& proc,
                   DescriptorEntry& entry,
                   uint64_t user_address,
                   uint64_t length,
@@ -329,8 +387,7 @@ int64_t pipe_read(process::Process&,
     if (pipe == nullptr || !pipe->in_use || !endpoint->can_read) {
         return -1;
     }
-    auto* dest = reinterpret_cast<uint8_t*>(user_address);
-    if (dest == nullptr && length != 0) {
+    if (user_address == 0 && length != 0) {
         return -1;
     }
 
@@ -341,7 +398,13 @@ int64_t pipe_read(process::Process&,
     lock_pipe(*pipe);
 
     if (pipe->count > 0) {
-        read_count = pipe_copy_out(*pipe, dest, requested);
+        int64_t copied =
+            pipe_copy_out_to_user(*pipe, proc, user_address, requested);
+        if (copied < 0) {
+            unlock_pipe(*pipe);
+            return -1;
+        }
+        read_count = static_cast<size_t>(copied);
     }
 
     if (read_count > 0 || async) {
@@ -350,17 +413,12 @@ int64_t pipe_read(process::Process&,
         return static_cast<int64_t>(read_count);
     }
 
-    if (pipe->writer_count == 0) {
-        unlock_pipe(*pipe);
-        return 0;
-    }
-
     PipeWaiter* waiter = allocate_pipe_waiter();
     if (waiter == nullptr) {
         unlock_pipe(*pipe);
         return -1;
     }
-    waiter->proc = process::current();
+    waiter->proc = &proc;
     waiter->user_address = user_address;
     waiter->length = length;
     waiter->is_read = true;
@@ -368,17 +426,14 @@ int64_t pipe_read(process::Process&,
 
     push_waiter(pipe->read_waiters, waiter);
 
-    process::Process* proc = process::current();
-    if (proc != nullptr) {
-        proc->state = process::State::Blocked;
-        proc->waiting_on = pipe;
-    }
+    proc.state = process::State::Blocked;
+    proc.waiting_on = pipe;
 
     unlock_pipe(*pipe);
     return kWouldBlock;
 }
 
-int64_t pipe_write(process::Process&,
+int64_t pipe_write(process::Process& proc,
                    DescriptorEntry& entry,
                    uint64_t user_address,
                    uint64_t length,
@@ -397,8 +452,7 @@ int64_t pipe_write(process::Process&,
     if (pipe == nullptr || !pipe->in_use || !endpoint->can_write) {
         return -1;
     }
-    const auto* src = reinterpret_cast<const uint8_t*>(user_address);
-    if (src == nullptr && length != 0) {
+    if (user_address == 0 && length != 0) {
         return -1;
     }
 
@@ -414,7 +468,13 @@ int64_t pipe_write(process::Process&,
     }
 
     if (pipe->count < kPipeBufferSize) {
-        written = pipe_copy_in(*pipe, src, requested);
+        int64_t copied =
+            pipe_copy_in_from_user(*pipe, proc, user_address, requested);
+        if (copied < 0) {
+            unlock_pipe(*pipe);
+            return -1;
+        }
+        written = static_cast<size_t>(copied);
     }
 
     if (written > 0 || async) {
@@ -428,7 +488,7 @@ int64_t pipe_write(process::Process&,
         unlock_pipe(*pipe);
         return -1;
     }
-    waiter->proc = process::current();
+    waiter->proc = &proc;
     waiter->user_address = user_address;
     waiter->length = length;
     waiter->is_read = false;
@@ -436,11 +496,8 @@ int64_t pipe_write(process::Process&,
 
     push_waiter(pipe->write_waiters, waiter);
 
-    process::Process* proc = process::current();
-    if (proc != nullptr) {
-        proc->state = process::State::Blocked;
-        proc->waiting_on = pipe;
-    }
+    proc.state = process::State::Blocked;
+    proc.waiting_on = pipe;
 
     unlock_pipe(*pipe);
     return kWouldBlock;

@@ -301,8 +301,6 @@ bool load_elf_binary(const loader::ProgramImage& image,
     }
 
     if (dynamic_phdr != nullptr) {
-        auto* dyn_table =
-            reinterpret_cast<const Elf64Dyn*>(load_bias + dynamic_phdr->vaddr);
         size_t dyn_count =
             static_cast<size_t>(dynamic_phdr->memsz / sizeof(Elf64Dyn));
 
@@ -311,19 +309,30 @@ bool load_elf_binary(const loader::ProgramImage& image,
         uint64_t rela_ent = 0;
 
         for (size_t i = 0; i < dyn_count; ++i) {
-            int64_t tag = dyn_table[i].tag;
+            Elf64Dyn dyn{};
+            uint64_t dyn_addr =
+                load_bias + dynamic_phdr->vaddr + (i * sizeof(Elf64Dyn));
+            if (!vm::copy_from_user(proc.cr3,
+                                    &dyn,
+                                    dyn_addr,
+                                    sizeof(Elf64Dyn))) {
+                log_message(LogLevel::Error,
+                            "Loader: failed to read dynamic table entry");
+                return false;
+            }
+            int64_t tag = dyn.tag;
             if (tag == DT_NULL) {
                 break;
             }
             switch (tag) {
                 case DT_RELA:
-                    rela_addr = dyn_table[i].val;
+                    rela_addr = dyn.val;
                     break;
                 case DT_RELASZ:
-                    rela_size = dyn_table[i].val;
+                    rela_size = dyn.val;
                     break;
                 case DT_RELAENT:
-                    rela_ent = dyn_table[i].val;
+                    rela_ent = dyn.val;
                     break;
                 default:
                     break;
@@ -334,10 +343,23 @@ bool load_elf_binary(const loader::ProgramImage& image,
             if (rela_ent == 0) {
                 rela_ent = sizeof(Elf64Rela);
             }
+            if (rela_ent < sizeof(Elf64Rela)) {
+                log_message(LogLevel::Error,
+                            "Loader: relocation entry size too small");
+                return false;
+            }
             size_t rela_count = static_cast<size_t>(rela_size / rela_ent);
-            auto* rela_table = reinterpret_cast<const Elf64Rela*>(load_bias + rela_addr);
             for (size_t i = 0; i < rela_count; ++i) {
-                const Elf64Rela& rela = rela_table[i];
+                Elf64Rela rela{};
+                uint64_t entry_addr = load_bias + rela_addr + (i * rela_ent);
+                if (!vm::copy_from_user(proc.cr3,
+                                        &rela,
+                                        entry_addr,
+                                        sizeof(Elf64Rela))) {
+                    log_message(LogLevel::Error,
+                                "Loader: failed to read relocation entry");
+                    return false;
+                }
                 uint32_t type = static_cast<uint32_t>(rela.info & 0xFFFFFFFFu);
                 switch (type) {
                     case R_X86_64_RELATIVE: {

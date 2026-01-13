@@ -11,6 +11,7 @@
 #include "../../fs/vfs.hpp"
 #include "../../lib/mem.hpp"
 #include "../../kernel/string_util.hpp"
+#include "arch/x86_64/percpu.hpp"
 
 namespace syscall {
 
@@ -51,6 +52,16 @@ uint64_t place_args_on_stack(process::Process& child, const char* args) {
         return 0;
     }
     return dest;
+}
+
+uint32_t pick_child_cpu(process::Process* parent) {
+    if (parent != nullptr && parent->preferred_cpu != UINT32_MAX) {
+        return parent->preferred_cpu;
+    }
+    if (auto* cpu = percpu::current_cpu()) {
+        return cpu->index;
+    }
+    return UINT32_MAX;
 }
 
 bool load_program_image(const char* path, loader::ProgramImage& out_image) {
@@ -445,6 +456,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->context.rax = 0;
             child->has_context = true;
 
+            child->preferred_cpu = pick_child_cpu(proc);
             child->state = process::State::Ready;
             scheduler::enqueue(child);
 
@@ -572,6 +584,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->context.rax = 0;
             child->has_context = true;
 
+            child->preferred_cpu = pick_child_cpu(proc);
             child->state = process::State::Ready;
             scheduler::enqueue(child);
 
