@@ -53,9 +53,6 @@ struct Process {
     bool console_transferred;
     bool has_context;
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
-    uint64_t next_code_cursor;
-    uint64_t next_stack_cursor;
-    uint64_t next_shared_cursor;
     char cwd[128];
     descriptor::Table descriptors;
     FileHandle file_handles[kMaxFileHandles];
@@ -67,6 +64,5 @@ Process* allocate();
 Process* current();
 void set_current(Process* proc);
 Process* table_entry(size_t index);
-Process* find_by_cr3(uint64_t cr3);
 
 }  // namespace process

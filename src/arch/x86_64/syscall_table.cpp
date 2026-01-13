@@ -48,8 +48,16 @@ uint64_t place_args_on_stack(process::Process& child, const char* args) {
     }
 
     uint64_t dest = top - static_cast<uint64_t>(len + 1);
-    if (!vm::copy_into_address_space(child.cr3, dest, args, len + 1)) {
+    uint64_t target_cr3 = child.cr3;
+    if (target_cr3 == 0) {
         return 0;
+    }
+    if (!vm::copy_to_user(target_cr3, dest, args, len + 1)) {
+        return 0;
+    }
+    uint64_t new_sp = dest & ~0xFull;
+    if (new_sp > base) {
+        child.user_sp = new_sp;
     }
     return dest;
 }
@@ -123,15 +131,7 @@ Result handle_syscall(SyscallFrame& frame) {
             return Result::Continue;
         }
         case SystemCall::Exit: {
-            process::Process* proc = process::current();
-            uint64_t code = frame.rdi % 0xFFFF;
-            if (proc != nullptr) {
-                log_message(LogLevel::Debug,
-                            "process %u exiting with code %llu",
-                            static_cast<unsigned int>(proc->pid),
-                            static_cast<unsigned long long>(code));
-            }
-            frame.rax = code;
+            frame.rax = frame.rdi % 0xFFFF;
             return Result::Unschedule;
         }
         case SystemCall::Yield: {
@@ -144,16 +144,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
             uint32_t type = static_cast<uint32_t>(frame.rdi & 0xFFFFu);
-            if (type == static_cast<uint32_t>(descriptor_defs::Type::SharedMemory)) {
-                log_message(LogLevel::Debug,
-                            "syscall DescriptorOpen pid=%u type=SharedMemory arg0/name_ptr=%llx arg1/len=%llx arg2=%llx rip=%llx rsp=%llx",
-                            static_cast<unsigned int>(proc->pid),
-                            static_cast<unsigned long long>(frame.rsi),
-                            static_cast<unsigned long long>(frame.rdx),
-                            static_cast<unsigned long long>(frame.r10),
-                            static_cast<unsigned long long>(frame.user_rip),
-                            static_cast<unsigned long long>(frame.user_rsp));
-            }
             uint32_t handle =
                 descriptor::open(*proc,
                                  proc->descriptors,
@@ -388,20 +378,12 @@ Result handle_syscall(SyscallFrame& frame) {
             if (!path_util::build_absolute_path(proc->cwd,
                                                 path_input,
                                                 resolved_exec)) {
-                log_message(LogLevel::Warn,
-                            "child syscall: parent=%u failed to resolve path=%s",
-                            static_cast<unsigned int>(proc->pid),
-                            path_input);
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
             loader::ProgramImage image{};
             if (!load_program_image(resolved_exec, image)) {
-                log_message(LogLevel::Warn,
-                            "child syscall: parent=%u cannot load '%s'",
-                            static_cast<unsigned int>(proc->pid),
-                            resolved_exec);
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -460,25 +442,6 @@ Result handle_syscall(SyscallFrame& frame) {
             child->state = process::State::Ready;
             scheduler::enqueue(child);
 
-            char arg_log[128];
-            arg_log[0] = '\0';
-            if (args != nullptr) {
-                if (!vm::copy_from_address_space(proc->cr3,
-                                                 arg_log,
-                                                 reinterpret_cast<uint64_t>(args),
-                                                 sizeof(arg_log) - 1)) {
-                    arg_log[0] = '\0';
-                } else {
-                    arg_log[sizeof(arg_log) - 1] = '\0';
-                }
-            }
-            log_message(LogLevel::Debug,
-                        "child syscall: parent=%u spawned pid=%u path=%s args=%s",
-                        static_cast<unsigned int>(proc->pid),
-                        static_cast<unsigned int>(child->pid),
-                        resolved_exec,
-                        arg_log);
-
             proc->waiting_on = child;
             proc->state = process::State::Blocked;
             bool transferred = descriptor::transfer_console_owner(*proc, *child);
@@ -503,12 +466,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
- 
-            log_message(LogLevel::Debug,
-                        "child syscall invoked parent=%u path=%s flags=%llu",
-                        static_cast<unsigned int>(proc->pid),
-                        path_user,
-                        static_cast<unsigned long long>(flags));
 
             size_t path_len = string_util::length(path_user);
             if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
@@ -565,9 +522,6 @@ Result handle_syscall(SyscallFrame& frame) {
                 child->state = process::State::Unused;
                 child->pid = 0;
                 child->parent = nullptr;
-                log_message(LogLevel::Warn,
-                            "child syscall: parent=%u failed to load image into process",
-                            static_cast<unsigned int>(proc->pid));
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -589,7 +543,7 @@ Result handle_syscall(SyscallFrame& frame) {
             scheduler::enqueue(child);
 
             frame.rax = static_cast<uint64_t>(child->pid);
-            return Result::Reschedule;
+            return Result::Continue;
         }
         case SystemCall::ProcessSetCwd: {
             process::Process* proc = process::current();
