@@ -4,6 +4,7 @@
 
 #include "lib/mem.hpp"
 #include "../../arch/x86_64/memory/paging.hpp"
+#include "kernel/memory/physical_allocator.hpp"
 
 namespace {
 
@@ -154,17 +155,11 @@ bool Console::allocate_back_buffer() {
     }
 
     size_t pages = (frame_bytes + kPageSize - 1) / kPageSize;
-    uint8_t* start = nullptr;
-
-    for (size_t i = 0; i < pages; ++i) {
-        auto* page = static_cast<uint8_t*>(paging_alloc_page());
-        if (page == nullptr) {
-            return false;
-        }
-        if (i == 0) {
-            start = page;
-        }
+    uint64_t phys = memory::alloc_kernel_block_pages(pages);
+    if (phys == 0) {
+        return false;
     }
+    auto* start = static_cast<uint8_t*>(paging_phys_to_virt(phys));
 
     back_buffer = start;
     back_buffer_capacity = pages * kPageSize;

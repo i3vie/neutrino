@@ -26,6 +26,7 @@
 #include "descriptor.hpp"
 #include "error.hpp"
 #include "loader.hpp"
+#include "memory/physical_allocator.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
 #include "string_util.hpp"
@@ -295,6 +296,8 @@ static void kernel_main_stage2() {
 
     log_message(LogLevel::Info, "Initializing paging");
     paging_init();
+    log_message(LogLevel::Info, "Initializing physical memory pools");
+    memory::init();
     if (kconsole != nullptr) {
         kconsole->enable_back_buffer();
     }
