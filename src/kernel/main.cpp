@@ -5,6 +5,7 @@
 #include "../drivers/console/console.hpp"
 #include "../drivers/fs/mount_manager.hpp"
 #include "../drivers/input/keyboard.hpp"
+#include "../drivers/input/mouse.hpp"
 #include "../drivers/interrupts/pic.hpp"
 #include "../drivers/limine/limine_requests.hpp"
 #include "../drivers/log/logging.hpp"
@@ -276,6 +277,10 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Info, "Initializing keyboard");
     keyboard::init();
     log_message(LogLevel::Info, "Keyboard initialized");
+
+    log_message(LogLevel::Info, "Initializing mouse");
+    mouse::init();
+    log_message(LogLevel::Info, "Mouse initialized");
 
     log_message(LogLevel::Info, "Configuring PIT");
     pit::init(100);

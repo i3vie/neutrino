@@ -30,6 +30,8 @@ constexpr uint32_t kTypeSerial =
     static_cast<uint32_t>(descriptor_defs::Type::Serial);
 constexpr uint32_t kTypeKeyboard =
     static_cast<uint32_t>(descriptor_defs::Type::Keyboard);
+constexpr uint32_t kTypeMouse =
+    static_cast<uint32_t>(descriptor_defs::Type::Mouse);
 constexpr uint32_t kTypeFramebuffer =
     static_cast<uint32_t>(descriptor_defs::Type::Framebuffer);
 constexpr uint32_t kTypeBlockDevice =
@@ -130,6 +132,7 @@ void register_builtin_types();
 
 bool transfer_console_owner(process::Process& from, process::Process& to);
 void restore_console_owner(process::Process& proc);
+bool console_is_owner(const process::Process& proc);
 
 void init_table(Table& table);
 void destroy_table(process::Process& proc, Table& table);
@@ -181,6 +184,10 @@ int set_property(process::Process& proc,
 
 void register_framebuffer_device(Framebuffer& framebuffer,
                                  uint64_t physical_base);
+void framebuffer_select(uint32_t index);
+uint32_t framebuffer_active_slot();
+bool framebuffer_is_active(uint32_t index);
+int32_t framebuffer_slot_for_process(const process::Process& proc);
 bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel);
 void reset_block_device_registry();
 

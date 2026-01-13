@@ -208,6 +208,53 @@ static inline long shared_memory_get_info(
         sizeof(*info));
 }
 
+static inline long framebuffer_open() {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Framebuffer),
+        0,
+        0,
+        0);
+}
+
+static inline long framebuffer_open_slot(uint32_t slot) {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Framebuffer),
+        static_cast<uint64_t>(slot),
+        0,
+        0);
+}
+
+static inline long framebuffer_get_info(
+    uint32_t handle,
+    descriptor_defs::FramebufferInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::FramebufferInfo),
+        info,
+        sizeof(*info));
+}
+
+static inline long framebuffer_present(
+    uint32_t handle,
+    const descriptor_defs::FramebufferRect* rect) {
+    return descriptor_set_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::FramebufferPresent),
+        rect,
+        rect ? sizeof(*rect) : 0);
+}
+
+static inline long mouse_open() {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Mouse),
+        0,
+        0,
+        0);
+}
+
 static inline long pipe_open_new(uint64_t flags) {
     return descriptor_open(
         static_cast<uint32_t>(descriptor_defs::Type::Pipe),

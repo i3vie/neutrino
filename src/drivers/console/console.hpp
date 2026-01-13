@@ -34,6 +34,7 @@ public:
     void set_color(uint32_t fg, uint32_t bg);
 
     bool enable_back_buffer();
+    void present();
 
 private:
     uint32_t framebuffer_handle;

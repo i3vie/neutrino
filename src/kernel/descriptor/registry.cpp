@@ -7,6 +7,7 @@ namespace descriptor {
 bool register_console_descriptor();
 bool register_serial_descriptor();
 bool register_keyboard_descriptor();
+bool register_mouse_descriptor();
 bool register_pipe_descriptor();
 bool register_framebuffer_descriptor();
 bool register_block_device_descriptor();
@@ -26,6 +27,10 @@ void register_builtin_types() {
     if (!register_keyboard_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register keyboard descriptor type");
+    }
+    if (!register_mouse_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register mouse descriptor type");
     }
     if (!register_pipe_descriptor()) {
         log_message(LogLevel::Warn,

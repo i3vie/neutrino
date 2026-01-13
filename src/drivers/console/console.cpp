@@ -202,6 +202,9 @@ void Console::flush_region(size_t x, size_t y, size_t width, size_t height) {
     if (back_buffer == nullptr || primary_fb.base == nullptr) {
         return;
     }
+    if (!descriptor::framebuffer_is_active(0)) {
+        return;
+    }
     if (width == 0 || height == 0) {
         return;
     }
@@ -249,6 +252,9 @@ void Console::flush_all() {
     if (back_buffer == nullptr || primary_fb.base == nullptr) {
         return;
     }
+    if (!descriptor::framebuffer_is_active(0)) {
+        return;
+    }
 
     if (frame_bytes == 0 || back_buffer_capacity == 0) {
         return;
@@ -263,6 +269,10 @@ void Console::flush_all() {
     }
 
     memcpy_fast(primary_fb.base, back_buffer, bytes);
+}
+
+void Console::present() {
+    flush_all();
 }
 
 bool Console::refresh_framebuffer_info() {

@@ -100,4 +100,8 @@ void restore_console_owner(process::Process& proc) {
     console_descriptor::g_console_refcount = 1;
 }
 
+bool console_is_owner(const process::Process& proc) {
+    return console_descriptor::g_console_owner == &proc;
+}
+
 }  // namespace descriptor
