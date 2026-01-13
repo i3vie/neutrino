@@ -37,6 +37,9 @@ struct SharedSegment {
     bool in_use;
     char name[kMaxNameLength];
     vm::Region region;
+    size_t page_count;
+    uint64_t pages[kMaxSegmentPages];
+    SegmentMapping mappings[process::kMaxProcesses];
     uint32_t refcount;
     PhysPageChunk* pages;
     uint32_t owner_pid;
@@ -66,6 +69,11 @@ void reset_segment(SharedSegment& segment) {
     segment.in_use = false;
     segment.name[0] = '\0';
     segment.region = vm::Region{0, 0};
+    segment.page_count = 0;
+    for (auto& mapping : segment.mappings) {
+        mapping.proc = nullptr;
+        mapping.refcount = 0;
+    }
     segment.refcount = 0;
     segment.pages = nullptr;
     segment.owner_pid = 0;
@@ -299,6 +307,72 @@ SharedSegment* find_segment_locked(const char* name) {
     return nullptr;
 }
 
+SegmentMapping* find_mapping(SharedSegment& segment, process::Process& proc) {
+    for (auto& mapping : segment.mappings) {
+        if (mapping.proc == &proc) {
+            return &mapping;
+        }
+    }
+    return nullptr;
+}
+
+SegmentMapping* allocate_mapping(SharedSegment& segment,
+                                 process::Process& proc) {
+    for (auto& mapping : segment.mappings) {
+        if (mapping.proc == nullptr) {
+            mapping.proc = &proc;
+            mapping.refcount = 0;
+            return &mapping;
+        }
+    }
+    return nullptr;
+}
+
+bool map_segment_into_process(SharedSegment& segment,
+                              process::Process& proc) {
+    if (segment.region.base == 0 || segment.page_count == 0) {
+        return false;
+    }
+    if (proc.cr3 == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < segment.page_count; ++i) {
+        uint64_t virt = segment.region.base + (i * kPageSize);
+        uint64_t phys = segment.pages[i];
+        if (!paging_map_page_cr3(proc.cr3,
+                                 virt,
+                                 phys,
+                                 PAGE_FLAG_WRITE | PAGE_FLAG_USER)) {
+            log_message(LogLevel::Error,
+                        "SHM map failed pid=%u virt=%llx phys=%llx",
+                        static_cast<unsigned int>(proc.pid),
+                        static_cast<unsigned long long>(virt),
+                        static_cast<unsigned long long>(phys));
+            return false;
+        }
+    }
+    return true;
+}
+
+void unmap_segment_from_process(SharedSegment& segment,
+                                process::Process& proc) {
+    if (segment.region.base == 0 || segment.page_count == 0 || proc.cr3 == 0) {
+        return;
+    }
+    for (size_t i = 0; i < segment.page_count; ++i) {
+        uint64_t virt = segment.region.base + (i * kPageSize);
+        uint64_t phys = 0;
+        paging_unmap_page_cr3(proc.cr3, virt, phys);
+    }
+}
+
+void release_segment_pages(SharedSegment& segment) {
+    for (size_t i = 0; i < segment.page_count; ++i) {
+        memory::free_user_page(segment.pages[i]);
+    }
+    segment.page_count = 0;
+}
+
 SharedSegment* allocate_segment_locked(const char* name,
                                        size_t requested_length,
                                        process::Process& owner) {
@@ -478,10 +552,19 @@ int shared_memory_get_property(DescriptorEntry& entry,
                                sizeof(descriptor_defs::SharedMemoryInfo))) {
             return -1;
         }
-        auto* info =
-            reinterpret_cast<descriptor_defs::SharedMemoryInfo*>(out);
-        info->base = segment->region.base;
-        info->length = segment->region.length;
+        process::Process* proc = process::current();
+        if (proc == nullptr || proc->cr3 == 0) {
+            return -1;
+        }
+        descriptor_defs::SharedMemoryInfo info{};
+        info.base = segment->region.base;
+        info.length = segment->region.length;
+        if (!vm::copy_to_user(proc->cr3,
+                              reinterpret_cast<uint64_t>(out),
+                              &info,
+                              sizeof(info))) {
+            return -1;
+        }
         return 0;
     }
     return -1;
@@ -497,6 +580,16 @@ void shared_memory_close(DescriptorEntry& entry) {
         return;
     }
     SegmentGuard guard;
+    auto* mapping = static_cast<SegmentMapping*>(entry.subsystem_data);
+    if (mapping != nullptr && mapping->proc != nullptr) {
+        if (mapping->refcount > 0) {
+            --mapping->refcount;
+        }
+        if (mapping->refcount == 0) {
+            unmap_segment_from_process(*segment, *mapping->proc);
+            mapping->proc = nullptr;
+        }
+    }
     if (segment->refcount > 0) {
         --segment->refcount;
     }
@@ -568,6 +661,8 @@ bool open_shared_memory(process::Process& proc,
     }
     size_t requested = static_cast<size_t>(length);
     SharedSegment* segment = nullptr;
+    SegmentMapping* mapping = nullptr;
+    bool created = false;
     {
         SegmentGuard guard;
         segment = find_segment_locked(name_buffer);
@@ -576,9 +671,29 @@ bool open_shared_memory(process::Process& proc,
             if (segment == nullptr) {
                 return false;
             }
+            created = true;
         } else if (requested != 0 && segment->region.length < requested) {
             return false;
         }
+        mapping = find_mapping(*segment, proc);
+        if (mapping == nullptr) {
+            mapping = allocate_mapping(*segment, proc);
+            if (mapping == nullptr) {
+                return false;
+            }
+        }
+        if (mapping->refcount == 0) {
+            if (!map_segment_into_process(*segment, proc)) {
+                mapping->proc = nullptr;
+                mapping->refcount = 0;
+                if (created) {
+                    release_segment_pages(*segment);
+                    reset_segment(*segment);
+                }
+                return false;
+            }
+        }
+        ++mapping->refcount;
         ++segment->refcount;
     }
 
@@ -614,7 +729,7 @@ bool open_shared_memory(process::Process& proc,
     alloc.extended_flags = 0;
     alloc.has_extended_flags = false;
     alloc.object = segment;
-    alloc.subsystem_data = nullptr;
+    alloc.subsystem_data = mapping;
     alloc.name = segment->name;
     alloc.ops = &kSharedMemoryOps;
     alloc.close = shared_memory_close;
