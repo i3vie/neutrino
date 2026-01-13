@@ -32,6 +32,10 @@ enum class SystemCall : uint64_t {
     DirectoryOpen         = 22,
     DirectoryRead         = 23,
     DirectoryClose        = 24,
+    MapAnonymous          = 25,
+    MapAt                 = 26,
+    Unmap                 = 27,
+    ChangeSlot            = 28,
 };
 
 Result handle_syscall(SyscallFrame& frame);

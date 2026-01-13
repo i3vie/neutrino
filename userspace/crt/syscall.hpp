@@ -31,10 +31,18 @@ enum class SystemCall : long {
     DirectoryOpen        = 22,
     DirectoryRead        = 23,
     DirectoryClose       = 24,
+    MapAnonymous         = 25,
+    MapAt                = 26,
+    Unmap                = 27,
+    ChangeSlot           = 28,
 };
 
 enum : uint32_t {
     DIR_ENTRY_FLAG_DIRECTORY = 1u << 0,
+};
+
+enum : uint64_t {
+    MAP_WRITE = 1ull << 0,
 };
 
 constexpr uint32_t kInvalidDescriptor = 0xFFFFFFFFu;
@@ -120,6 +128,38 @@ static inline long abi_minor() {
 
 static inline long yield() {
     return raw_syscall0(SystemCall::Yield);
+}
+
+static inline void* map_anonymous(size_t length, uint64_t flags) {
+    long ret = raw_syscall2(SystemCall::MapAnonymous,
+                            static_cast<long>(length),
+                            static_cast<long>(flags));
+    if (ret < 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+}
+
+static inline void* map_at(void* addr_hint, size_t length, uint64_t flags) {
+    long ret = raw_syscall3(SystemCall::MapAt,
+                            static_cast<long>(reinterpret_cast<uintptr_t>(addr_hint)),
+                            static_cast<long>(length),
+                            static_cast<long>(flags));
+    if (ret < 0) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+}
+
+static inline long unmap(void* addr, size_t length) {
+    return raw_syscall2(SystemCall::Unmap,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(addr)),
+                        static_cast<long>(length));
+}
+
+static inline long change_slot(uint32_t slot) {
+    return raw_syscall1(SystemCall::ChangeSlot,
+                        static_cast<long>(slot));
 }
 
 static inline long child(const char* path,

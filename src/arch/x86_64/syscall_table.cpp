@@ -689,6 +689,60 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
+        case SystemCall::MapAnonymous: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint64_t addr = vm::map_anonymous(proc->cr3,
+                                              static_cast<size_t>(frame.rdi),
+                                              frame.rsi);
+            frame.rax = (addr == 0) ? static_cast<uint64_t>(-1) : addr;
+            return Result::Continue;
+        }
+        case SystemCall::MapAt: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint64_t addr = vm::map_at(proc->cr3,
+                                       frame.rdi,
+                                       static_cast<size_t>(frame.rsi),
+                                       frame.rdx);
+            frame.rax = (addr == 0) ? static_cast<uint64_t>(-1) : addr;
+            return Result::Continue;
+        }
+        case SystemCall::Unmap: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool ok = vm::unmap_region(proc->cr3,
+                                       frame.rdi,
+                                       static_cast<size_t>(frame.rsi));
+            frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::ChangeSlot: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (descriptor::framebuffer_active_slot() != 0) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint32_t slot = static_cast<uint32_t>(frame.rdi);
+            descriptor::framebuffer_select(slot);
+            frame.rax = descriptor::framebuffer_is_active(slot)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
         default: {
             log_message(LogLevel::Warn, "Unhandled syscall %llx", frame.rax);
             frame.rax = static_cast<uint64_t>(-1);
