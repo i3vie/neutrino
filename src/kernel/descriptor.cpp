@@ -1,6 +1,7 @@
 #include "descriptor.hpp"
 
 #include "process.hpp"
+#include "arch/x86_64/memory/paging.hpp"
 #include "string_util.hpp"
 #include "../lib/mem.hpp"
 
@@ -15,7 +16,12 @@ process::Process& kernel_process() {
     if (!g_kernel_process_initialized) {
         memset(&g_kernel_process, 0, sizeof(g_kernel_process));
         init_table(g_kernel_process.descriptors);
+        g_kernel_process.cr3 = paging_kernel_cr3();
+        g_kernel_process.fs_base = 0;
         g_kernel_process_initialized = true;
+    }
+    if (g_kernel_process.cr3 == 0) {
+        g_kernel_process.cr3 = paging_kernel_cr3();
     }
     return g_kernel_process;
 }

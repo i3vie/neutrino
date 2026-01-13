@@ -6,8 +6,10 @@
 #include "lib/mem.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/tss.hpp"
+#include "arch/x86_64/registers.hpp"
 #include "userspace.hpp"
 #include "arch/x86_64/percpu.hpp"
+#include "arch/x86_64/smp.hpp"
 
 namespace {
 
@@ -86,6 +88,10 @@ public:
 
 void enqueue_locked(process::Process* proc) {
     size_t total = g_cpu_total;
+    size_t online = smp::online_cpus();
+    if (online != 0 && online < total) {
+        total = online;
+    }
     if (total == 0) {
         total = 1;
     }
@@ -105,7 +111,12 @@ process::Process* pop_locked() {
     if (proc != nullptr) {
         return proc;
     }
-    for (size_t q = 0; q < g_cpu_total; ++q) {
+    size_t total = g_cpu_total;
+    size_t online = smp::online_cpus();
+    if (online != 0 && online < total) {
+        total = online;
+    }
+    for (size_t q = 0; q < total; ++q) {
         if (q == idx) continue;
         proc = queue_pop(queue_for_cpu(q));
         if (proc != nullptr) {
@@ -275,6 +286,7 @@ void reschedule(syscall::SyscallFrame& frame) {
         current_proc->has_context = true;
         current_proc->user_ip = frame.user_rip;
         current_proc->user_sp = frame.user_rsp;
+        current_proc->fs_base = cpu::read_fs_base();
     } else {
         current_proc->has_context = false;
     }

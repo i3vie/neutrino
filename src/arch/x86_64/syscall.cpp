@@ -4,8 +4,10 @@
 
 #include "../../kernel/scheduler.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/process.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "arch/x86_64/gdt.hpp"
+#include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/syscall_table.hpp"
 
 extern "C" void syscall_entry();
@@ -76,6 +78,18 @@ extern "C" void syscall_dispatch(SyscallFrame* frame) {
             break;
         }
     }
+}
+
+extern "C" uint64_t syscall_kernel_stack_top() {
+    process::Process* proc = process::current();
+    if (proc != nullptr && proc->kernel_stack_top != 0) {
+        return proc->kernel_stack_top;
+    }
+    percpu::Cpu* cpu = percpu::current_cpu();
+    if (cpu != nullptr) {
+        return cpu->tss.rsp0;
+    }
+    return 0;
 }
 
 void init() {

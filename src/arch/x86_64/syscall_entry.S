@@ -23,6 +23,7 @@
 
 section .text
 global syscall_entry
+global userspace_enter_frame
 extern syscall_dispatch
 extern syscall_kernel_stack
 
@@ -62,14 +63,59 @@ syscall_entry:
     rep movsq
 
     mov r15, rsp
+    call syscall_kernel_stack_top
+    test rax, rax
+    jz .dispatch
+    sub rax, FRAME_SIZE
+    mov rbx, rax
+    mov rdi, rax
+    mov rsi, r15
+    mov rcx, FRAME_SIZE / 8
+    rep movsq
+    mov rsp, rbx
+    mov r15, rbx
+.dispatch:
     mov rdi, rsp
     call syscall_dispatch
+    mov r15, rsp
 
     mov rax, [r15 + FRAME_USER_RSP]
     mov rdx, [r15 + FRAME_USER_RFLAGS]
     mov rcx, [r15 + FRAME_USER_RIP]
 
-    lea rsp, [r15 + FRAME_SIZE]
+    lea rsp, [r15]
+    sub rsp, 40
+    mov qword [rsp + 32], USER_DS
+    mov qword [rsp + 24], rax
+    mov qword [rsp + 16], rdx
+    mov qword [rsp + 8], USER_CS
+    mov qword [rsp + 0], rcx
+
+    mov rax, [r15 + FRAME_RAX]
+    mov rbx, [r15 + FRAME_RBX]
+    mov rcx, [r15 + FRAME_RCX]
+    mov rdx, [r15 + FRAME_RDX]
+    mov rsi, [r15 + FRAME_RSI]
+    mov rdi, [r15 + FRAME_RDI]
+    mov rbp, [r15 + FRAME_RBP]
+    mov r8,  [r15 + FRAME_R8]
+    mov r9,  [r15 + FRAME_R9]
+    mov r10, [r15 + FRAME_R10]
+    mov r11, [r15 + FRAME_R11]
+    mov r12, [r15 + FRAME_R12]
+    mov r13, [r15 + FRAME_R13]
+    mov r14, [r15 + FRAME_R14]
+    mov r15, [r15 + FRAME_R15]
+
+    iretq
+
+userspace_enter_frame:
+    mov r15, rdi
+
+    mov rax, [r15 + FRAME_USER_RSP]
+    mov rdx, [r15 + FRAME_USER_RFLAGS]
+    mov rcx, [r15 + FRAME_USER_RIP]
+
     sub rsp, 40
     mov qword [rsp + 32], USER_DS
     mov qword [rsp + 24], rax

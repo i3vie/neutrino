@@ -6,6 +6,9 @@
 
 namespace {
 
+extern "C" [[noreturn]] void userspace_enter_frame(
+    const syscall::SyscallFrame* frame);
+
 [[noreturn]] void transfer_to_userspace(uint64_t entry, uint64_t user_stack) {
     constexpr uint64_t kUserFlags = 0x202;
     asm volatile(
@@ -32,10 +35,12 @@ namespace userspace {
 
 [[noreturn]] void enter_process(process::Process& proc) {
     set_rsp0(proc.kernel_stack_top);
+    if (proc.has_context) {
+        userspace_enter_frame(&proc.context);
+    }
     uint64_t entry = proc.user_ip;
     uint64_t user_stack = proc.user_sp & ~0xFull;
     transfer_to_userspace(entry, user_stack);
 }
 
 }  // namespace userspace
-

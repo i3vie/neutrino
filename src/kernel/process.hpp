@@ -38,6 +38,7 @@ struct Process {
     uint32_t pid;
     State state;
     uint64_t cr3;
+    uint64_t fs_base;
     uint64_t user_ip;
     uint64_t user_sp;
     uint64_t kernel_stack_base;

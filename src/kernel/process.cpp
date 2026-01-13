@@ -111,6 +111,12 @@ void set_current(Process* proc) {
     asm volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
     if (proc != nullptr) {
         proc->state = State::Running;
+        uint64_t target_cr3 =
+            (proc->cr3 != 0) ? proc->cr3 : paging_kernel_cr3();
+        if (target_cr3 != 0) {
+            paging_switch_cr3(target_cr3);
+        }
+        cpu::write_fs_base(proc->fs_base);
     }
 }
 
