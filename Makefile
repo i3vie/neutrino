@@ -22,7 +22,7 @@ QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		-drive file=hdd.img,format=raw,if=ide \
-		-enable-kvm
+		-enable-kvm -display sdl
 QEMU_DEBUG_ARGS := -d int \
 		-monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot
 QEMU_DEBUG_WAIT_ARGS := -s -S
