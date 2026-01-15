@@ -398,6 +398,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->waiting_on = nullptr;
             child->exit_code = 0;
             child->has_exited = false;
+            child->vty_id = proc->vty_id;
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
@@ -499,6 +500,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->waiting_on = nullptr;
             child->exit_code = 0;
             child->has_exited = false;
+            child->vty_id = proc->vty_id;
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {

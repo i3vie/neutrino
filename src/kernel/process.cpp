@@ -35,6 +35,7 @@ void init() {
         g_process_table[i].has_exited = false;
         g_process_table[i].console_transferred = false;
         g_process_table[i].preferred_cpu = UINT32_MAX;
+        g_process_table[i].vty_id = 0;
         g_process_table[i].cwd[0] = '/';
         g_process_table[i].cwd[1] = '\0';
         descriptor::init_table(g_process_table[i].descriptors);
@@ -76,6 +77,7 @@ Process* allocate() {
         proc.console_transferred = false;
         proc.cwd[0] = '/';
         proc.cwd[1] = '\0';
+        proc.vty_id = 0;
         descriptor::init_table(proc.descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             proc.file_handles[fh].in_use = false;

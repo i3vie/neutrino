@@ -40,6 +40,8 @@ constexpr uint32_t kTypePipe =
     static_cast<uint32_t>(descriptor_defs::Type::Pipe);
 constexpr uint32_t kTypeSharedMemory =
     static_cast<uint32_t>(descriptor_defs::Type::SharedMemory);
+constexpr uint32_t kTypeVty =
+    static_cast<uint32_t>(descriptor_defs::Type::Vty);
 
 constexpr int64_t kWouldBlock = -2;
 
@@ -190,6 +192,7 @@ bool framebuffer_is_active(uint32_t index);
 int32_t framebuffer_slot_for_process(const process::Process& proc);
 bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel);
 void reset_block_device_registry();
+bool vty_write(uint32_t id, const char* data, size_t length);
 
 uint32_t open_kernel(uint32_t type,
                      uint64_t arg0,

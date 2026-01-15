@@ -1,6 +1,7 @@
 #include "../descriptor.hpp"
 
 #include "../../drivers/console/console.hpp"
+#include "../process.hpp"
 
 namespace descriptor {
 
@@ -14,13 +15,22 @@ int64_t console_read(process::Process&,
     return -1;
 }
 
-int64_t console_write(process::Process&,
+int64_t console_write(process::Process& proc,
                       DescriptorEntry& entry,
                       uint64_t user_address,
                       uint64_t length,
                       uint64_t offset) {
     if (offset != 0) {
         return -1;
+    }
+    if (proc.vty_id != 0) {
+        const char* data = reinterpret_cast<const char*>(user_address);
+        if (data == nullptr || length == 0) {
+            return 0;
+        }
+        if (vty_write(proc.vty_id, data, static_cast<size_t>(length))) {
+            return static_cast<int64_t>(length);
+        }
     }
     auto* console = static_cast<Console*>(entry.object);
     if (console == nullptr) {
@@ -61,6 +71,17 @@ bool open_console(process::Process& proc,
                   uint64_t,
                   uint64_t,
                   Allocation& alloc) {
+    if (proc.vty_id != 0) {
+        alloc.type = kTypeConsole;
+        alloc.flags = static_cast<uint64_t>(Flag::Writable);
+        alloc.extended_flags = 0;
+        alloc.has_extended_flags = false;
+        alloc.object = kconsole;
+        alloc.close = nullptr;
+        alloc.name = "console";
+        alloc.ops = &kConsoleOps;
+        return true;
+    }
     if (kconsole == nullptr) {
         return false;
     }

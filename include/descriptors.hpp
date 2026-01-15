@@ -14,6 +14,18 @@ enum class Type : uint16_t {
     BlockDevice = 0x020,
     Pipe        = 0x030,
     SharedMemory = 0x040,
+    Vty         = 0x050,
+};
+
+enum class Flag : uint64_t {
+    Readable    = 1ull << 0,
+    Writable    = 1ull << 1,
+    Seekable    = 1ull << 2,
+    Mappable    = 1ull << 3,
+    Async       = 1ull << 8,
+    EventSource = 1ull << 9,
+    Device      = 1ull << 10,
+    Block       = 1ull << 11,
 };
 
 enum class Property : uint32_t {
@@ -23,6 +35,9 @@ enum class Property : uint32_t {
     BlockGeometry     = 0x00020001,
     SharedMemoryInfo  = 0x00030001,
     PipeInfo          = 0x00040001,
+    VtyInfo           = 0x00050001,
+    VtyCells          = 0x00050002,
+    VtyInjectInput    = 0x00050003,
 };
 
 
@@ -70,6 +85,27 @@ struct MouseEvent {
     int8_t dy;
     uint8_t buttons;
     uint8_t reserved;
+};
+
+enum class VtyOpen : uint64_t {
+    Attach = 1ull << 0,
+};
+
+struct VtyInfo {
+    uint32_t id;
+    uint32_t cols;
+    uint32_t rows;
+    uint32_t cursor_x;
+    uint32_t cursor_y;
+    uint32_t flags;
+    uint32_t cell_bytes;
+};
+
+struct VtyCell {
+    uint8_t ch;
+    uint8_t fg;
+    uint8_t bg;
+    uint8_t flags;
 };
 
 }  // namespace descriptor_defs

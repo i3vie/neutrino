@@ -12,6 +12,7 @@ bool register_pipe_descriptor();
 bool register_framebuffer_descriptor();
 bool register_block_device_descriptor();
 bool register_shared_memory_descriptor();
+bool register_vty_descriptor();
 
 void register_builtin_types() {
     reset_block_device_registry();
@@ -47,6 +48,10 @@ void register_builtin_types() {
     if (!register_shared_memory_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register shared memory descriptor type");
+    }
+    if (!register_vty_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register vty descriptor type");
     }
 }
 

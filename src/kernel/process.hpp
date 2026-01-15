@@ -53,6 +53,7 @@ struct Process {
     bool console_transferred;
     bool has_context;
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
+    uint32_t vty_id;
     char cwd[128];
     descriptor::Table descriptors;
     FileHandle file_handles[kMaxFileHandles];
