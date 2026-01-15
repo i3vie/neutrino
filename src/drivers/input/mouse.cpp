@@ -144,35 +144,37 @@ void init() {
 }
 
 void handle_irq() {
-    uint8_t status = inb(kStatusPort);
-    if ((status & kStatusOutputFull) == 0) {
-        return;
-    }
-    if ((status & kStatusAuxData) == 0) {
-        return;
-    }
+    while (true) {
+        uint8_t status = inb(kStatusPort);
+        if ((status & kStatusOutputFull) == 0) {
+            return;
+        }
+        if ((status & kStatusAuxData) == 0) {
+            return;
+        }
 
-    uint8_t data = inb(kDataPort);
-    if (g_packet_index == 0 && (data & 0x08) == 0) {
-        return;
-    }
-    g_packet[g_packet_index++] = data;
-    if (g_packet_index < 3) {
-        return;
-    }
-    g_packet_index = 0;
+        uint8_t data = inb(kDataPort);
+        if (g_packet_index == 0 && (data & 0x08) == 0) {
+            continue;
+        }
+        g_packet[g_packet_index++] = data;
+        if (g_packet_index < 3) {
+            continue;
+        }
+        g_packet_index = 0;
 
-    Event ev{};
-    ev.buttons = static_cast<uint8_t>(g_packet[0] & 0x07);
-    ev.dx = static_cast<int8_t>(g_packet[1]);
-    ev.dy = static_cast<int8_t>(g_packet[2]);
-    ev.reserved = 0;
+        Event ev{};
+        ev.buttons = static_cast<uint8_t>(g_packet[0] & 0x07);
+        ev.dx = static_cast<int8_t>(g_packet[1]);
+        ev.dy = static_cast<int8_t>(g_packet[2]);
+        ev.reserved = 0;
 
-    uint32_t slot = descriptor::framebuffer_active_slot();
-    if (slot >= kInputSlots) {
-        slot = 0;
+        uint32_t slot = descriptor::framebuffer_active_slot();
+        if (slot >= kInputSlots) {
+            slot = 0;
+        }
+        enqueue(slot, ev);
     }
-    enqueue(slot, ev);
 }
 
 size_t read(uint32_t slot, Event* buffer, size_t max_events) {

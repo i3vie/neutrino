@@ -170,6 +170,13 @@ void handle_irq() {
             return;
         }
     }
+    if (g_left_ctrl_down && g_shift) {
+        if (scancode >= 0x02 && scancode <= 0x07) {
+            uint32_t index = static_cast<uint32_t>(scancode - 0x02);
+            descriptor::framebuffer_select(index);
+            return;
+        }
+    }
 
     if (scancode >= sizeof(kScancodeMap)) {
         return;

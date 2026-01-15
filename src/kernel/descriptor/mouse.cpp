@@ -21,11 +21,7 @@ int64_t mouse_read(process::Process&,
     if (buffer == nullptr) {
         return -1;
     }
-    uintptr_t slot_raw = reinterpret_cast<uintptr_t>(entry.subsystem_data);
-    if (slot_raw == 0) {
-        return -1;
-    }
-    uint32_t slot = static_cast<uint32_t>(slot_raw - 1);
+    uint32_t slot = framebuffer_active_slot();
     size_t max_events = static_cast<size_t>(length / sizeof(mouse::Event));
     size_t count = mouse::read(slot, buffer, max_events);
     return static_cast<int64_t>(count * sizeof(mouse::Event));

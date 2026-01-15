@@ -58,7 +58,7 @@ bool open_keyboard(process::Process& proc,
         if (proc_slot >= 0) {
             slot = static_cast<uint32_t>(proc_slot);
         } else if (console_is_owner(proc)) {
-            slot = framebuffer_active_slot();
+            slot = 0;
         } else {
             return false;
         }
