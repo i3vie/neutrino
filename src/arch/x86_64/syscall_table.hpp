@@ -36,6 +36,10 @@ enum class SystemCall : uint64_t {
     MapAt                 = 26,
     Unmap                 = 27,
     ChangeSlot            = 28,
+    DirectoryOpenRoot     = 29,
+    DirectoryOpenAt       = 30,
+    FileOpenAt            = 31,
+    FileCreateAt          = 32,
 };
 
 Result handle_syscall(SyscallFrame& frame);

@@ -12,7 +12,7 @@ OBJ_DIR  := build
 PROG_DIR := programs
 BIN_DIR  := binary
 
-PROGRAMS := init shell photon wavelength ion ls cat
+PROGRAMS := init shell photon wavelength ion orbital ls cat
 PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
@@ -57,6 +57,9 @@ install: all
 	done; \
 	if [[ -f "config/photon/autorun" ]]; then \
 		$(SUDO) install -m 0644 "config/photon/autorun" "$(MOUNT_DIR)/config/photon/autorun"; \
+	fi; \
+	if [[ -f "config/photon/scale" ]]; then \
+		$(SUDO) install -m 0644 "config/photon/scale" "$(MOUNT_DIR)/config/photon/scale"; \
 	fi; \
 	if [[ -f "$(PROG_DIR)/init.elf" ]]; then \
 		$(SUDO) install -m 0644 "$(PROG_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \

@@ -645,6 +645,52 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
+        case SystemCall::DirectoryOpenRoot: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int32_t handle = file_io::open_directory_root(*proc);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
+        case SystemCall::DirectoryOpenAt: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint32_t parent = static_cast<uint32_t>(frame.rdi);
+            const char* name = reinterpret_cast<const char*>(frame.rsi);
+            int32_t handle = file_io::open_directory_at(*proc, parent, name);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
+        case SystemCall::FileOpenAt: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint32_t parent = static_cast<uint32_t>(frame.rdi);
+            const char* name = reinterpret_cast<const char*>(frame.rsi);
+            int32_t handle = file_io::open_file_at(*proc, parent, name);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
+        case SystemCall::FileCreateAt: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint32_t parent = static_cast<uint32_t>(frame.rdi);
+            const char* name = reinterpret_cast<const char*>(frame.rsi);
+            int32_t handle = file_io::create_file_at(*proc, parent, name);
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
+            return Result::Continue;
+        }
         case SystemCall::MapAnonymous: {
             process::Process* proc = process::current();
             if (proc == nullptr) {

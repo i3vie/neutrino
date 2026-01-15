@@ -35,6 +35,10 @@ enum class SystemCall : long {
     MapAt                = 26,
     Unmap                = 27,
     ChangeSlot           = 28,
+    DirectoryOpenRoot    = 29,
+    DirectoryOpenAt      = 30,
+    FileOpenAt           = 31,
+    FileCreateAt         = 32,
 };
 
 enum : uint32_t {
@@ -405,9 +409,31 @@ static inline long directory_open(const char* path) {
                         static_cast<long>(reinterpret_cast<uintptr_t>(path)));
 }
 
+static inline long directory_open_root() {
+    return raw_syscall0(SystemCall::DirectoryOpenRoot);
+}
+
+static inline long directory_open_at(uint32_t dir_handle, const char* name) {
+    return raw_syscall2(SystemCall::DirectoryOpenAt,
+                        static_cast<long>(dir_handle),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(name)));
+}
+
 static inline long file_create(const char* path) {
     return raw_syscall1(SystemCall::FileCreate,
                         static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long file_open_at(uint32_t dir_handle, const char* name) {
+    return raw_syscall2(SystemCall::FileOpenAt,
+                        static_cast<long>(dir_handle),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(name)));
+}
+
+static inline long file_create_at(uint32_t dir_handle, const char* name) {
+    return raw_syscall2(SystemCall::FileCreateAt,
+                        static_cast<long>(dir_handle),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(name)));
 }
 
 static inline long directory_read(uint32_t handle, DirEntry* out_entry) {

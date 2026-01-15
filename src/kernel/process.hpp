@@ -6,6 +6,7 @@
 #include "arch/x86_64/syscall.hpp"
 #include "descriptor.hpp"
 #include "fs/vfs.hpp"
+#include "path_util.hpp"
 #include "vm.hpp"
 
 namespace process {
@@ -32,6 +33,7 @@ struct FileHandle {
 struct DirectoryHandle {
     bool in_use;
     vfs::DirectoryHandle handle;
+    char path[path_util::kMaxPathLength];
 };
 
 struct Process {

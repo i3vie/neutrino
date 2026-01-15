@@ -45,6 +45,7 @@ int32_t allocate_directory_handle(process::Process& proc) {
         if (!proc.directory_handles[i].in_use) {
             proc.directory_handles[i].in_use = true;
             proc.directory_handles[i].handle = {};
+            proc.directory_handles[i].path[0] = '\0';
             return static_cast<int32_t>(i);
         }
     }
@@ -66,6 +67,21 @@ bool copy_path(process::Process& proc,
     char temp[path_util::kMaxPathLength];
     string_util::copy(temp, sizeof(temp), user_path);
     return path_util::build_absolute_path(proc.cwd, temp, out);
+}
+
+bool build_child_path(const char* base,
+                      const char* name,
+                      char (&out)[path_util::kMaxPathLength]) {
+    if (base == nullptr || name == nullptr) {
+        return false;
+    }
+    if (name[0] == '\0') {
+        return false;
+    }
+    if (string_util::contains(name, '/')) {
+        return false;
+    }
+    return path_util::build_absolute_path(base, name, out);
 }
 
 }  // namespace
@@ -215,6 +231,132 @@ int32_t open_directory(process::Process& proc, const char* path) {
     process::DirectoryHandle& handle =
         proc.directory_handles[static_cast<size_t>(slot)];
     handle.handle = vfs_handle;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    return slot;
+}
+
+int32_t open_directory_root(process::Process& proc) {
+    char local_path[path_util::kMaxPathLength];
+    local_path[0] = '/';
+    local_path[1] = '\0';
+
+    vfs::DirectoryHandle vfs_handle{};
+    if (!vfs::open_directory(local_path, vfs_handle)) {
+        return -1;
+    }
+
+    int32_t slot = allocate_directory_handle(proc);
+    if (slot < 0) {
+        log_message(LogLevel::Warn,
+                    "FileIO: no free directory handles for process %u",
+                    static_cast<unsigned int>(proc.pid));
+        vfs::close_directory(vfs_handle);
+        return -1;
+    }
+
+    process::DirectoryHandle& handle =
+        proc.directory_handles[static_cast<size_t>(slot)];
+    handle.handle = vfs_handle;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    return slot;
+}
+
+int32_t open_directory_at(process::Process& proc,
+                          uint32_t dir_handle,
+                          const char* name) {
+    process::DirectoryHandle* parent = get_directory_handle(proc, dir_handle);
+    if (parent == nullptr) {
+        return -1;
+    }
+    char local_path[path_util::kMaxPathLength];
+    if (!build_child_path(parent->path, name, local_path)) {
+        return -1;
+    }
+
+    vfs::DirectoryHandle vfs_handle{};
+    if (!vfs::open_directory(local_path, vfs_handle)) {
+        return -1;
+    }
+
+    int32_t slot = allocate_directory_handle(proc);
+    if (slot < 0) {
+        log_message(LogLevel::Warn,
+                    "FileIO: no free directory handles for process %u",
+                    static_cast<unsigned int>(proc.pid));
+        vfs::close_directory(vfs_handle);
+        return -1;
+    }
+
+    process::DirectoryHandle& handle =
+        proc.directory_handles[static_cast<size_t>(slot)];
+    handle.handle = vfs_handle;
+    string_util::copy(handle.path, sizeof(handle.path), local_path);
+    return slot;
+}
+
+int32_t open_file_at(process::Process& proc,
+                     uint32_t dir_handle,
+                     const char* name) {
+    process::DirectoryHandle* parent = get_directory_handle(proc, dir_handle);
+    if (parent == nullptr) {
+        return -1;
+    }
+    char local_path[path_util::kMaxPathLength];
+    if (!build_child_path(parent->path, name, local_path)) {
+        return -1;
+    }
+
+    int32_t slot = allocate_file_handle(proc);
+    if (slot < 0) {
+        log_message(LogLevel::Warn,
+                    "FileIO: no free file handles for process %u",
+                    static_cast<unsigned int>(proc.pid));
+        return -1;
+    }
+
+    vfs::FileHandle vfs_handle{};
+    if (!vfs::open_file(local_path, vfs_handle)) {
+        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
+        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        return -1;
+    }
+
+    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    handle.handle = vfs_handle;
+    handle.position = 0;
+    return slot;
+}
+
+int32_t create_file_at(process::Process& proc,
+                       uint32_t dir_handle,
+                       const char* name) {
+    process::DirectoryHandle* parent = get_directory_handle(proc, dir_handle);
+    if (parent == nullptr) {
+        return -1;
+    }
+    char local_path[path_util::kMaxPathLength];
+    if (!build_child_path(parent->path, name, local_path)) {
+        return -1;
+    }
+
+    int32_t slot = allocate_file_handle(proc);
+    if (slot < 0) {
+        log_message(LogLevel::Warn,
+                    "FileIO: no free file handles for process %u",
+                    static_cast<unsigned int>(proc.pid));
+        return -1;
+    }
+
+    vfs::FileHandle vfs_handle{};
+    if (!vfs::create_file(local_path, vfs_handle)) {
+        proc.file_handles[static_cast<size_t>(slot)].in_use = false;
+        proc.file_handles[static_cast<size_t>(slot)].handle = {};
+        return -1;
+    }
+
+    process::FileHandle& handle = proc.file_handles[static_cast<size_t>(slot)];
+    handle.handle = vfs_handle;
+    handle.position = 0;
     return slot;
 }
 
@@ -226,6 +368,7 @@ bool close_directory(process::Process& proc, uint32_t handle) {
     vfs::close_directory(entry->handle);
     entry->in_use = false;
     entry->handle = {};
+    entry->path[0] = '\0';
     return true;
 }
 

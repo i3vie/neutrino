@@ -20,11 +20,70 @@ enum class MessageType : uint32_t {
 
 enum class ClientMessage : uint8_t {
     Present = 1,
+    MenuUpdate = 2,
+    MenuInvoke = 3,
 };
 
 enum class ServerMessage : uint8_t {
+    MenuCommand = 0xFB,
+    MenuBar = 0xFC,
+    Key = 0xFD,
     Mouse = 0xFE,
     Close = 0xFF,
+};
+
+constexpr uint8_t kMenuLabelSize = 16;
+constexpr uint8_t kMenuItemLabelSize = 24;
+constexpr uint8_t kMenuMaxItems = 8;
+constexpr uint8_t kMenuMaxMenus = 4;
+
+struct MenuItem {
+    char label[kMenuItemLabelSize];
+    uint32_t id;
+};
+
+struct Menu {
+    char label[kMenuLabelSize];
+    uint8_t item_count;
+    uint8_t reserved[3];
+    MenuItem items[kMenuMaxItems];
+};
+
+struct MenuBar {
+    uint8_t menu_count;
+    uint8_t reserved[3];
+    Menu menus[kMenuMaxMenus];
+};
+
+struct __attribute__((packed)) ClientMenuUpdate {
+    uint8_t type;
+    MenuBar bar;
+};
+
+struct __attribute__((packed)) ClientMenuInvoke {
+    uint8_t type;
+    uint8_t menu_index;
+    uint8_t item_index;
+    uint8_t reserved;
+};
+
+struct __attribute__((packed)) ServerMenuCommand {
+    uint8_t type;
+    uint8_t reserved[3];
+    uint32_t id;
+};
+
+struct __attribute__((packed)) ServerMenuBarMessage {
+    uint8_t type;
+    char title[32];
+    MenuBar bar;
+};
+
+struct __attribute__((packed)) ServerKeyMessage {
+    uint8_t type;
+    uint8_t scancode;
+    uint8_t flags;
+    uint8_t mods;
 };
 
 struct __attribute__((packed)) ServerMouseMessage {

@@ -17,12 +17,13 @@ constexpr uint32_t kFontWidth = 8;
 constexpr uint32_t kFontHeight = 8;
 constexpr uint32_t kTitleTextPadding = 6;
 constexpr int32_t kMouseScale = 1;
-constexpr size_t kMaxWindows = 8;
+constexpr size_t kMaxWindows = 16;
 constexpr size_t kMaxWindowBytes = 4 * 1024 * 1024;
 constexpr const char kRegistryName[] = "wm.registry";
 constexpr const char kWindowNamePrefix[] = "wm.win.";
 constexpr const char kAutoexecRelativePath[] = "config/photon/autorun";
 constexpr const char kDefaultDesktopPath[] = "binary/wavelength.elf";
+constexpr const char kDefaultMenuTitle[] = "Wavelength";
 constexpr int kDesktopRetryFrames = 120;
 constexpr int kDesktopRetryMax = 12;
 
@@ -61,7 +62,14 @@ struct Window {
     uint32_t out_pipe_id;
     char shm_name[48];
     char title[32];
+    wm::MenuBar menu;
+    uint8_t client_buffer[1024];
+    size_t client_pending;
 };
+
+void copy_string(char* dest, size_t dest_size, const char* src);
+
+Window g_windows[kMaxWindows];
 
 void fill_rect_clipped(uint8_t* frame,
                        const descriptor_defs::FramebufferInfo& info,
@@ -916,46 +924,162 @@ void draw_cursor(uint8_t* frame,
     }
 }
 
-void send_key(Window* window, uint8_t key) {
+void send_key(Window* window, const descriptor_defs::KeyboardEvent& event) {
     if (window == nullptr || !window->in_use || window->in_pipe_handle == 0) {
         return;
     }
-    descriptor_write(window->in_pipe_handle, &key, 1);
+    wm::ServerKeyMessage msg{};
+    msg.type = static_cast<uint8_t>(wm::ServerMessage::Key);
+    msg.scancode = event.scancode;
+    msg.flags = event.flags;
+    msg.mods = event.mods;
+    descriptor_write(window->in_pipe_handle, &msg, sizeof(msg));
 }
 
-void send_mouse(Window* window, uint8_t buttons, uint16_t x, uint16_t y) {
+void clamp_menu_bar(wm::MenuBar& bar) {
+    if (bar.menu_count > wm::kMenuMaxMenus) {
+        bar.menu_count = wm::kMenuMaxMenus;
+    }
+    for (uint8_t i = 0; i < bar.menu_count; ++i) {
+        if (bar.menus[i].item_count > wm::kMenuMaxItems) {
+            bar.menus[i].item_count = wm::kMenuMaxItems;
+        }
+    }
+}
+
+void send_menu_bar_update(Window* background, const Window* focused) {
+    if (background == nullptr || !background->in_use ||
+        background->in_pipe_handle == 0) {
+        return;
+    }
+    wm::ServerMenuBarMessage msg{};
+    msg.type = static_cast<uint8_t>(wm::ServerMessage::MenuBar);
+    if (focused != nullptr && focused->title[0] != '\0') {
+        copy_string(msg.title, sizeof(msg.title), focused->title);
+    } else {
+        copy_string(msg.title, sizeof(msg.title), kDefaultMenuTitle);
+    }
+    if (focused != nullptr) {
+        msg.bar = focused->menu;
+    } else {
+        msg.bar = {};
+    }
+    wm::MenuBar bar = msg.bar;
+    clamp_menu_bar(bar);
+    msg.bar = bar;
+    descriptor_write(background->in_pipe_handle, &msg, sizeof(msg));
+}
+
+void send_menu_command(Window* target, uint32_t id) {
+    if (target == nullptr || !target->in_use || target->in_pipe_handle == 0) {
+        return;
+    }
+    wm::ServerMenuCommand msg{};
+    msg.type = static_cast<uint8_t>(wm::ServerMessage::MenuCommand);
+    msg.id = id;
+    descriptor_write(target->in_pipe_handle, &msg, sizeof(msg));
+}
+
+void send_mouse(Window* window, uint8_t buttons, int32_t x, int32_t y) {
     if (window == nullptr || !window->in_use || window->in_pipe_handle == 0) {
+        return;
+    }
+    uint32_t title_height = 0;
+    if (window->height > window->content_height) {
+        title_height = window->height - window->content_height;
+    }
+    int32_t local_x = x - window->x;
+    int32_t local_y = y - (window->y + static_cast<int32_t>(title_height));
+    if (local_x < 0 || local_y < 0) {
+        return;
+    }
+    if (local_x >= static_cast<int32_t>(window->width) ||
+        local_y >= static_cast<int32_t>(window->content_height)) {
         return;
     }
     wm::ServerMouseMessage msg{};
     msg.type = static_cast<uint8_t>(wm::ServerMessage::Mouse);
     msg.buttons = buttons;
-    msg.x = x;
-    msg.y = y;
+    msg.x = static_cast<uint16_t>(local_x);
+    msg.y = static_cast<uint16_t>(local_y);
     descriptor_write(window->in_pipe_handle, &msg, sizeof(msg));
 }
 
-bool drain_present(Window& window) {
+struct ClientDrain {
+    bool present;
+    bool menu_update;
+    bool menu_invoke;
+    wm::ClientMenuInvoke invoke;
+};
+
+ClientDrain drain_client_messages(Window& window) {
+    ClientDrain result{};
     if (!window.in_use || window.out_pipe_handle == 0) {
-        return false;
+        return result;
     }
-    uint8_t buffer[16];
-    bool changed = false;
-    while (true) {
+
+    while (window.client_pending < sizeof(window.client_buffer)) {
         long read = descriptor_read(window.out_pipe_handle,
-                                    buffer,
-                                    sizeof(buffer));
+                                    window.client_buffer + window.client_pending,
+                                    sizeof(window.client_buffer) - window.client_pending);
         if (read <= 0) {
             break;
         }
-        for (long i = 0; i < read; ++i) {
-            if (buffer[i] ==
-                static_cast<uint8_t>(wm::ClientMessage::Present)) {
-                changed = true;
-            }
-        }
+        window.client_pending += static_cast<size_t>(read);
     }
-    return changed;
+
+    size_t offset = 0;
+    while (offset < window.client_pending) {
+        uint8_t type = window.client_buffer[offset];
+        if (type == static_cast<uint8_t>(wm::ClientMessage::Present)) {
+            result.present = true;
+            offset += 1;
+            continue;
+        }
+        if (type == static_cast<uint8_t>(wm::ClientMessage::MenuUpdate)) {
+            if (window.client_pending - offset <
+                sizeof(wm::ClientMenuUpdate)) {
+                break;
+            }
+            wm::ClientMenuUpdate msg{};
+            lattice::copy_bytes(reinterpret_cast<uint8_t*>(&msg),
+                                window.client_buffer + offset,
+                                sizeof(msg));
+            wm::MenuBar bar = msg.bar;
+            clamp_menu_bar(bar);
+            window.menu = bar;
+            result.menu_update = true;
+            offset += sizeof(msg);
+            continue;
+        }
+        if (type == static_cast<uint8_t>(wm::ClientMessage::MenuInvoke)) {
+            if (window.client_pending - offset <
+                sizeof(wm::ClientMenuInvoke)) {
+                break;
+            }
+            wm::ClientMenuInvoke msg{};
+            lattice::copy_bytes(reinterpret_cast<uint8_t*>(&msg),
+                                window.client_buffer + offset,
+                                sizeof(msg));
+            result.menu_invoke = true;
+            result.invoke = msg;
+            offset += sizeof(msg);
+            continue;
+        }
+        offset += 1;
+    }
+
+    if (offset > 0 && offset < window.client_pending) {
+        size_t remaining = window.client_pending - offset;
+        for (size_t i = 0; i < remaining; ++i) {
+            window.client_buffer[i] = window.client_buffer[offset + i];
+        }
+        window.client_pending = remaining;
+    } else if (offset >= window.client_pending) {
+        window.client_pending = 0;
+    }
+
+    return result;
 }
 
 void reset_window(Window& window) {
@@ -976,6 +1100,8 @@ void reset_window(Window& window) {
     window.out_pipe_id = 0;
     window.shm_name[0] = '\0';
     window.title[0] = '\0';
+    window.menu = {};
+    window.client_pending = 0;
 }
 
 void close_window(Window& window) {
@@ -1766,7 +1892,7 @@ int main(uint64_t, uint64_t) {
     bool dirty_rect_valid = false;
     descriptor_defs::FramebufferRect dirty_rect{};
 
-    Window windows[kMaxWindows]{};
+    Window (&windows)[kMaxWindows] = g_windows;
     for (size_t i = 0; i < kMaxWindows; ++i) {
         reset_window(windows[i]);
     }
@@ -1774,7 +1900,11 @@ int main(uint64_t, uint64_t) {
     size_t window_count = 0;
     int background_index = -1;
     int background_warmup = 0;
+    int last_background_index = -2;
     int focus_index = -1;
+    int last_focus_index = -2;
+    uint32_t last_focus_id = 0;
+    bool menu_bar_dirty = true;
     int drag_index = -1;
     int32_t drag_offset_x = 0;
     int32_t drag_offset_y = 0;
@@ -1923,6 +2053,11 @@ int main(uint64_t, uint64_t) {
                             drag_index = hit;
                             drag_offset_x = cursor_x - windows[hit].x;
                             drag_offset_y = cursor_y - windows[hit].y;
+                        } else {
+                            send_mouse(&windows[hit],
+                                       events[i].buttons,
+                                       cursor_x,
+                                       cursor_y);
                         }
                     } else if (background_index >= 0 &&
                                background_index < static_cast<int>(kMaxWindows) &&
@@ -1938,17 +2073,18 @@ int main(uint64_t, uint64_t) {
                                             info,
                                             prev_focus_rect);
                         }
-                        focus_index = background_index;
-                        if (prev_focus != focus_index && has_prev_focus_rect) {
-                            mark_dirty_rect(prev_focus_rect);
-                            scene_dirty = true;
+                        if (window_count == 0) {
+                            focus_index = background_index;
+                            if (prev_focus != focus_index &&
+                                has_prev_focus_rect) {
+                                mark_dirty_rect(prev_focus_rect);
+                                scene_dirty = true;
+                            }
                         }
-                        if (left && !left_down) {
-                            send_mouse(&windows[background_index],
-                                       events[i].buttons,
-                                       static_cast<uint16_t>(cursor_x),
-                                       static_cast<uint16_t>(cursor_y));
-                        }
+                        send_mouse(&windows[background_index],
+                                   events[i].buttons,
+                                   cursor_x,
+                                   cursor_y);
                     }
                 }
                 if (!left && left_down) {
@@ -1977,22 +2113,37 @@ int main(uint64_t, uint64_t) {
             }
         }
 
-        uint8_t key = 0;
+        descriptor_defs::KeyboardEvent keys[8]{};
         long kread = descriptor_read(static_cast<uint32_t>(keyboard),
-                                     &key,
-                                     1);
+                                     keys,
+                                     sizeof(keys));
         if (kread > 0) {
-            bool has_background_for_exit =
-                background_index >= 0 &&
-                background_index < static_cast<int>(kMaxWindows) &&
-                windows[background_index].in_use;
-            if (key == 27 && window_count == 0 && !has_background_for_exit) {
-                break;
+            size_t count =
+                static_cast<size_t>(kread) / sizeof(keys[0]);
+            bool request_exit = false;
+            for (size_t i = 0; i < count; ++i) {
+                const auto& event = keys[i];
+                if ((event.flags & descriptor_defs::kKeyboardFlagPressed) != 0) {
+                    bool has_background_for_exit =
+                        background_index >= 0 &&
+                        background_index < static_cast<int>(kMaxWindows) &&
+                        windows[background_index].in_use;
+                    if ((event.flags & descriptor_defs::kKeyboardFlagExtended) == 0 &&
+                        event.scancode == 0x01 &&
+                        window_count == 0 &&
+                        !has_background_for_exit) {
+                        request_exit = true;
+                        break;
+                    }
+                }
+                if (focus_index >= 0 &&
+                    focus_index < static_cast<int>(kMaxWindows) &&
+                    windows[focus_index].in_use) {
+                    send_key(&windows[focus_index], event);
+                }
             }
-            if (focus_index >= 0 &&
-                focus_index < static_cast<int>(kMaxWindows) &&
-                windows[focus_index].in_use) {
-                send_key(&windows[focus_index], key);
+            if (request_exit) {
+                break;
             }
         }
 
@@ -2075,13 +2226,28 @@ int main(uint64_t, uint64_t) {
             }
         }
 
+        bool menu_invoke = false;
+        wm::ClientMenuInvoke invoke_msg{};
         for (size_t i = 0; i < kMaxWindows; ++i) {
-            if (windows[i].in_use && drain_present(windows[i])) {
+            if (!windows[i].in_use) {
+                continue;
+            }
+            ClientDrain drain = drain_client_messages(windows[i]);
+            if (drain.present) {
                 descriptor_defs::FramebufferRect rect{};
                 if (window_rect(windows[i], info, rect)) {
                     mark_dirty_rect(rect);
                 }
                 scene_dirty = true;
+            }
+            if (drain.menu_update &&
+                static_cast<int>(i) == focus_index) {
+                menu_bar_dirty = true;
+            }
+            if (drain.menu_invoke &&
+                static_cast<int>(i) == background_index) {
+                menu_invoke = true;
+                invoke_msg = drain.invoke;
             }
         }
 
@@ -2090,6 +2256,10 @@ int main(uint64_t, uint64_t) {
             background_index < static_cast<int>(kMaxWindows) &&
             windows[background_index].in_use;
         bool has_windows = window_count > 0 || has_background;
+        if (background_index != last_background_index) {
+            last_background_index = background_index;
+            menu_bar_dirty = true;
+        }
         if (has_background) {
             if (background_warmup > 0) {
                 --background_warmup;
@@ -2113,6 +2283,47 @@ int main(uint64_t, uint64_t) {
             if (had_windows) {
                 force_full_redraw = true;
             }
+        }
+
+        uint32_t focus_id = 0;
+        if (focus_index >= 0 &&
+            focus_index < static_cast<int>(kMaxWindows) &&
+            windows[focus_index].in_use) {
+            focus_id = windows[focus_index].id;
+        }
+        if (focus_id != last_focus_id) {
+            last_focus_id = focus_id;
+            menu_bar_dirty = true;
+        }
+        if (focus_index != last_focus_index) {
+            last_focus_index = focus_index;
+            menu_bar_dirty = true;
+        }
+        if (menu_invoke && focus_index >= 0 &&
+            focus_index < static_cast<int>(kMaxWindows) &&
+            windows[focus_index].in_use &&
+            focus_index != background_index) {
+            const Window& focus_window = windows[focus_index];
+            if (invoke_msg.menu_index < focus_window.menu.menu_count) {
+                const auto& menu =
+                    focus_window.menu.menus[invoke_msg.menu_index];
+                if (invoke_msg.item_index < menu.item_count) {
+                    uint32_t id = menu.items[invoke_msg.item_index].id;
+                    if (id != 0) {
+                        send_menu_command(&windows[focus_index], id);
+                    }
+                }
+            }
+        }
+        if (menu_bar_dirty && has_background) {
+            Window* focused =
+                (focus_index >= 0 &&
+                 focus_index < static_cast<int>(kMaxWindows) &&
+                 windows[focus_index].in_use)
+                    ? &windows[focus_index]
+                    : nullptr;
+            send_menu_bar_update(&windows[background_index], focused);
+            menu_bar_dirty = false;
         }
         if (!has_background && desktop_retry_count < kDesktopRetryMax) {
             if (desktop_retry_delay > 0) {

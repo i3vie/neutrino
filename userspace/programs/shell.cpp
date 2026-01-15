@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "descriptors.hpp"
+#include "keyboard_scancode.hpp"
 #include "../crt/syscall.hpp"
 
 constexpr uint32_t kDescConsole =
@@ -861,26 +862,26 @@ int main(uint64_t arg, uint64_t) {
     input_buffer[0] = '\0';
     size_t rendered_length = prompt_len;
 
-    uint8_t key;
+    bool input_is_keyboard = (input_handle != vty_handle);
     while (1) {
-        long r = descriptor_read(static_cast<uint32_t>(input_handle), &key, 1);
-        if (r > 0) {
+        auto handle_input_byte = [&](uint8_t key) {
             if (key == '\r' || key == '\n') {
-            descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-            input_buffer[input_length] = '\0';
-            execute_command(console, input_buffer);
-            input_length = 0;
-            input_buffer[0] = '\0';
-            prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
-            descriptor_write(static_cast<uint32_t>(console),
-                             prompt_buffer,
-                             prompt_len);
-            rendered_length = prompt_len;
+                descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+                input_buffer[input_length] = '\0';
+                execute_command(console, input_buffer);
+                input_length = 0;
+                input_buffer[0] = '\0';
+                prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
+                descriptor_write(static_cast<uint32_t>(console),
+                                 prompt_buffer,
+                                 prompt_len);
+                rendered_length = prompt_len;
             } else if (key == '\b' || key == 0x7F) {
                 if (input_length > 0) {
                     --input_length;
                     input_buffer[input_length] = '\0';
-                    prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
+                    prompt_len = build_prompt(prompt_buffer,
+                                              sizeof(prompt_buffer));
                     rendered_length = render_line(console,
                                                   prompt_buffer,
                                                   prompt_len,
@@ -894,7 +895,8 @@ int main(uint64_t arg, uint64_t) {
                 if (input_length + 1 < sizeof(input_buffer)) {
                     input_buffer[input_length++] = static_cast<char>(key);
                     input_buffer[input_length] = '\0';
-                    prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
+                    prompt_len = build_prompt(prompt_buffer,
+                                              sizeof(prompt_buffer));
                     rendered_length = render_line(console,
                                                   prompt_buffer,
                                                   prompt_len,
@@ -902,6 +904,38 @@ int main(uint64_t arg, uint64_t) {
                                                   input_length,
                                                   rendered_length);
                 }
+            }
+        };
+
+        if (input_is_keyboard) {
+            descriptor_defs::KeyboardEvent events[8]{};
+            long r = descriptor_read(static_cast<uint32_t>(input_handle),
+                                     events,
+                                     sizeof(events));
+            if (r > 0) {
+                size_t count =
+                    static_cast<size_t>(r) / sizeof(events[0]);
+                for (size_t i = 0; i < count; ++i) {
+                    if (!keyboard::is_pressed(events[i])) {
+                        continue;
+                    }
+                    if (keyboard::is_extended(events[i])) {
+                        continue;
+                    }
+                    char ch = keyboard::scancode_to_char(events[i].scancode,
+                                                         events[i].mods);
+                    if (ch != 0) {
+                        handle_input_byte(static_cast<uint8_t>(ch));
+                    }
+                }
+            }
+        } else {
+            uint8_t key = 0;
+            long r = descriptor_read(static_cast<uint32_t>(input_handle),
+                                     &key,
+                                     1);
+            if (r > 0) {
+                handle_input_byte(key);
             }
         }
         yield();

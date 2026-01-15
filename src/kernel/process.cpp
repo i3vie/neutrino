@@ -47,6 +47,7 @@ void init() {
         for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
             g_process_table[i].directory_handles[dh].in_use = false;
             g_process_table[i].directory_handles[dh].handle = {};
+            g_process_table[i].directory_handles[dh].path[0] = '\0';
         }
     }
 }
@@ -87,6 +88,7 @@ Process* allocate() {
         for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
             proc.directory_handles[dh].in_use = false;
             proc.directory_handles[dh].handle = {};
+            proc.directory_handles[dh].path[0] = '\0';
         }
         return &proc;
     }

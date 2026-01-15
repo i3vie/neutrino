@@ -3,6 +3,7 @@
 
 #include "descriptors.hpp"
 #include "font8x8_basic.hpp"
+#include "keyboard_scancode.hpp"
 #include "wm_protocol.hpp"
 #include "lattice/lattice.hpp"
 #include "../crt/syscall.hpp"
@@ -394,6 +395,63 @@ bool read_pipe_exact(uint32_t handle, void* data, size_t length) {
     return true;
 }
 
+void inject_vty_input(uint32_t vty_handle,
+                      const uint8_t* bytes,
+                      size_t length) {
+    if (bytes == nullptr || length == 0) {
+        return;
+    }
+    descriptor_set_property(
+        vty_handle,
+        static_cast<uint32_t>(descriptor_defs::Property::VtyInjectInput),
+        bytes,
+        length);
+}
+
+void handle_key_message(uint32_t vty_handle,
+                        const wm::ServerKeyMessage& msg) {
+    descriptor_defs::KeyboardEvent event{};
+    event.scancode = msg.scancode;
+    event.flags = msg.flags;
+    event.mods = msg.mods;
+    event.reserved = 0;
+    if (!keyboard::is_pressed(event)) {
+        return;
+    }
+
+    int32_t dx = 0;
+    int32_t dy = 0;
+    if (keyboard::is_arrow_key(event, dx, dy)) {
+        const char* seq = nullptr;
+        if (dx < 0) {
+            seq = "\x1b[D";
+        } else if (dx > 0) {
+            seq = "\x1b[C";
+        } else if (dy < 0) {
+            seq = "\x1b[A";
+        } else if (dy > 0) {
+            seq = "\x1b[B";
+        }
+        if (seq != nullptr) {
+            inject_vty_input(vty_handle,
+                             reinterpret_cast<const uint8_t*>(seq),
+                             3);
+        }
+        return;
+    }
+
+    if (keyboard::is_extended(event)) {
+        return;
+    }
+
+    char ch = keyboard::scancode_to_char(event.scancode, event.mods);
+    if (ch == 0) {
+        return;
+    }
+    uint8_t byte = static_cast<uint8_t>(ch);
+    inject_vty_input(vty_handle, &byte, 1);
+}
+
 bool open_registry(uint32_t& handle, wm::Registry*& registry) {
     long shm = shared_memory_open(kRegistryName, sizeof(wm::Registry));
     if (shm < 0) {
@@ -661,20 +719,53 @@ int main(uint64_t arg, uint64_t) {
 
     child(shell_path, args_buffer, 0, nullptr);
 
+    uint8_t buffer[128];
+    size_t pending = 0;
+
     while (1) {
-        uint8_t key = 0;
         long read = descriptor_read(static_cast<uint32_t>(reply_handle),
-                                    &key,
-                                    1);
+                                    buffer + pending,
+                                    sizeof(buffer) - pending);
         if (read > 0) {
-            if (key == static_cast<uint8_t>(wm::ServerMessage::Close)) {
+            pending += static_cast<size_t>(read);
+        }
+
+        size_t offset = 0;
+        while (offset < pending) {
+            uint8_t type = buffer[offset];
+            if (type == static_cast<uint8_t>(wm::ServerMessage::Close)) {
                 return 0;
             }
-            descriptor_set_property(
-                static_cast<uint32_t>(vty_handle),
-                static_cast<uint32_t>(descriptor_defs::Property::VtyInjectInput),
-                &key,
-                1);
+            if (type == static_cast<uint8_t>(wm::ServerMessage::Mouse)) {
+                if (pending - offset < sizeof(wm::ServerMouseMessage)) {
+                    break;
+                }
+                offset += sizeof(wm::ServerMouseMessage);
+                continue;
+            }
+            if (type == static_cast<uint8_t>(wm::ServerMessage::Key)) {
+                if (pending - offset < sizeof(wm::ServerKeyMessage)) {
+                    break;
+                }
+                wm::ServerKeyMessage msg{};
+                lattice::copy_bytes(reinterpret_cast<uint8_t*>(&msg),
+                                    buffer + offset,
+                                    sizeof(msg));
+                offset += sizeof(msg);
+                handle_key_message(static_cast<uint32_t>(vty_handle), msg);
+                continue;
+            }
+            offset += 1;
+        }
+
+        if (offset > 0 && offset < pending) {
+            size_t remaining = pending - offset;
+            for (size_t i = 0; i < remaining; ++i) {
+                buffer[i] = buffer[offset + i];
+            }
+            pending = remaining;
+        } else if (offset >= pending) {
+            pending = 0;
         }
 
         if (descriptor_get_property(

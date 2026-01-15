@@ -40,6 +40,25 @@ enum class Property : uint32_t {
     VtyInjectInput    = 0x00050003,
 };
 
+enum KeyboardEventFlag : uint8_t {
+    kKeyboardFlagPressed = 1u << 0,
+    kKeyboardFlagExtended = 1u << 1,
+};
+
+enum KeyboardMod : uint8_t {
+    kKeyboardModShift = 1u << 0,
+    kKeyboardModCtrl = 1u << 1,
+    kKeyboardModAlt = 1u << 2,
+    kKeyboardModCaps = 1u << 3,
+};
+
+struct KeyboardEvent {
+    uint8_t scancode;
+    uint8_t flags;
+    uint8_t mods;
+    uint8_t reserved;
+};
+
 
 struct FramebufferInfo {
     uint64_t physical_base;

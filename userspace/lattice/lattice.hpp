@@ -65,4 +65,31 @@ void fill_rect_stride(uint8_t* buffer,
                       uint32_t rect_height,
                       uint32_t color);
 
+struct FilePickerParent {
+    uint8_t* buffer;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t bytes_per_pixel;
+    wm::PixelFormat format;
+    uint32_t reply_handle;
+    uint32_t present_handle;
+};
+
+enum class FilePickerMode : uint8_t {
+    Open,
+    Save,
+};
+
+struct FilePickerResult {
+    bool accepted;
+    uint32_t handle;
+};
+
+class FilePicker {
+public:
+    static FilePickerResult open(const FilePickerParent& parent,
+                                 FilePickerMode mode);
+};
+
 }  // namespace lattice

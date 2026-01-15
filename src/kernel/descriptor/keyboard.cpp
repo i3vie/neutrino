@@ -17,7 +17,8 @@ int64_t keyboard_read(process::Process&,
     if (length == 0) {
         return 0;
     }
-    auto* buffer = reinterpret_cast<char*>(user_address);
+    auto* buffer =
+        reinterpret_cast<descriptor_defs::KeyboardEvent*>(user_address);
     if (buffer == nullptr) {
         return -1;
     }
@@ -26,9 +27,13 @@ int64_t keyboard_read(process::Process&,
         return -1;
     }
     uint32_t slot = static_cast<uint32_t>(slot_raw - 1);
-    size_t to_read = static_cast<size_t>(length);
-    size_t read_count = keyboard::read(slot, buffer, to_read);
-    return static_cast<int64_t>(read_count);
+    size_t max_events =
+        static_cast<size_t>(length) / sizeof(descriptor_defs::KeyboardEvent);
+    if (max_events == 0) {
+        return 0;
+    }
+    size_t read_count = keyboard::read(slot, buffer, max_events);
+    return static_cast<int64_t>(read_count * sizeof(descriptor_defs::KeyboardEvent));
 }
 
 int64_t keyboard_write(process::Process&,
