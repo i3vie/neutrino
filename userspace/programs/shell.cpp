@@ -10,6 +10,8 @@ constexpr uint32_t kDescConsole =
     static_cast<uint32_t>(descriptor_defs::Type::Console);
 constexpr uint32_t kDescKeyboard =
     static_cast<uint32_t>(descriptor_defs::Type::Keyboard);
+constexpr uint32_t kDescVty =
+    static_cast<uint32_t>(descriptor_defs::Type::Vty);
 
 namespace {
 
@@ -120,6 +122,31 @@ bool strings_equal(const char* a, const char* b) {
         ++b;
     }
     return *a == '\0' && *b == '\0';
+}
+
+uint32_t parse_uint32(const char* text) {
+    if (text == nullptr) {
+        return 0;
+    }
+    uint32_t value = 0;
+    while (*text >= '0' && *text <= '9') {
+        uint32_t digit = static_cast<uint32_t>(*text - '0');
+        value = value * 10 + digit;
+        ++text;
+    }
+    return value;
+}
+
+uint32_t parse_vty_arg(const char* args) {
+    if (args == nullptr || args[0] == '\0') {
+        return 0;
+    }
+    const char* cursor = args;
+    if (cursor[0] == 'v' && cursor[1] == 't' &&
+        cursor[2] == 'y' && cursor[3] == '=') {
+        return parse_uint32(cursor + 4);
+    }
+    return 0;
 }
 
 char g_current_cwd[128] = "/";
@@ -795,12 +822,27 @@ void execute_command(long console, const char* line) {
 
 }  // namespace
 
-int main(uint64_t, uint64_t) {
+int main(uint64_t arg, uint64_t) {
+    const char* args = reinterpret_cast<const char*>(arg);
+    uint32_t vty_id = parse_vty_arg(args);
+    long vty_handle = -1;
+    if (vty_id != 0) {
+        uint64_t flags =
+            static_cast<uint64_t>(descriptor_defs::Flag::Readable) |
+            static_cast<uint64_t>(descriptor_defs::Flag::Writable);
+        uint64_t open_context =
+            static_cast<uint64_t>(descriptor_defs::VtyOpen::Attach);
+        vty_handle = descriptor_open(kDescVty, vty_id, flags, open_context);
+    }
+
     long console = descriptor_open(kDescConsole, 0);
     if (console < 0) return 1;
 
-    long keyboard = descriptor_open(kDescKeyboard, 0);
-    if (keyboard < 0) return 1;
+    long input_handle = vty_handle;
+    if (input_handle < 0) {
+        input_handle = descriptor_open(kDescKeyboard, 0);
+        if (input_handle < 0) return 1;
+    }
 
     long cwd_len = getcwd(g_current_cwd, sizeof(g_current_cwd));
     if (cwd_len < 0 || g_current_cwd[0] == '\0') {
@@ -821,7 +863,7 @@ int main(uint64_t, uint64_t) {
 
     uint8_t key;
     while (1) {
-        long r = descriptor_read(static_cast<uint32_t>(keyboard), &key, 1);
+        long r = descriptor_read(static_cast<uint32_t>(input_handle), &key, 1);
         if (r > 0) {
             if (key == '\r' || key == '\n') {
             descriptor_write(static_cast<uint32_t>(console), "\n", 1);
