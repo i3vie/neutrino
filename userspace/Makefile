@@ -12,7 +12,7 @@ OBJ_DIR  := build
 PROG_DIR := programs
 BIN_DIR  := binary
 
-PROGRAMS := shell ls cat noop shm_parent shm_writer shm_reader
+PROGRAMS := init shell photon ion ls cat noop shm_parent shm_writer shm_reader
 PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
@@ -54,8 +54,8 @@ install: all
 	for prog in $(PROGRAMS); do \
 		$(SUDO) install -m 0644 "$(PROG_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
 	done; \
-	if [[ -f "$(PROG_DIR)/shell.elf" ]]; then \
-		$(SUDO) install -m 0644 "$(PROG_DIR)/compositor.elf" "$(MOUNT_DIR)/init.elf"; \
+	if [[ -f "$(PROG_DIR)/init.elf" ]]; then \
+		$(SUDO) install -m 0644 "$(PROG_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \
 	fi; \
 	sync
 
