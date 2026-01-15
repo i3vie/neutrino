@@ -18,6 +18,7 @@ constexpr uint32_t kDefaultScale = 1;
 constexpr uint32_t kMaxScale = 4;
 constexpr uint32_t kDefaultLineGap = 2;
 constexpr uint32_t kMaxLineGap = 6;
+constexpr uint32_t kTextPaddingX = 6;
 
 struct Terminal {
     uint8_t* buffer;
@@ -33,6 +34,7 @@ struct Terminal {
     uint32_t glyph_width;
     uint32_t glyph_height;
     uint32_t cursor_height;
+    uint32_t padding_x;
     uint32_t fg;
     uint32_t bg;
     uint32_t cursor;
@@ -219,7 +221,7 @@ void draw_glyph(const Terminal& term,
     if (uc >= 128) {
         uc = static_cast<uint8_t>('?');
     }
-    uint32_t base_x = cell_x * term.cell_width;
+    uint32_t base_x = term.padding_x + cell_x * term.cell_width;
     uint32_t base_y = cell_y * term.cell_height;
     uint32_t scale = term.scale;
     for (uint32_t row = 0; row < kFontHeight; ++row) {
@@ -255,7 +257,7 @@ void draw_cursor(const Terminal& term, uint32_t cell_x, uint32_t cell_y) {
     if (cell_x >= term.cols || cell_y >= term.rows) {
         return;
     }
-    uint32_t base_x = cell_x * term.cell_width;
+    uint32_t base_x = term.padding_x + cell_x * term.cell_width;
     uint32_t base_y = cell_y * term.cell_height;
     uint32_t cursor_height = term.cursor_height;
     if (cursor_height > term.glyph_height) {
@@ -514,7 +516,7 @@ int main(uint64_t arg, uint64_t) {
         return 1;
     }
 
-    uint32_t request_width = cols * cell_width;
+    uint32_t request_width = cols * cell_width + kTextPaddingX;
     uint32_t request_height = 0;
     if (rows > 0) {
         request_height = rows * glyph_height + (rows - 1) * line_gap;
@@ -603,6 +605,7 @@ int main(uint64_t arg, uint64_t) {
     term.glyph_width = glyph_width;
     term.glyph_height = glyph_height;
     term.cursor_height = cursor_height;
+    term.padding_x = kTextPaddingX;
     term.fg = lattice::pack_color(response.format, 230, 230, 230);
     term.bg = lattice::pack_color(response.format, 16, 18, 24);
     term.cursor = lattice::pack_color(response.format, 128, 220, 128);

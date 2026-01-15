@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 #include "descriptors.hpp"
+#include "font8x8_basic.hpp"
 #include "wm_protocol.hpp"
 #include "lattice/lattice.hpp"
 #include "../crt/syscall.hpp"
@@ -12,6 +13,9 @@ constexpr uint32_t kSlot = 1;
 constexpr uint32_t kCursorSize = 9;
 constexpr uint32_t kTitleBarHeight = 15;
 constexpr uint32_t kBorderThickness = 1;
+constexpr uint32_t kFontWidth = 8;
+constexpr uint32_t kFontHeight = 8;
+constexpr uint32_t kTitleTextPadding = 6;
 constexpr int32_t kMouseScale = 1;
 constexpr size_t kMaxWindows = 8;
 constexpr size_t kMaxWindowBytes = 4 * 1024 * 1024;
@@ -95,6 +99,150 @@ void fill_rect_clipped(uint8_t* frame,
               static_cast<uint32_t>(right - left),
               static_cast<uint32_t>(bottom - top),
               color);
+}
+
+size_t str_len(const char* text) {
+    size_t len = 0;
+    if (text == nullptr) {
+        return 0;
+    }
+    while (text[len] != '\0') {
+        ++len;
+    }
+    return len;
+}
+
+void draw_char(uint8_t* frame,
+               const descriptor_defs::FramebufferInfo& info,
+               uint32_t bytes_per_pixel,
+               int32_t x,
+               int32_t y,
+               char ch,
+               uint32_t color) {
+    if (frame == nullptr) {
+        return;
+    }
+    uint8_t uc = static_cast<uint8_t>(ch);
+    if (uc >= 128) {
+        uc = static_cast<uint8_t>('?');
+    }
+    for (uint32_t row = 0; row < kFontHeight; ++row) {
+        uint8_t bits = font8x8_basic[uc][row];
+        int32_t py = y + static_cast<int32_t>(row);
+        if (py < 0 || py >= static_cast<int32_t>(info.height)) {
+            continue;
+        }
+        for (uint32_t col = 0; col < kFontWidth; ++col) {
+            if ((bits & (1u << col)) == 0) {
+                continue;
+            }
+            int32_t px = x + static_cast<int32_t>(col);
+            if (px < 0 || px >= static_cast<int32_t>(info.width)) {
+                continue;
+            }
+            lattice::write_pixel(frame,
+                                 info,
+                                 bytes_per_pixel,
+                                 static_cast<uint32_t>(px),
+                                 static_cast<uint32_t>(py),
+                                 color);
+        }
+    }
+}
+
+void draw_char_clipped(uint8_t* frame,
+                       const descriptor_defs::FramebufferInfo& info,
+                       uint32_t bytes_per_pixel,
+                       int32_t x,
+                       int32_t y,
+                       char ch,
+                       uint32_t color,
+                       const descriptor_defs::FramebufferRect& clip) {
+    if (frame == nullptr) {
+        return;
+    }
+    int32_t clip_left = static_cast<int32_t>(clip.x);
+    int32_t clip_top = static_cast<int32_t>(clip.y);
+    int32_t clip_right = clip_left + static_cast<int32_t>(clip.width);
+    int32_t clip_bottom = clip_top + static_cast<int32_t>(clip.height);
+    int32_t right = x + static_cast<int32_t>(kFontWidth);
+    int32_t bottom = y + static_cast<int32_t>(kFontHeight);
+    if (right <= clip_left || bottom <= clip_top ||
+        x >= clip_right || y >= clip_bottom) {
+        return;
+    }
+    uint8_t uc = static_cast<uint8_t>(ch);
+    if (uc >= 128) {
+        uc = static_cast<uint8_t>('?');
+    }
+    for (uint32_t row = 0; row < kFontHeight; ++row) {
+        uint8_t bits = font8x8_basic[uc][row];
+        int32_t py = y + static_cast<int32_t>(row);
+        if (py < clip_top || py >= clip_bottom ||
+            py < 0 || py >= static_cast<int32_t>(info.height)) {
+            continue;
+        }
+        for (uint32_t col = 0; col < kFontWidth; ++col) {
+            if ((bits & (1u << col)) == 0) {
+                continue;
+            }
+            int32_t px = x + static_cast<int32_t>(col);
+            if (px < clip_left || px >= clip_right ||
+                px < 0 || px >= static_cast<int32_t>(info.width)) {
+                continue;
+            }
+            lattice::write_pixel(frame,
+                                 info,
+                                 bytes_per_pixel,
+                                 static_cast<uint32_t>(px),
+                                 static_cast<uint32_t>(py),
+                                 color);
+        }
+    }
+}
+
+void draw_text_limited(uint8_t* frame,
+                       const descriptor_defs::FramebufferInfo& info,
+                       uint32_t bytes_per_pixel,
+                       int32_t x,
+                       int32_t y,
+                       const char* text,
+                       size_t max_chars,
+                       uint32_t color) {
+    if (text == nullptr || max_chars == 0) {
+        return;
+    }
+    int32_t cursor = x;
+    for (size_t i = 0; text[i] != '\0' && i < max_chars; ++i) {
+        draw_char(frame, info, bytes_per_pixel, cursor, y, text[i], color);
+        cursor += static_cast<int32_t>(kFontWidth);
+    }
+}
+
+void draw_text_limited_clipped(uint8_t* frame,
+                               const descriptor_defs::FramebufferInfo& info,
+                               uint32_t bytes_per_pixel,
+                               int32_t x,
+                               int32_t y,
+                               const char* text,
+                               size_t max_chars,
+                               uint32_t color,
+                               const descriptor_defs::FramebufferRect& clip) {
+    if (text == nullptr || max_chars == 0) {
+        return;
+    }
+    int32_t cursor = x;
+    for (size_t i = 0; text[i] != '\0' && i < max_chars; ++i) {
+        draw_char_clipped(frame,
+                          info,
+                          bytes_per_pixel,
+                          cursor,
+                          y,
+                          text[i],
+                          color,
+                          clip);
+        cursor += static_cast<int32_t>(kFontWidth);
+    }
 }
 
 bool window_rect(const Window& window,
@@ -204,6 +352,7 @@ void draw_window_decor(uint8_t* frame,
                        const Window& window,
                        uint32_t border_color,
                        uint32_t title_color,
+                       uint32_t title_text,
                        uint32_t close_fill,
                        uint32_t close_border) {
     (void)close_border;
@@ -256,6 +405,37 @@ void draw_window_decor(uint8_t* frame,
               window.height,
               border_color);
 
+    if (title_height >= kFontHeight && window.title[0] != '\0') {
+        uint32_t right_limit = window.width;
+        if (window.width > title_height + kTitleTextPadding) {
+            right_limit = window.width - title_height - kTitleTextPadding;
+        }
+        uint32_t available = 0;
+        if (right_limit > kTitleTextPadding) {
+            available = right_limit - kTitleTextPadding;
+        }
+        size_t max_chars = available / kFontWidth;
+        size_t title_len = str_len(window.title);
+        if (max_chars > title_len) {
+            max_chars = title_len;
+        }
+        if (max_chars > 0) {
+            int32_t text_x =
+                window.x + static_cast<int32_t>(kTitleTextPadding);
+            int32_t text_y =
+                window.y +
+                static_cast<int32_t>((title_height - kFontHeight) / 2);
+            draw_text_limited(frame,
+                              info,
+                              bytes_per_pixel,
+                              text_x,
+                              text_y,
+                              window.title,
+                              max_chars,
+                              title_text);
+        }
+    }
+
     if (title_height > 0) {
         uint32_t size = title_height;
         if (size > window.width) {
@@ -295,6 +475,7 @@ void draw_window_decor_clipped(uint8_t* frame,
                                const Window& window,
                                uint32_t border_color,
                                uint32_t title_color,
+                               uint32_t title_text,
                                uint32_t close_fill,
                                const descriptor_defs::FramebufferRect& clip) {
     if (!window.in_use || window.is_background ||
@@ -350,6 +531,38 @@ void draw_window_decor_clipped(uint8_t* frame,
                       window.height,
                       border_color,
                       clip);
+
+    if (title_height >= kFontHeight && window.title[0] != '\0') {
+        uint32_t right_limit = window.width;
+        if (window.width > title_height + kTitleTextPadding) {
+            right_limit = window.width - title_height - kTitleTextPadding;
+        }
+        uint32_t available = 0;
+        if (right_limit > kTitleTextPadding) {
+            available = right_limit - kTitleTextPadding;
+        }
+        size_t max_chars = available / kFontWidth;
+        size_t title_len = str_len(window.title);
+        if (max_chars > title_len) {
+            max_chars = title_len;
+        }
+        if (max_chars > 0) {
+            int32_t text_x =
+                window.x + static_cast<int32_t>(kTitleTextPadding);
+            int32_t text_y =
+                window.y +
+                static_cast<int32_t>((title_height - kFontHeight) / 2);
+            draw_text_limited_clipped(frame,
+                                      info,
+                                      bytes_per_pixel,
+                                      text_x,
+                                      text_y,
+                                      window.title,
+                                      max_chars,
+                                      title_text,
+                                      clip);
+        }
+    }
 
     if (title_height > 0) {
         uint32_t size = title_height;
@@ -1572,6 +1785,8 @@ int main(uint64_t, uint64_t) {
     uint32_t border_color = lattice::pack_color(info, 210, 210, 220);
     uint32_t title_color = lattice::pack_color(info, 40, 40, 48);
     uint32_t title_focus_color = lattice::pack_color(info, 70, 90, 140);
+    uint32_t title_text_color = lattice::pack_color(info, 220, 225, 235);
+    uint32_t title_text_focus = lattice::pack_color(info, 245, 248, 252);
     uint32_t close_fill = lattice::pack_color(info, 210, 70, 70);
     uint32_t close_border = lattice::pack_color(info, 120, 30, 30);
 
@@ -1944,12 +2159,15 @@ int main(uint64_t, uint64_t) {
                                 static_cast<int>(i) == focus_index;
                             uint32_t title_color_use =
                                 focused ? title_focus_color : title_color;
+                            uint32_t title_text_use =
+                                focused ? title_text_focus : title_text_color;
                             draw_window_decor(frame,
                                               info,
                                               bytes_per_pixel,
                                               windows[i],
                                               border_color,
                                               title_color_use,
+                                              title_text_use,
                                               close_fill,
                                               close_border);
                         }
@@ -2034,12 +2252,15 @@ int main(uint64_t, uint64_t) {
                             static_cast<int>(i) == focus_index;
                         uint32_t title_color_use =
                             focused ? title_focus_color : title_color;
+                        uint32_t title_text_use =
+                            focused ? title_text_focus : title_text_color;
                         draw_window_decor_clipped(frame,
                                                   info,
                                                   bytes_per_pixel,
                                                   windows[i],
                                                   border_color,
                                                   title_color_use,
+                                                  title_text_use,
                                                   close_fill,
                                                   dirty_rect);
                     }

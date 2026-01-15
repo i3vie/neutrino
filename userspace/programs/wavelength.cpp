@@ -449,7 +449,7 @@ int main(uint64_t, uint64_t) {
     draw_text(surface, title_x, title_y, "Wavelength", label_color);
 
     Icon icons[] = {
-        {"Terminal", "binary/ion.elf", 0, 0, 'T'},
+        {"Ion", "binary/ion.elf", 0, 0, 'I'},
     };
 
     uint32_t cell_width = kIconSize + kIconGap;
