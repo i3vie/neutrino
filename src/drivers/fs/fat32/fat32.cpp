@@ -42,7 +42,13 @@ struct __attribute__((packed)) BpbFat32 {
 constexpr uint8_t ATTR_LONG_NAME = 0x0F;
 constexpr uint8_t ATTR_DIRECTORY = 0x10;
 constexpr uint8_t ATTR_VOLUME_ID = 0x08;
-constexpr size_t kMaxSegmentLength = 32;
+constexpr size_t kMaxSegmentLength = 128;
+constexpr uint8_t kLfnSequenceMask = 0x1F;
+constexpr uint8_t kLfnLastFlag = 0x40;
+constexpr uint8_t kLfnType = 0x00;
+constexpr uint8_t kLfnMaxEntries = 20;
+constexpr size_t kLfnCharsPerEntry = 13;
+constexpr size_t kMaxLfnLength = 128;
 
 constexpr uint32_t kFatEntryMask = 0x0FFFFFFF;
 constexpr uint32_t kFatEoc = 0x0FFFFFF8;
@@ -58,6 +64,15 @@ alignas(512) uint8_t cluster_buffer[32768];
 alignas(512) uint8_t fat_cache[512];
 uint32_t fat_cache_sector = 0xFFFFFFFF;
 const fs::BlockDevice* fat_cache_device = nullptr;
+
+struct LfnState {
+    char name[kMaxLfnLength];
+    uint8_t checksum;
+    uint8_t expected;
+    bool active;
+    bool complete;
+    bool overflow;
+};
 
 inline uint32_t cluster_to_lba(const Fat32Volume& vol, uint32_t cluster) {
     return vol.cluster_begin_lba +
@@ -210,6 +225,90 @@ size_t string_length(const char* str) {
     return len;
 }
 
+void reset_lfn(LfnState& state) {
+    memset(&state, 0, sizeof(state));
+}
+
+uint16_t read_lfn_char(const uint8_t* entry, size_t offset) {
+    return static_cast<uint16_t>(entry[offset]) |
+           (static_cast<uint16_t>(entry[offset + 1]) << 8);
+}
+
+void store_lfn_chars(LfnState& state, const uint8_t* entry, uint8_t seq) {
+    static const uint8_t kOffsets[kLfnCharsPerEntry] = {
+        1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30,
+    };
+    size_t base = (static_cast<size_t>(seq) - 1u) * kLfnCharsPerEntry;
+    for (size_t i = 0; i < kLfnCharsPerEntry; ++i) {
+        size_t out_index = base + i;
+        uint16_t code = read_lfn_char(entry, kOffsets[i]);
+        if (code == 0x0000 || code == 0xFFFF) {
+            if (out_index < sizeof(state.name)) {
+                state.name[out_index] = '\0';
+            }
+            break;
+        }
+        if (out_index + 1 >= sizeof(state.name)) {
+            state.overflow = true;
+            continue;
+        }
+        char ch = (code <= 0x7F) ? static_cast<char>(code) : '?';
+        state.name[out_index] = ch;
+    }
+    state.name[sizeof(state.name) - 1] = '\0';
+}
+
+uint8_t lfn_checksum(const uint8_t* short_entry) {
+    uint8_t sum = 0;
+    for (size_t i = 0; i < 11; ++i) {
+        sum = static_cast<uint8_t>(((sum & 1u) ? 0x80u : 0u) +
+                                   (sum >> 1u) + short_entry[i]);
+    }
+    return sum;
+}
+
+void consume_lfn_entry(LfnState& state, const uint8_t* entry) {
+    if (entry[11] != ATTR_LONG_NAME || entry[0] == 0xE5) {
+        reset_lfn(state);
+        return;
+    }
+    if (entry[12] != kLfnType || entry[26] != 0 || entry[27] != 0) {
+        reset_lfn(state);
+        return;
+    }
+
+    uint8_t order = entry[0];
+    uint8_t seq = static_cast<uint8_t>(order & kLfnSequenceMask);
+    if (seq == 0 || seq > kLfnMaxEntries) {
+        reset_lfn(state);
+        return;
+    }
+
+    bool last = (order & kLfnLastFlag) != 0;
+    if (last) {
+        reset_lfn(state);
+        state.active = true;
+        state.expected = seq;
+        state.checksum = entry[13];
+    } else if (!state.active || state.expected != seq) {
+        reset_lfn(state);
+        return;
+    }
+
+    if (state.checksum != entry[13]) {
+        reset_lfn(state);
+        return;
+    }
+
+    store_lfn_chars(state, entry, seq);
+    if (state.expected > 0) {
+        --state.expected;
+        if (state.expected == 0) {
+            state.complete = true;
+        }
+    }
+}
+
 bool build_short_name(const char* name, uint8_t (&out)[11]) {
     if (name == nullptr || name[0] == '\0') {
         return false;
@@ -285,6 +384,8 @@ bool iterate_directory(Fat32Volume& volume, uint32_t start_cluster, Fn&& fn) {
     bool done = false;
     size_t raw_index = 0;
     size_t visible_index = 0;
+    LfnState lfn{};
+    reset_lfn(lfn);
 
     while (!done) {
         uint32_t lba = cluster_to_lba(volume, current_cluster);
@@ -303,23 +404,43 @@ bool iterate_directory(Fat32Volume& volume, uint32_t start_cluster, Fn&& fn) {
                 break;
             }
 
-            bool skip = (entry[0] == 0xE5) ||
-                        (entry[11] == ATTR_LONG_NAME) ||
-                        ((entry[11] & ATTR_VOLUME_ID) != 0);
-
-            if (!skip) {
-                IterationResult res = fn(entry,
-                                         current_cluster,
-                                         static_cast<uint32_t>(raw_index),
-                                         static_cast<uint32_t>(visible_index));
-                if (res == IterationResult::StopSuccess) {
-                    return true;
-                }
-                if (res == IterationResult::StopFailure) {
-                    return false;
-                }
-                ++visible_index;
+            if (entry[0] == 0xE5) {
+                reset_lfn(lfn);
+                ++raw_index;
+                continue;
             }
+
+            if (entry[11] == ATTR_LONG_NAME) {
+                consume_lfn_entry(lfn, entry);
+                ++raw_index;
+                continue;
+            }
+
+            if ((entry[11] & ATTR_VOLUME_ID) != 0) {
+                reset_lfn(lfn);
+                ++raw_index;
+                continue;
+            }
+
+            const char* long_name = nullptr;
+            if (lfn.active && lfn.complete && !lfn.overflow &&
+                lfn_checksum(entry) == lfn.checksum) {
+                long_name = lfn.name;
+            }
+
+            IterationResult res = fn(entry,
+                                     current_cluster,
+                                     static_cast<uint32_t>(raw_index),
+                                     static_cast<uint32_t>(visible_index),
+                                     long_name);
+            reset_lfn(lfn);
+            if (res == IterationResult::StopSuccess) {
+                return true;
+            }
+            if (res == IterationResult::StopFailure) {
+                return false;
+            }
+            ++visible_index;
 
             ++raw_index;
         }
@@ -345,9 +466,19 @@ bool iterate_directory(Fat32Volume& volume, uint32_t start_cluster, Fn&& fn) {
 void copy_entry(const uint8_t* raw,
                 uint32_t directory_cluster,
                 uint32_t raw_index,
+                const char* long_name,
                 Fat32DirEntry& out) {
     memset(&out, 0, sizeof(Fat32DirEntry));
-    format_83_name(raw, out.name);
+    if (long_name != nullptr && long_name[0] != '\0') {
+        size_t i = 0;
+        while (long_name[i] != '\0' && i + 1 < sizeof(out.name)) {
+            out.name[i] = long_name[i];
+            ++i;
+        }
+        out.name[i] = '\0';
+    } else {
+        format_83_name(raw, out.name);
+    }
     out.attributes = raw[11];
     out.first_cluster =
         (static_cast<uint32_t>(raw[20]) << 16) |
@@ -986,7 +1117,7 @@ bool fat32_create_file(Fat32Volume& volume,
         return false;
     }
 
-    copy_entry(raw, slot.cluster, slot.raw_index, out_entry);
+    copy_entry(raw, slot.cluster, slot.raw_index, nullptr, out_entry);
     return true;
 }
 
@@ -1118,9 +1249,14 @@ bool fat32_list_directory(Fat32Volume& volume, uint32_t start_cluster,
                                 [&](const uint8_t* entry,
                                     uint32_t dir_cluster,
                                     uint32_t raw_index,
-                                    uint32_t) -> IterationResult {
+                                    uint32_t,
+                                    const char* long_name) -> IterationResult {
         if (collected < max_entries) {
-            copy_entry(entry, dir_cluster, raw_index, out_entries[collected]);
+            copy_entry(entry,
+                       dir_cluster,
+                       raw_index,
+                       long_name,
+                       out_entries[collected]);
         }
         ++collected;
         return IterationResult::Continue;
@@ -1145,11 +1281,15 @@ bool fat32_find_entry(Fat32Volume& volume, uint32_t directory_cluster,
                                 [&](const uint8_t* raw,
                                     uint32_t dir_cluster,
                                     uint32_t raw_index,
-                                    uint32_t) -> IterationResult {
-        char entry_name[12] = {0};
+                                    uint32_t,
+                                    const char* long_name) -> IterationResult {
+        const char* entry_long =
+            (long_name != nullptr && long_name[0] != '\0') ? long_name : nullptr;
+        char entry_name[64] = {0};
         format_83_name(raw, entry_name);
-        if (names_equal(entry_name, name)) {
-            copy_entry(raw, dir_cluster, raw_index, out_entry);
+        if ((entry_long != nullptr && names_equal(entry_long, name)) ||
+            names_equal(entry_name, name)) {
+            copy_entry(raw, dir_cluster, raw_index, entry_long, out_entry);
             found = true;
             return IterationResult::StopSuccess;
         }
@@ -1381,9 +1521,10 @@ bool fat32_get_entry_by_index(Fat32Volume& volume, uint32_t directory_cluster,
                                 [&](const uint8_t* raw,
                                     uint32_t dir_cluster,
                                     uint32_t raw_index,
-                                    uint32_t visible_index) -> IterationResult {
+                                    uint32_t visible_index,
+                                    const char* long_name) -> IterationResult {
         if (visible_index == index) {
-            copy_entry(raw, dir_cluster, raw_index, out_entry);
+            copy_entry(raw, dir_cluster, raw_index, long_name, out_entry);
             found = true;
             return IterationResult::StopSuccess;
         }

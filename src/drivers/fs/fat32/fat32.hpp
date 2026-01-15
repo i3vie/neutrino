@@ -9,7 +9,7 @@ struct FilesystemOps;
 }
 
 struct Fat32DirEntry {
-    char name[12];
+    char name[64];
     uint8_t attributes;
     uint32_t first_cluster;
     uint32_t size;
