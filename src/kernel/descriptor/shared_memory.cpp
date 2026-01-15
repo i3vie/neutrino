@@ -16,7 +16,7 @@ constexpr size_t kMaxSegments = 32;
 constexpr size_t kMaxNameLength = 48;
 constexpr size_t kDefaultSegmentSize = 0x1000;
 constexpr size_t kPageSize = 0x1000;
-constexpr size_t kMaxSegmentPages = 1024;  // Bound shared segments to keep allocator pressure predictable.
+constexpr size_t kMaxSegmentPages = 4096;  // Allow larger shared buffers (e.g., full-screen surfaces).
 
 struct SegmentMapping {
     process::Process* proc;
@@ -152,6 +152,11 @@ SharedSegment* allocate_segment_locked(const char* name,
     size_t padded = static_cast<size_t>((length + kPageSize - 1) & ~(kPageSize - 1));
     size_t pages = padded / kPageSize;
     if (pages == 0 || pages > kMaxSegmentPages) {
+        log_message(LogLevel::Warn,
+                    "SharedMemory: request %zu bytes (%zu pages) exceeds limit %zu",
+                    length,
+                    pages,
+                    kMaxSegmentPages);
         return nullptr;
     }
     SharedSegment* slot = nullptr;
@@ -162,14 +167,22 @@ SharedSegment* allocate_segment_locked(const char* name,
         }
     }
     if (slot == nullptr) {
+        log_message(LogLevel::Warn,
+                    "SharedMemory: no free segment slots for '%s'",
+                    name);
         return nullptr;
     }
 
     vm::Region region = vm::reserve_user_region(padded);
     if (region.base == 0 || region.length == 0) {
+        log_message(LogLevel::Warn,
+                    "SharedMemory: reserve_user_region failed for %zu bytes",
+                    padded);
         return nullptr;
     }
     if (!vm::is_user_range(region.base, region.length)) {
+        log_message(LogLevel::Warn,
+                    "SharedMemory: reserved range not user-accessible");
         return nullptr;
     }
 
@@ -180,6 +193,10 @@ SharedSegment* allocate_segment_locked(const char* name,
     for (size_t i = 0; i < pages; ++i) {
         uint64_t phys = memory::alloc_user_page();
         if (phys == 0) {
+            log_message(LogLevel::Warn,
+                        "SharedMemory: alloc_user_page failed at %zu/%zu",
+                        i + 1,
+                        pages);
             for (size_t j = 0; j < i; ++j) {
                 memory::free_user_page(slot->pages[j]);
             }
@@ -347,10 +364,19 @@ bool open_shared_memory(process::Process& proc,
         if (segment == nullptr) {
             segment = allocate_segment_locked(name_buffer, requested);
             if (segment == nullptr) {
+                log_message(LogLevel::Warn,
+                            "SharedMemory: failed to create '%s' (%zu bytes)",
+                            name_buffer,
+                            requested);
                 return false;
             }
             created = true;
         } else if (requested != 0 && segment->region.length < requested) {
+            log_message(LogLevel::Warn,
+                        "SharedMemory: '%s' existing size %zu < requested %zu",
+                        name_buffer,
+                        static_cast<size_t>(segment->region.length),
+                        requested);
             return false;
         }
         mapping = find_mapping(*segment, proc);

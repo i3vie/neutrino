@@ -17,6 +17,10 @@ constexpr size_t kMaxWindows = 8;
 constexpr size_t kMaxWindowBytes = 4 * 1024 * 1024;
 constexpr const char kRegistryName[] = "wm.registry";
 constexpr const char kWindowNamePrefix[] = "wm.win.";
+constexpr const char kAutoexecRelativePath[] = "config/photon/autorun";
+constexpr const char kDefaultDesktopPath[] = "binary/wavelength.elf";
+constexpr int kDesktopRetryFrames = 120;
+constexpr int kDesktopRetryMax = 12;
 
 void render_background(uint8_t* frame,
                        const descriptor_defs::FramebufferInfo& info,
@@ -706,6 +710,18 @@ void send_key(Window* window, uint8_t key) {
     descriptor_write(window->in_pipe_handle, &key, 1);
 }
 
+void send_mouse(Window* window, uint8_t buttons, uint16_t x, uint16_t y) {
+    if (window == nullptr || !window->in_use || window->in_pipe_handle == 0) {
+        return;
+    }
+    wm::ServerMouseMessage msg{};
+    msg.type = static_cast<uint8_t>(wm::ServerMessage::Mouse);
+    msg.buttons = buttons;
+    msg.x = x;
+    msg.y = y;
+    descriptor_write(window->in_pipe_handle, &msg, sizeof(msg));
+}
+
 bool drain_present(Window& window) {
     if (!window.in_use || window.out_pipe_handle == 0) {
         return false;
@@ -803,6 +819,271 @@ bool write_pipe_all(uint32_t handle, const void* data, size_t length) {
     return true;
 }
 
+void copy_string(char* dest, size_t dest_size, const char* src) {
+    if (dest == nullptr || dest_size == 0) {
+        return;
+    }
+    size_t i = 0;
+    if (src != nullptr) {
+        for (; i + 1 < dest_size && src[i] != '\0'; ++i) {
+            dest[i] = src[i];
+        }
+    }
+    dest[i] = '\0';
+}
+
+bool is_space(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
+
+char* skip_spaces(char* text) {
+    if (text == nullptr) {
+        return nullptr;
+    }
+    while (*text != '\0' && is_space(*text)) {
+        ++text;
+    }
+    return text;
+}
+
+void trim_trailing(char* start, char* end) {
+    if (start == nullptr || end == nullptr) {
+        return;
+    }
+    while (end > start && is_space(*(end - 1))) {
+        --end;
+    }
+    *end = '\0';
+}
+
+void extract_mount_name(const char* path, char* out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (path == nullptr || path[0] != '/') {
+        return;
+    }
+    size_t src = 1;
+    size_t dst = 0;
+    while (path[src] != '\0' && path[src] != '/') {
+        if (dst + 1 >= out_size) {
+            out[0] = '\0';
+            return;
+        }
+        out[dst++] = path[src++];
+    }
+    if (dst == 0) {
+        out[0] = '\0';
+        return;
+    }
+    out[dst] = '\0';
+}
+
+bool build_mount_subpath(const char* mount,
+                         const char* suffix,
+                         char* out,
+                         size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+    if (mount == nullptr || mount[0] == '\0') {
+        return false;
+    }
+    size_t idx = 0;
+    out[idx++] = '/';
+    for (size_t i = 0; mount[i] != '\0'; ++i) {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = mount[i];
+    }
+    if (suffix != nullptr && suffix[0] != '\0') {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = '/';
+        for (size_t i = 0; suffix[i] != '\0'; ++i) {
+            if (idx + 1 >= out_size) {
+                return false;
+            }
+            out[idx++] = suffix[i];
+        }
+    }
+    out[idx] = '\0';
+    return true;
+}
+
+bool find_mount_name(char* out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    char cwd[128];
+    long cwd_len = getcwd(cwd, sizeof(cwd));
+    if (cwd_len > 0 && cwd[0] != '\0') {
+        extract_mount_name(cwd, out, out_size);
+        if (out[0] != '\0') {
+            return true;
+        }
+    }
+    long dir = directory_open("/");
+    if (dir < 0) {
+        return false;
+    }
+    DirEntry entry{};
+    bool found = false;
+    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
+        if (entry.name[0] != '\0') {
+            copy_string(out, out_size, entry.name);
+            found = true;
+            break;
+        }
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    return found && out[0] != '\0';
+}
+
+bool resolve_mount_path(const char* suffix,
+                        char* out,
+                        size_t out_size) {
+    char mount_name[64];
+    if (!find_mount_name(mount_name, sizeof(mount_name))) {
+        return false;
+    }
+    return build_mount_subpath(mount_name, suffix, out, out_size);
+}
+
+bool read_file_into_buffer(const char* path,
+                           char* buffer,
+                           size_t buffer_size,
+                           size_t& out_len) {
+    out_len = 0;
+    if (path == nullptr || buffer == nullptr || buffer_size == 0) {
+        return false;
+    }
+    long handle = file_open(path);
+    if (handle < 0) {
+        return false;
+    }
+    size_t total = 0;
+    while (total + 1 < buffer_size) {
+        long read = file_read(static_cast<uint32_t>(handle),
+                              buffer + total,
+                              buffer_size - 1 - total);
+        if (read <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(read);
+    }
+    file_close(static_cast<uint32_t>(handle));
+    buffer[total] = '\0';
+    out_len = total;
+    return total > 0;
+}
+
+bool read_file_from_mounts(const char* suffix,
+                           char* buffer,
+                           size_t buffer_size,
+                           size_t& out_len) {
+    if (read_file_into_buffer(suffix, buffer, buffer_size, out_len)) {
+        return true;
+    }
+    char path[160];
+    if (resolve_mount_path(suffix, path, sizeof(path)) &&
+        read_file_into_buffer(path, buffer, buffer_size, out_len)) {
+        return true;
+    }
+    long dir = directory_open("/");
+    if (dir < 0) {
+        return false;
+    }
+    DirEntry entry{};
+    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
+        if (entry.name[0] == '\0') {
+            continue;
+        }
+        if (!build_mount_subpath(entry.name, suffix, path, sizeof(path))) {
+            continue;
+        }
+        if (read_file_into_buffer(path, buffer, buffer_size, out_len)) {
+            directory_close(static_cast<uint32_t>(dir));
+            return true;
+        }
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    return false;
+}
+
+bool spawn_from_mounts(const char* suffix) {
+    if (suffix == nullptr || suffix[0] == '\0') {
+        return false;
+    }
+    long pid = child(suffix, nullptr, 0, nullptr);
+    if (pid >= 0) {
+        return true;
+    }
+    char path[160];
+    if (resolve_mount_path(suffix, path, sizeof(path))) {
+        pid = child(path, nullptr, 0, nullptr);
+        if (pid >= 0) {
+            return true;
+        }
+    }
+    long dir = directory_open("/");
+    if (dir < 0) {
+        return false;
+    }
+    DirEntry entry{};
+    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
+        if (entry.name[0] == '\0') {
+            continue;
+        }
+        if (!build_mount_subpath(entry.name, suffix, path, sizeof(path))) {
+            continue;
+        }
+        pid = child(path, nullptr, 0, nullptr);
+        if (pid >= 0) {
+            directory_close(static_cast<uint32_t>(dir));
+            return true;
+        }
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    return false;
+}
+
+bool run_autoexec() {
+    char buffer[256];
+    size_t len = 0;
+    bool loaded = read_file_from_mounts(kAutoexecRelativePath,
+                                        buffer,
+                                        sizeof(buffer),
+                                        len);
+    if (!loaded) {
+        return false;
+    }
+
+    char* cursor = buffer;
+    while (cursor != nullptr && *cursor != '\0') {
+        char* line_start = cursor;
+        while (*cursor != '\0' && *cursor != '\n' && *cursor != '\r') {
+            ++cursor;
+        }
+        char* line_end = cursor;
+        while (*cursor == '\n' || *cursor == '\r') {
+            *cursor = '\0';
+            ++cursor;
+        }
+        char* trimmed = skip_spaces(line_start);
+        trim_trailing(trimmed, line_end);
+        if (trimmed == nullptr || trimmed[0] == '\0' || trimmed[0] == '#') {
+            continue;
+        }
+        spawn_from_mounts(trimmed);
+    }
+    return true;
+}
+
 bool populate_registry(uint32_t server_pipe_id) {
     long handle = shared_memory_open(kRegistryName, sizeof(wm::Registry));
     if (handle < 0) {
@@ -885,7 +1166,15 @@ bool create_window_from_request(const wm::CreateRequest& request,
 
     uint64_t stride = static_cast<uint64_t>(width) * bytes_per_pixel;
     uint64_t total = stride * height;
-    if (stride == 0 || total == 0 || total > kMaxWindowBytes) {
+    uint64_t max_bytes = kMaxWindowBytes;
+    if (request_background) {
+        uint64_t frame_bytes =
+            static_cast<uint64_t>(info.pitch) * info.height;
+        if (frame_bytes > max_bytes) {
+            max_bytes = frame_bytes;
+        }
+    }
+    if (stride == 0 || total == 0 || total > max_bytes) {
         window->in_use = false;
         response.status = -3;
         return false;
@@ -1250,6 +1539,10 @@ int main(uint64_t, uint64_t) {
         return 1;
     }
 
+    bool autoexec_loaded = run_autoexec();
+    int desktop_retry_delay = 0;
+    int desktop_retry_count = 0;
+
     int32_t cursor_x = static_cast<int32_t>(info.width / 2);
     int32_t cursor_y = static_cast<int32_t>(info.height / 2);
     int32_t prev_x = cursor_x;
@@ -1267,6 +1560,7 @@ int main(uint64_t, uint64_t) {
     uint32_t next_window_id = 1;
     size_t window_count = 0;
     int background_index = -1;
+    int background_warmup = 0;
     int focus_index = -1;
     int drag_index = -1;
     int32_t drag_offset_x = 0;
@@ -1434,6 +1728,12 @@ int main(uint64_t, uint64_t) {
                             mark_dirty_rect(prev_focus_rect);
                             scene_dirty = true;
                         }
+                        if (left && !left_down) {
+                            send_mouse(&windows[background_index],
+                                       events[i].buttons,
+                                       static_cast<uint16_t>(cursor_x),
+                                       static_cast<uint16_t>(cursor_y));
+                        }
                     }
                 }
                 if (!left && left_down) {
@@ -1537,6 +1837,9 @@ int main(uint64_t, uint64_t) {
                             (focus_index < 0 || window_count == 0)) {
                             focus_index = created_index;
                         }
+                        background_warmup = 120;
+                        force_full_redraw = true;
+                        scene_dirty = true;
                     } else {
                         ++window_count;
                         if (created_index >= 0) {
@@ -1572,6 +1875,14 @@ int main(uint64_t, uint64_t) {
             background_index < static_cast<int>(kMaxWindows) &&
             windows[background_index].in_use;
         bool has_windows = window_count > 0 || has_background;
+        if (has_background) {
+            if (background_warmup > 0) {
+                --background_warmup;
+                scene_dirty = true;
+            }
+        } else {
+            background_warmup = 0;
+        }
         if (has_windows) {
             if (focus_index >= 0 &&
                 (focus_index >= static_cast<int>(kMaxWindows) ||
@@ -1586,6 +1897,23 @@ int main(uint64_t, uint64_t) {
             drag_index = -1;
             if (had_windows) {
                 force_full_redraw = true;
+            }
+        }
+        if (!has_background && desktop_retry_count < kDesktopRetryMax) {
+            if (desktop_retry_delay > 0) {
+                --desktop_retry_delay;
+            } else {
+                bool spawned = false;
+                if (!autoexec_loaded) {
+                    autoexec_loaded = run_autoexec();
+                    spawned = autoexec_loaded;
+                }
+                if (!spawned) {
+                    spawned = spawn_from_mounts(kDefaultDesktopPath);
+                }
+                ++desktop_retry_count;
+                desktop_retry_delay = spawned ? kDesktopRetryFrames * 2
+                                              : kDesktopRetryFrames;
             }
         }
 

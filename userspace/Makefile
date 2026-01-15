@@ -12,7 +12,7 @@ OBJ_DIR  := build
 PROG_DIR := programs
 BIN_DIR  := binary
 
-PROGRAMS := init shell photon ion ls cat noop shm_parent shm_writer shm_reader
+PROGRAMS := init shell photon wavelength ion ls cat
 PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
@@ -51,9 +51,13 @@ install: all
 	mounted=1; \
 	$(SUDO) rm -rf "$(MOUNT_DIR)/binary"; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/binary"; \
+	$(SUDO) mkdir -p "$(MOUNT_DIR)/config/photon"; \
 	for prog in $(PROGRAMS); do \
 		$(SUDO) install -m 0644 "$(PROG_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
 	done; \
+	if [[ -f "config/photon/autorun" ]]; then \
+		$(SUDO) install -m 0644 "config/photon/autorun" "$(MOUNT_DIR)/config/photon/autorun"; \
+	fi; \
 	if [[ -f "$(PROG_DIR)/init.elf" ]]; then \
 		$(SUDO) install -m 0644 "$(PROG_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \
 	fi; \

@@ -23,7 +23,15 @@ enum class ClientMessage : uint8_t {
 };
 
 enum class ServerMessage : uint8_t {
+    Mouse = 0xFE,
     Close = 0xFF,
+};
+
+struct __attribute__((packed)) ServerMouseMessage {
+    uint8_t type;
+    uint8_t buttons;
+    uint16_t x;
+    uint16_t y;
 };
 
 struct CreateRequest {

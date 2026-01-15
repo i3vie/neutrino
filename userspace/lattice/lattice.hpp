@@ -54,4 +54,15 @@ void fill_rect(uint8_t* frame,
                uint32_t height,
                uint32_t color);
 
+void fill_rect_stride(uint8_t* buffer,
+                      uint32_t width,
+                      uint32_t height,
+                      uint32_t stride,
+                      uint32_t bytes_per_pixel,
+                      int32_t x,
+                      int32_t y,
+                      uint32_t rect_width,
+                      uint32_t rect_height,
+                      uint32_t color);
+
 }  // namespace lattice

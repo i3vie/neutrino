@@ -144,4 +144,48 @@ void fill_rect(uint8_t* frame,
     }
 }
 
+void fill_rect_stride(uint8_t* buffer,
+                      uint32_t width,
+                      uint32_t height,
+                      uint32_t stride,
+                      uint32_t bytes_per_pixel,
+                      int32_t x,
+                      int32_t y,
+                      uint32_t rect_width,
+                      uint32_t rect_height,
+                      uint32_t color) {
+    if (buffer == nullptr || rect_width == 0 || rect_height == 0) {
+        return;
+    }
+    int32_t left = x;
+    int32_t top = y;
+    int32_t right = x + static_cast<int32_t>(rect_width);
+    int32_t bottom = y + static_cast<int32_t>(rect_height);
+    if (right <= 0 || bottom <= 0) {
+        return;
+    }
+    if (left < 0) {
+        left = 0;
+    }
+    if (top < 0) {
+        top = 0;
+    }
+    if (right > static_cast<int32_t>(width)) {
+        right = static_cast<int32_t>(width);
+    }
+    if (bottom > static_cast<int32_t>(height)) {
+        bottom = static_cast<int32_t>(height);
+    }
+    for (int32_t py = top; py < bottom; ++py) {
+        for (int32_t px = left; px < right; ++px) {
+            write_pixel(buffer,
+                        stride,
+                        bytes_per_pixel,
+                        static_cast<uint32_t>(px),
+                        static_cast<uint32_t>(py),
+                        color);
+        }
+    }
+}
+
 }  // namespace lattice
