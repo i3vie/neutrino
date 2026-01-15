@@ -317,15 +317,6 @@ void reschedule(syscall::SyscallFrame& frame) {
         return;
     }
 
-    if (current_proc != next) {
-        log_message(LogLevel::Debug,
-                    "Scheduler: context switch pid=%u->%u cr3=%llx->%llx",
-                    static_cast<unsigned int>(current_proc ? current_proc->pid : 0),
-                    static_cast<unsigned int>(next ? next->pid : 0),
-                    static_cast<unsigned long long>(current_proc ? current_proc->cr3 : 0),
-                    static_cast<unsigned long long>(next ? next->cr3 : 0));
-    }
-
     process::set_current(next);
     prepare_frame_for_process(*next, frame);
 }
