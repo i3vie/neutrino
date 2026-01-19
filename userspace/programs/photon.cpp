@@ -33,12 +33,12 @@ void render_background(uint8_t* frame,
     if (info.width == 0 || info.height == 0) {
         return;
     }
+    uint32_t black = lattice::pack_color(info, 20, 20, 20);
+    uint32_t white = lattice::pack_color(info, 200, 200, 200);
     for (uint32_t y = 0; y < info.height; ++y) {
         for (uint32_t x = 0; x < info.width; ++x) {
-            uint32_t r = (x * 255u) / info.width;
-            uint32_t g = (y * 255u) / info.height;
-            uint32_t b = ((x ^ y) & 0xFFu);
-            uint32_t pixel = lattice::pack_color(info, r, g, b);
+            // Checkerboard it like X11
+            uint32_t pixel = ((x / 2 + y / 2) % 2 == 0) ? black : white;
             lattice::write_pixel(frame, info, bytes_per_pixel, x, y, pixel);
         }
     }
@@ -892,36 +892,50 @@ void draw_cursor(uint8_t* frame,
         return;
     }
     int32_t half = static_cast<int32_t>(kCursorSize / 2);
-    for (int32_t dx = -half; dx <= half; ++dx) {
-        int32_t x = cursor_x + dx;
-        if (x < 0 || x >= static_cast<int32_t>(info.width)) {
-            continue;
-        }
-        if (cursor_y < 0 || cursor_y >= static_cast<int32_t>(info.height)) {
-            continue;
-        }
-        lattice::write_pixel(frame,
-                             info,
-                             bytes_per_pixel,
-                             static_cast<uint32_t>(x),
-                             static_cast<uint32_t>(cursor_y),
-                             color);
-    }
-    for (int32_t dy = -half; dy <= half; ++dy) {
-        int32_t y = cursor_y + dy;
+    uint32_t outline = lattice::pack_color(info, 0, 0, 0);
+
+    auto draw_hline = [&](int32_t y, uint32_t line_color) {
         if (y < 0 || y >= static_cast<int32_t>(info.height)) {
-            continue;
+            return;
         }
-        if (cursor_x < 0 || cursor_x >= static_cast<int32_t>(info.width)) {
-            continue;
+        for (int32_t dx = -half; dx <= half; ++dx) {
+            int32_t x = cursor_x + dx;
+            if (x < 0 || x >= static_cast<int32_t>(info.width)) {
+                continue;
+            }
+            lattice::write_pixel(frame,
+                                 info,
+                                 bytes_per_pixel,
+                                 static_cast<uint32_t>(x),
+                                 static_cast<uint32_t>(y),
+                                 line_color);
         }
-        lattice::write_pixel(frame,
-                             info,
-                             bytes_per_pixel,
-                             static_cast<uint32_t>(cursor_x),
-                             static_cast<uint32_t>(y),
-                             color);
-    }
+    };
+
+    auto draw_vline = [&](int32_t x, uint32_t line_color) {
+        if (x < 0 || x >= static_cast<int32_t>(info.width)) {
+            return;
+        }
+        for (int32_t dy = -half; dy <= half; ++dy) {
+            int32_t y = cursor_y + dy;
+            if (y < 0 || y >= static_cast<int32_t>(info.height)) {
+                continue;
+            }
+            lattice::write_pixel(frame,
+                                 info,
+                                 bytes_per_pixel,
+                                 static_cast<uint32_t>(x),
+                                 static_cast<uint32_t>(y),
+                                 line_color);
+        }
+    };
+
+    draw_hline(cursor_y - 1, outline);
+    draw_hline(cursor_y + 1, outline);
+    draw_vline(cursor_x - 1, outline);
+    draw_vline(cursor_x + 1, outline);
+    draw_hline(cursor_y, color);
+    draw_vline(cursor_x, color);
 }
 
 void send_key(Window* window, const descriptor_defs::KeyboardEvent& event) {
@@ -1009,6 +1023,8 @@ struct ClientDrain {
     bool present;
     bool menu_update;
     bool menu_invoke;
+    bool close_request;
+    bool focus_request;
     wm::ClientMenuInvoke invoke;
 };
 
@@ -1064,6 +1080,16 @@ ClientDrain drain_client_messages(Window& window) {
             result.menu_invoke = true;
             result.invoke = msg;
             offset += sizeof(msg);
+            continue;
+        }
+        if (type == static_cast<uint8_t>(wm::ClientMessage::Close)) {
+            result.close_request = true;
+            offset += 1;
+            continue;
+        }
+        if (type == static_cast<uint8_t>(wm::ClientMessage::Focus)) {
+            result.focus_request = true;
+            offset += 1;
             continue;
         }
         offset += 1;
@@ -1686,7 +1712,12 @@ void render_cursor_region_mapped(uint8_t* dest,
     if (rect.width == 0 || rect.height == 0) {
         return;
     }
+    uint32_t outline = lattice::pack_color(info, 0, 0, 0);
     int32_t half = static_cast<int32_t>(kCursorSize / 2);
+    int32_t rect_left = static_cast<int32_t>(rect.x);
+    int32_t rect_right = static_cast<int32_t>(rect.x + rect.width - 1);
+    int32_t h_start_base = cursor_x - half;
+    int32_t h_end_base = cursor_x + half;
     for (uint32_t row = 0; row < rect.height; ++row) {
         uint32_t y = rect.y + row;
         size_t base_offset = static_cast<size_t>(y) * info.pitch +
@@ -1696,34 +1727,54 @@ void render_cursor_region_mapped(uint8_t* dest,
             dest[base_offset + i] = background[base_offset + i];
         }
 
-        if (static_cast<int32_t>(y) == cursor_y) {
-            int32_t h_start = cursor_x - half;
-            int32_t h_end = cursor_x + half;
-            int32_t rect_right =
-                static_cast<int32_t>(rect.x + rect.width - 1);
-            if (h_start < static_cast<int32_t>(rect.x)) {
-                h_start = static_cast<int32_t>(rect.x);
-            }
-            if (h_end > rect_right) {
-                h_end = rect_right;
-            }
+        int32_t y_signed = static_cast<int32_t>(y);
+        if (y_signed == cursor_y - 1 || y_signed == cursor_y + 1) {
+            int32_t h_start = h_start_base < rect_left ? rect_left : h_start_base;
+            int32_t h_end = h_end_base > rect_right ? rect_right : h_end_base;
             for (int32_t x = h_start; x <= h_end; ++x) {
                 size_t offset =
                     base_offset +
-                    static_cast<size_t>(x - static_cast<int32_t>(rect.x)) *
+                    static_cast<size_t>(x - rect_left) * bytes_per_pixel;
+                lattice::write_pixel_raw(dest, bytes_per_pixel, offset, outline);
+            }
+        }
+
+        int32_t v_offset = y_signed - cursor_y;
+        if (v_offset >= -half && v_offset <= half) {
+            int32_t outline_left = cursor_x - 1;
+            int32_t outline_right = cursor_x + 1;
+            if (outline_left >= rect_left && outline_left <= rect_right) {
+                size_t offset =
+                    base_offset +
+                    static_cast<size_t>(outline_left - rect_left) *
                         bytes_per_pixel;
+                lattice::write_pixel_raw(dest, bytes_per_pixel, offset, outline);
+            }
+            if (outline_right >= rect_left && outline_right <= rect_right) {
+                size_t offset =
+                    base_offset +
+                    static_cast<size_t>(outline_right - rect_left) *
+                        bytes_per_pixel;
+                lattice::write_pixel_raw(dest, bytes_per_pixel, offset, outline);
+            }
+        }
+
+        if (y_signed == cursor_y) {
+            int32_t h_start = h_start_base < rect_left ? rect_left : h_start_base;
+            int32_t h_end = h_end_base > rect_right ? rect_right : h_end_base;
+            for (int32_t x = h_start; x <= h_end; ++x) {
+                size_t offset =
+                    base_offset +
+                    static_cast<size_t>(x - rect_left) * bytes_per_pixel;
                 lattice::write_pixel_raw(dest, bytes_per_pixel, offset, color);
             }
         }
 
-        int32_t v_offset = static_cast<int32_t>(y) - cursor_y;
         if (v_offset >= -half && v_offset <= half) {
-            if (cursor_x >= static_cast<int32_t>(rect.x) &&
-                cursor_x <= static_cast<int32_t>(rect.x + rect.width - 1)) {
+            if (cursor_x >= rect_left && cursor_x <= rect_right) {
                 size_t offset =
                     base_offset +
-                    static_cast<size_t>(cursor_x -
-                                        static_cast<int32_t>(rect.x)) *
+                    static_cast<size_t>(cursor_x - rect_left) *
                         bytes_per_pixel;
                 lattice::write_pixel_raw(dest, bytes_per_pixel, offset, color);
             }
@@ -1742,6 +1793,7 @@ void render_cursor_region(uint32_t handle,
                           uint32_t color,
                           uint8_t* row_buffer,
                           size_t row_buffer_bytes) {
+    uint32_t outline = lattice::pack_color(info, 0, 0, 0);
     int32_t half = static_cast<int32_t>(kCursorSize / 2);
     int32_t left = prev_x < cursor_x ? prev_x : cursor_x;
     int32_t right = prev_x > cursor_x ? prev_x : cursor_x;
@@ -1776,6 +1828,43 @@ void render_cursor_region(uint32_t handle,
             row_buffer[i] = background[src_offset + i];
         }
 
+        if (y == cursor_y - 1 || y == cursor_y + 1) {
+            int32_t h_start = cursor_x - half;
+            int32_t h_end = cursor_x + half;
+            if (h_start < left) h_start = left;
+            if (h_end > right) h_end = right;
+            for (int32_t x = h_start; x <= h_end; ++x) {
+                size_t offset =
+                    static_cast<size_t>(x - left) * bytes_per_pixel;
+                lattice::write_pixel_raw(row_buffer,
+                                         bytes_per_pixel,
+                                         offset,
+                                         outline);
+            }
+        }
+
+        int32_t v_offset = y - cursor_y;
+        if (v_offset >= -half && v_offset <= half) {
+            int32_t outline_left = cursor_x - 1;
+            int32_t outline_right = cursor_x + 1;
+            if (outline_left >= left && outline_left <= right) {
+                size_t offset =
+                    static_cast<size_t>(outline_left - left) * bytes_per_pixel;
+                lattice::write_pixel_raw(row_buffer,
+                                         bytes_per_pixel,
+                                         offset,
+                                         outline);
+            }
+            if (outline_right >= left && outline_right <= right) {
+                size_t offset =
+                    static_cast<size_t>(outline_right - left) * bytes_per_pixel;
+                lattice::write_pixel_raw(row_buffer,
+                                         bytes_per_pixel,
+                                         offset,
+                                         outline);
+            }
+        }
+
         if (y == cursor_y) {
             int32_t h_start = cursor_x - half;
             int32_t h_end = cursor_x + half;
@@ -1788,7 +1877,6 @@ void render_cursor_region(uint32_t handle,
             }
         }
 
-        int32_t v_offset = y - cursor_y;
         if (v_offset >= -half && v_offset <= half) {
             if (cursor_x >= left && cursor_x <= right) {
                 size_t offset =
@@ -1982,6 +2070,8 @@ int main(uint64_t, uint64_t) {
                 }
                 cursor_x = nx;
                 cursor_y = ny;
+                int dispatch_index = -1;
+                bool suppress_dispatch = false;
                 bool left = (events[i].buttons & 0x1u) != 0;
                 if (left && !left_down) {
                     int prev_focus = focus_index;
@@ -2047,17 +2137,16 @@ int main(uint64_t, uint64_t) {
                             drag_index = -1;
                             force_full_redraw = true;
                             scene_dirty = true;
+                            suppress_dispatch = true;
                         } else if (point_in_titlebar(windows[hit],
                                                      cursor_x,
                                                      cursor_y)) {
                             drag_index = hit;
                             drag_offset_x = cursor_x - windows[hit].x;
                             drag_offset_y = cursor_y - windows[hit].y;
+                            suppress_dispatch = true;
                         } else {
-                            send_mouse(&windows[hit],
-                                       events[i].buttons,
-                                       cursor_x,
-                                       cursor_y);
+                            dispatch_index = hit;
                         }
                     } else if (background_index >= 0 &&
                                background_index < static_cast<int>(kMaxWindows) &&
@@ -2081,10 +2170,7 @@ int main(uint64_t, uint64_t) {
                                 scene_dirty = true;
                             }
                         }
-                        send_mouse(&windows[background_index],
-                                   events[i].buttons,
-                                   cursor_x,
-                                   cursor_y);
+                        dispatch_index = background_index;
                     }
                 }
                 if (!left && left_down) {
@@ -2108,6 +2194,23 @@ int main(uint64_t, uint64_t) {
                         }
                         scene_dirty = true;
                     }
+                    suppress_dispatch = true;
+                }
+                if (!suppress_dispatch && dispatch_index < 0 && drag_index < 0) {
+                    int hit = find_window_at(windows, cursor_x, cursor_y);
+                    if (hit >= 0) {
+                        dispatch_index = hit;
+                    } else if (background_index >= 0 &&
+                               background_index < static_cast<int>(kMaxWindows) &&
+                               windows[background_index].in_use) {
+                        dispatch_index = background_index;
+                    }
+                }
+                if (!suppress_dispatch && dispatch_index >= 0) {
+                    send_mouse(&windows[dispatch_index],
+                               events[i].buttons,
+                               cursor_x,
+                               cursor_y);
                 }
                 left_down = left;
             }
@@ -2233,6 +2336,43 @@ int main(uint64_t, uint64_t) {
                 continue;
             }
             ClientDrain drain = drain_client_messages(windows[i]);
+            if (drain.close_request) {
+                bool was_background = windows[i].is_background;
+                descriptor_defs::FramebufferRect rect{};
+                if (window_rect(windows[i], info, rect)) {
+                    mark_dirty_rect(rect);
+                }
+                close_window(windows[i]);
+                if (was_background) {
+                    background_index = -1;
+                } else if (window_count > 0) {
+                    --window_count;
+                }
+                if (focus_index == static_cast<int>(i)) {
+                    focus_index = last_window_index(windows);
+                    if (focus_index < 0 &&
+                        background_index >= 0 &&
+                        background_index < static_cast<int>(kMaxWindows) &&
+                        windows[background_index].in_use) {
+                        focus_index = background_index;
+                    }
+                }
+                drag_index = -1;
+                force_full_redraw = true;
+                scene_dirty = true;
+                continue;
+            }
+            if (drain.focus_request) {
+                if (!windows[i].is_background) {
+                    focus_index = static_cast<int>(i);
+                    focus_index =
+                        bring_to_front(windows,
+                                       focus_index,
+                                       focus_index);
+                    scene_dirty = true;
+                    menu_bar_dirty = true;
+                }
+            }
             if (drain.present) {
                 descriptor_defs::FramebufferRect rect{};
                 if (window_rect(windows[i], info, rect)) {

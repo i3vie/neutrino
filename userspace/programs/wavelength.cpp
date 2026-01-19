@@ -69,6 +69,52 @@ void copy_string(char* dest, size_t dest_size, const char* src) {
     dest[i] = '\0';
 }
 
+bool string_equal_n(const char* left, const char* right, size_t max_len) {
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+    for (size_t i = 0; i < max_len; ++i) {
+        if (left[i] != right[i]) {
+            return false;
+        }
+        if (left[i] == '\0') {
+            return true;
+        }
+    }
+    return true;
+}
+
+bool menu_bar_equal(const wm::MenuBar& left, const wm::MenuBar& right) {
+    if (left.menu_count != right.menu_count) {
+        return false;
+    }
+    for (uint8_t i = 0; i < left.menu_count; ++i) {
+        const wm::Menu& left_menu = left.menus[i];
+        const wm::Menu& right_menu = right.menus[i];
+        if (!string_equal_n(left_menu.label,
+                            right_menu.label,
+                            wm::kMenuLabelSize)) {
+            return false;
+        }
+        if (left_menu.item_count != right_menu.item_count) {
+            return false;
+        }
+        for (uint8_t j = 0; j < left_menu.item_count; ++j) {
+            const wm::MenuItem& left_item = left_menu.items[j];
+            const wm::MenuItem& right_item = right_menu.items[j];
+            if (left_item.id != right_item.id) {
+                return false;
+            }
+            if (!string_equal_n(left_item.label,
+                                right_item.label,
+                                wm::kMenuItemLabelSize)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 uint32_t clamp_ui_scale(uint32_t value) {
     if (value == 0) {
         return 1;
@@ -599,7 +645,8 @@ int main(uint64_t, uint64_t) {
 
     Icon icons[] = {
         {"Ion", "binary/ion.elf", 0, 0, 'I'},
-        {"Orbital", "binary/orbital.elf", 2, 0, 'O'},
+        {"Orbital", "binary/orbital.elf", 30, 0, 'O'},
+        {"Flux", "binary/flux.elf", 60, 0, 'F'},
     };
     size_t icon_count = sizeof(icons) / sizeof(icons[0]);
 
@@ -617,8 +664,10 @@ int main(uint64_t, uint64_t) {
     for (size_t i = 0; i < icon_count; ++i) {
         uint32_t col = static_cast<uint32_t>(i) % columns;
         uint32_t row = static_cast<uint32_t>(i) / columns;
-        icons[i].x = origin_x + col * cell_width;
-        icons[i].y = origin_y + row * cell_height;
+        uint32_t offset_x = icons[i].x;
+        uint32_t offset_y = icons[i].y;
+        icons[i].x = origin_x + col * cell_width + offset_x;
+        icons[i].y = origin_y + row * cell_height + offset_y;
     }
 
     auto render_scene = [&]() {
@@ -662,6 +711,10 @@ int main(uint64_t, uint64_t) {
                       menu_y,
                       menu_bar.menus[i].label,
                       label_color);
+        }
+
+        for (size_t i = 0; i < icon_count; ++i) {
+            draw_icon(surface, icons[i], icon_fill, icon_border, label_color);
         }
 
         if (active_menu >= 0 &&
@@ -722,10 +775,6 @@ int main(uint64_t, uint64_t) {
                           menu.items[i].label,
                           label_color);
             }
-        }
-
-        for (size_t i = 0; i < icon_count; ++i) {
-            draw_icon(surface, icons[i], icon_fill, icon_border, label_color);
         }
     };
 
@@ -875,11 +924,18 @@ int main(uint64_t, uint64_t) {
                 lattice::copy_bytes(reinterpret_cast<uint8_t*>(&msg),
                                     buffer + offset,
                                     sizeof(msg));
-                copy_string(focused_title, sizeof(focused_title), msg.title);
-                menu_bar = msg.bar;
-                clamp_menu_bar(menu_bar);
-                active_menu = -1;
-                needs_redraw = true;
+                wm::MenuBar incoming = msg.bar;
+                clamp_menu_bar(incoming);
+                bool title_changed = !string_equal_n(focused_title,
+                                                     msg.title,
+                                                     sizeof(msg.title));
+                bool menu_changed = !menu_bar_equal(menu_bar, incoming);
+                if (title_changed || menu_changed) {
+                    copy_string(focused_title, sizeof(focused_title), msg.title);
+                    menu_bar = incoming;
+                    active_menu = -1;
+                    needs_redraw = true;
+                }
                 offset += sizeof(msg);
                 continue;
             }

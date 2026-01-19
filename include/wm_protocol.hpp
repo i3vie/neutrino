@@ -22,6 +22,8 @@ enum class ClientMessage : uint8_t {
     Present = 1,
     MenuUpdate = 2,
     MenuInvoke = 3,
+    Close = 4,
+    Focus = 5,
 };
 
 enum class ServerMessage : uint8_t {

@@ -88,7 +88,7 @@ struct FilePickerResult {
 
 class FilePicker {
 public:
-    static FilePickerResult open(const FilePickerParent& parent,
+    static FilePickerResult open(FilePickerParent parent,
                                  FilePickerMode mode);
 };
 

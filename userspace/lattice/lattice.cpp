@@ -206,6 +206,10 @@ constexpr uint32_t kPickerInputHeight = 16;
 constexpr uint32_t kPickerMaxEntries = 64;
 constexpr uint32_t kPickerMaxDepth = 8;
 constexpr uint32_t kPickerNameMax = 64;
+constexpr uint32_t kPickerWindowWidth = 420;
+constexpr uint32_t kPickerWindowHeight = 320;
+constexpr const char kRegistryName[] = "wm.registry";
+constexpr const char kPickerWindowTitle[] = "File Picker";
 constexpr uint32_t kInvalidFileHandle = 0xFFFFFFFFu;
 
 size_t string_length(const char* text) {
@@ -351,12 +355,48 @@ bool write_pipe_all(uint32_t handle, const void* data, size_t length) {
     return true;
 }
 
+bool read_pipe_exact(uint32_t handle, void* data, size_t length) {
+    if (data == nullptr || length == 0) {
+        return false;
+    }
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(data);
+    size_t offset = 0;
+    while (offset < length) {
+        long read = descriptor_read(handle, bytes + offset, length - offset);
+        if (read < 0) {
+            return false;
+        }
+        if (read == 0) {
+            yield();
+            continue;
+        }
+        offset += static_cast<size_t>(read);
+    }
+    return true;
+}
+
 void send_present(uint32_t handle) {
     if (handle == kInvalidFileHandle) {
         return;
     }
     uint8_t msg = static_cast<uint8_t>(wm::ClientMessage::Present);
     write_pipe_all(handle, &msg, sizeof(msg));
+}
+
+bool send_client_message(uint32_t handle, wm::ClientMessage type) {
+    if (handle == kInvalidFileHandle) {
+        return false;
+    }
+    uint8_t msg = static_cast<uint8_t>(type);
+    return write_pipe_all(handle, &msg, sizeof(msg));
+}
+
+void send_close_request(uint32_t handle) {
+    send_client_message(handle, wm::ClientMessage::Close);
+}
+
+void send_focus_request(uint32_t handle) {
+    send_client_message(handle, wm::ClientMessage::Focus);
 }
 
 struct PickerState {
@@ -458,7 +498,7 @@ bool file_exists(uint32_t dir_handle, const char* name) {
 
 }  // namespace
 
-FilePickerResult FilePicker::open(const FilePickerParent& parent,
+FilePickerResult FilePicker::open(FilePickerParent parent,
                                   FilePickerMode mode) {
     FilePickerResult result{};
     result.accepted = false;
@@ -482,6 +522,156 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
         unmap(entries, entries_bytes);
         return result;
     }
+
+    long registry_handle = -1;
+    long reply_pipe = -1;
+    long server_pipe = -1;
+    long shm_handle = -1;
+    descriptor_defs::SharedMemoryInfo shm_info{};
+    uint32_t present_handle = kInvalidDescriptor;
+
+    registry_handle = shared_memory_open(kRegistryName, sizeof(wm::Registry));
+    if (registry_handle < 0) {
+        unmap(entries, entries_bytes);
+        return result;
+    }
+    descriptor_defs::SharedMemoryInfo registry_info{};
+    if (shared_memory_get_info(static_cast<uint32_t>(registry_handle),
+                               &registry_info) != 0 ||
+        registry_info.base == 0 ||
+        registry_info.length < sizeof(wm::Registry)) {
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+    wm::Registry* registry =
+        reinterpret_cast<wm::Registry*>(registry_info.base);
+    while (registry->magic != wm::kRegistryMagic ||
+           registry->version != wm::kRegistryVersion ||
+           registry->server_pipe_id == 0) {
+        yield();
+    }
+
+    uint64_t reply_flags =
+        static_cast<uint64_t>(descriptor_defs::Flag::Readable) |
+        static_cast<uint64_t>(descriptor_defs::Flag::Async);
+    reply_pipe = pipe_open_new(reply_flags);
+    if (reply_pipe < 0) {
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+    descriptor_defs::PipeInfo reply_info{};
+    if (pipe_get_info(static_cast<uint32_t>(reply_pipe), &reply_info) != 0 ||
+        reply_info.id == 0) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+
+    uint64_t server_flags =
+        static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
+        static_cast<uint64_t>(descriptor_defs::Flag::Async);
+    server_pipe =
+        pipe_open_existing(server_flags, registry->server_pipe_id);
+    if (server_pipe < 0) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+
+    wm::CreateRequest request{};
+    request.type = static_cast<uint32_t>(wm::MessageType::CreateWindow);
+    request.reply_pipe_id = reply_info.id;
+    request.width = kPickerWindowWidth;
+    request.height = kPickerWindowHeight;
+    request.flags = 0;
+    copy_string(request.title, sizeof(request.title), kPickerWindowTitle);
+
+    if (!write_pipe_all(static_cast<uint32_t>(server_pipe),
+                        &request,
+                        sizeof(request))) {
+        descriptor_close(static_cast<uint32_t>(server_pipe));
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+    descriptor_close(static_cast<uint32_t>(server_pipe));
+
+    wm::CreateResponse response{};
+    if (!read_pipe_exact(static_cast<uint32_t>(reply_pipe),
+                         &response,
+                         sizeof(response)) ||
+        response.status != 0) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+
+    char shm_name[sizeof(response.shm_name) + 1];
+    for (size_t i = 0; i < sizeof(response.shm_name); ++i) {
+        shm_name[i] = response.shm_name[i];
+        if (response.shm_name[i] == '\0') {
+            break;
+        }
+    }
+    shm_name[sizeof(response.shm_name)] = '\0';
+
+    shm_handle = shared_memory_open(shm_name, 0);
+    if (shm_handle < 0) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+    if (shared_memory_get_info(static_cast<uint32_t>(shm_handle), &shm_info) != 0 ||
+        shm_info.base == 0 || shm_info.length == 0) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(shm_handle));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+
+    uint32_t bytes_per_pixel = (response.format.bpp + 7u) / 8u;
+    if (bytes_per_pixel == 0 || bytes_per_pixel > 4) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+        descriptor_close(static_cast<uint32_t>(shm_handle));
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+        unmap(entries, entries_bytes);
+        return result;
+    }
+
+    if (response.out_pipe_id != 0) {
+        uint64_t present_flags =
+            static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
+            static_cast<uint64_t>(descriptor_defs::Flag::Async);
+        long handle =
+            pipe_open_existing(present_flags, response.out_pipe_id);
+        if (handle >= 0) {
+            present_handle = static_cast<uint32_t>(handle);
+        }
+    }
+
+    parent.buffer = reinterpret_cast<uint8_t*>(shm_info.base);
+    parent.width = response.width;
+    parent.height = response.height;
+    parent.stride = response.stride;
+    parent.bytes_per_pixel = bytes_per_pixel;
+    parent.format = response.format;
+    parent.reply_handle = static_cast<uint32_t>(reply_pipe);
+    parent.present_handle = present_handle;
+
+    auto request_focus_once = [&]() {
+        if (parent.present_handle != kInvalidDescriptor) {
+            send_focus_request(parent.present_handle);
+        }
+    };
+    request_focus_once();
 
     uint32_t bg = pack_color(parent.format, 18, 20, 26);
     uint32_t panel = pack_color(parent.format, 26, 30, 38);
@@ -878,11 +1068,27 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
     uint8_t buffer[256];
     size_t pending = 0;
 
+    bool closing_requested = false;
+    auto request_close_once = [&]() {
+        if (!closing_requested && parent.present_handle != kInvalidDescriptor) {
+            send_close_request(parent.present_handle);
+            closing_requested = true;
+        }
+    };
+    auto finish_picker = [&](bool accepted, uint32_t handle) {
+        result.accepted = accepted;
+        result.handle = handle;
+        request_close_once();
+    };
+
     while (true) {
-        if (needs_redraw) {
+        if (needs_redraw && !closing_requested) {
             render();
             send_present(parent.present_handle);
             needs_redraw = false;
+        }
+        if (!closing_requested) {
+            request_focus_once();
         }
 
         long read = descriptor_read(parent.reply_handle,
@@ -896,11 +1102,11 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
         while (offset < pending) {
             uint8_t type = buffer[offset];
             if (type == static_cast<uint8_t>(wm::ServerMessage::Close)) {
-                directory_close(state.dir_handle);
-                unmap(entries, entries_bytes);
-                result.accepted = false;
-                result.handle = kInvalidFileHandle;
-                return result;
+                if (!closing_requested) {
+                    result.accepted = false;
+                    result.handle = kInvalidFileHandle;
+                }
+                goto picker_exit;
             }
             if (type == static_cast<uint8_t>(wm::ServerMessage::Mouse)) {
                 if (pending - offset < sizeof(wm::ServerMouseMessage)) {
@@ -960,13 +1166,12 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                                           kPickerButtonHeight)) {
                             long handle = file_create_at(state.dir_handle,
                                                          state.filename);
-                            directory_close(state.dir_handle);
-                            unmap(entries, entries_bytes);
-                            result.accepted = handle >= 0;
-                            result.handle = (handle >= 0)
-                                ? static_cast<uint32_t>(handle)
-                                : kInvalidFileHandle;
-                            return result;
+                            uint32_t handle_id =
+                                (handle >= 0)
+                                    ? static_cast<uint32_t>(handle)
+                                    : kInvalidFileHandle;
+                            finish_picker(handle >= 0, handle_id);
+                            continue;
                         }
                         if (point_in_rect(msg.x, msg.y,
                                           no_x,
@@ -1028,11 +1233,8 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                                       button_y,
                                       kPickerButtonWidth,
                                       kPickerButtonHeight)) {
-                        directory_close(state.dir_handle);
-                        unmap(entries, entries_bytes);
-                        result.accepted = false;
-                        result.handle = kInvalidFileHandle;
-                        return result;
+                        finish_picker(false, kInvalidFileHandle);
+                        continue;
                     }
 
                     bool can_accept = false;
@@ -1055,13 +1257,11 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                                 state.entries[static_cast<size_t>(state.selected)];
                             long handle = file_open_at(state.dir_handle,
                                                        entry.name);
-                            directory_close(state.dir_handle);
-                            unmap(entries, entries_bytes);
-                            result.accepted = handle >= 0;
-                            result.handle = (handle >= 0)
-                                ? static_cast<uint32_t>(handle)
-                                : kInvalidFileHandle;
-                            return result;
+                            uint32_t handle_id =
+                                (handle >= 0)
+                                    ? static_cast<uint32_t>(handle)
+                                    : kInvalidFileHandle;
+                            finish_picker(handle >= 0, handle_id);
                         } else {
                             if (file_exists(state.dir_handle, state.filename)) {
                                 state.confirm_overwrite = true;
@@ -1069,13 +1269,11 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                             } else {
                                 long handle = file_create_at(state.dir_handle,
                                                              state.filename);
-                                directory_close(state.dir_handle);
-                                unmap(entries, entries_bytes);
-                                result.accepted = handle >= 0;
-                                result.handle = (handle >= 0)
-                                    ? static_cast<uint32_t>(handle)
-                                    : kInvalidFileHandle;
-                                return result;
+                                uint32_t handle_id =
+                                    (handle >= 0)
+                                        ? static_cast<uint32_t>(handle)
+                                        : kInvalidFileHandle;
+                                finish_picker(handle >= 0, handle_id);
                             }
                         }
                         continue;
@@ -1110,13 +1308,11 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                                event.scancode == 0x1C) {
                         long handle = file_create_at(state.dir_handle,
                                                      state.filename);
-                        directory_close(state.dir_handle);
-                        unmap(entries, entries_bytes);
-                        result.accepted = handle >= 0;
-                        result.handle = (handle >= 0)
-                            ? static_cast<uint32_t>(handle)
-                            : kInvalidFileHandle;
-                        return result;
+                        uint32_t handle_id =
+                            (handle >= 0)
+                                ? static_cast<uint32_t>(handle)
+                                : kInvalidFileHandle;
+                        finish_picker(handle >= 0, handle_id);
                     }
                     continue;
                 }
@@ -1139,11 +1335,8 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
 
                 if (!keyboard::is_extended(event) &&
                     event.scancode == 0x01) {
-                    directory_close(state.dir_handle);
-                    unmap(entries, entries_bytes);
-                    result.accepted = false;
-                    result.handle = kInvalidFileHandle;
-                    return result;
+                    finish_picker(false, kInvalidFileHandle);
+                    continue;
                 }
 
                 if (mode == FilePickerMode::Save) {
@@ -1170,13 +1363,11 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                             } else {
                                 long handle = file_create_at(state.dir_handle,
                                                              state.filename);
-                                directory_close(state.dir_handle);
-                                unmap(entries, entries_bytes);
-                                result.accepted = handle >= 0;
-                                result.handle = (handle >= 0)
-                                    ? static_cast<uint32_t>(handle)
-                                    : kInvalidFileHandle;
-                                return result;
+                                uint32_t handle_id =
+                                    (handle >= 0)
+                                        ? static_cast<uint32_t>(handle)
+                                        : kInvalidFileHandle;
+                                finish_picker(handle >= 0, handle_id);
                             }
                         }
                     }
@@ -1199,13 +1390,11 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
                         } else {
                             long handle = file_open_at(state.dir_handle,
                                                        entry.name);
-                            directory_close(state.dir_handle);
-                            unmap(entries, entries_bytes);
-                            result.accepted = handle >= 0;
-                            result.handle = (handle >= 0)
-                                ? static_cast<uint32_t>(handle)
-                                : kInvalidFileHandle;
-                            return result;
+                            uint32_t handle_id =
+                                (handle >= 0)
+                                    ? static_cast<uint32_t>(handle)
+                                    : kInvalidFileHandle;
+                            finish_picker(handle >= 0, handle_id);
                         }
                     }
                 }
@@ -1226,6 +1415,28 @@ FilePickerResult FilePicker::open(const FilePickerParent& parent,
 
         yield();
     }
+
+picker_exit:
+    if (state.dir_handle != kInvalidFileHandle) {
+        directory_close(state.dir_handle);
+    }
+    unmap(entries, entries_bytes);
+    if (parent.buffer != nullptr && shm_info.length > 0) {
+        unmap(parent.buffer, static_cast<size_t>(shm_info.length));
+    }
+    if (present_handle != kInvalidDescriptor) {
+        descriptor_close(present_handle);
+    }
+    if (reply_pipe >= 0) {
+        descriptor_close(static_cast<uint32_t>(reply_pipe));
+    }
+    if (shm_handle >= 0) {
+        descriptor_close(static_cast<uint32_t>(shm_handle));
+    }
+    if (registry_handle >= 0) {
+        descriptor_close(static_cast<uint32_t>(registry_handle));
+    }
+    return result;
 }
 
 }  // namespace lattice
