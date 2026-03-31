@@ -7,6 +7,7 @@
 #include "descriptor.hpp"
 #include "fs/vfs.hpp"
 #include "path_util.hpp"
+#include "capabilities.hpp"
 #include "vm.hpp"
 
 namespace process {
@@ -54,18 +55,24 @@ struct Process {
     bool has_exited;
     bool console_transferred;
     bool has_context;
+    bool is_kernel_task;
+    void (*kernel_entry)(Process&);
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
     uint32_t vty_id;
     char cwd[128];
     descriptor::Table descriptors;
+    capabilities::Principal* principal;
+    capabilities::CapHandleEntry cap_handles[capabilities::kMaxProcessCapabilities];
     FileHandle file_handles[kMaxFileHandles];
     DirectoryHandle directory_handles[kMaxDirectoryHandles];
 };
 
 void init();
 Process* allocate();
+Process* allocate_kernel_task(void (*entry)(Process&));
 Process* current();
 void set_current(Process* proc);
 Process* table_entry(size_t index);
+Process* find_by_pid(uint32_t pid);
 
 }  // namespace process

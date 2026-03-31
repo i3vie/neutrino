@@ -42,6 +42,10 @@ constexpr uint32_t kTypeSharedMemory =
     static_cast<uint32_t>(descriptor_defs::Type::SharedMemory);
 constexpr uint32_t kTypeVty =
     static_cast<uint32_t>(descriptor_defs::Type::Vty);
+constexpr uint32_t kTypeCpuStats =
+    static_cast<uint32_t>(descriptor_defs::Type::CpuStats);
+constexpr uint32_t kTypeNetDevice =
+    static_cast<uint32_t>(descriptor_defs::Type::NetDevice);
 
 constexpr int64_t kWouldBlock = -2;
 
@@ -198,6 +202,10 @@ uint32_t open_kernel(uint32_t type,
                      uint64_t arg0,
                      uint64_t arg1,
                      uint64_t arg2);
+
+// Drives progress for asynchronous block I/O requests.
+void service_block_io();
+void start_block_io_worker();
 int64_t read_kernel(uint32_t handle,
                     void* buffer,
                     uint64_t length,

@@ -10,6 +10,14 @@ namespace {
 
 constexpr size_t kBufferSize = 256;
 constexpr size_t kInputSlots = 6;
+constexpr uint16_t kDataPort = 0x60;
+constexpr uint16_t kStatusPort = 0x64;
+
+constexpr uint8_t kStatusOutputFull = 1u << 0;
+constexpr uint8_t kStatusInputFull = 1u << 1;
+
+constexpr uint8_t kCommandReadConfig = 0x20;
+constexpr uint8_t kCommandWriteConfig = 0x60;
 
 struct SlotBuffer {
     descriptor_defs::KeyboardEvent data[kBufferSize];
@@ -29,6 +37,45 @@ bool g_left_alt_down = false;
 bool g_right_ctrl_down = false;
 bool g_right_alt_down = false;
 bool g_extended_pending = false;
+
+bool wait_input_clear() {
+    for (size_t i = 0; i < 100000; ++i) {
+        if ((inb(kStatusPort) & kStatusInputFull) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool wait_output_full() {
+    for (size_t i = 0; i < 100000; ++i) {
+        if ((inb(kStatusPort) & kStatusOutputFull) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void write_command(uint8_t cmd) {
+    if (!wait_input_clear()) {
+        return;
+    }
+    outb(kStatusPort, cmd);
+}
+
+void write_data(uint8_t data) {
+    if (!wait_input_clear()) {
+        return;
+    }
+    outb(kDataPort, data);
+}
+
+uint8_t read_data() {
+    if (!wait_output_full()) {
+        return 0;
+    }
+    return inb(kDataPort);
+}
 
 void enqueue(uint32_t slot, const descriptor_defs::KeyboardEvent& event) {
     if (slot >= kInputSlots) {
@@ -161,16 +208,23 @@ void init() {
     g_extended_pending = false;
     g_initialized = true;
 
+    write_command(kCommandReadConfig);
+    uint8_t config = read_data();
+    config |= (1u << 0);   // enable IRQ1
+    config &= ~(1u << 4);  // enable keyboard clock
+    write_command(kCommandWriteConfig);
+    write_data(config);
+
     pic::set_mask(1, false);
 }
 
 void handle_irq() {
-    uint8_t status = inb(0x64);
-    if ((status & 0x01) == 0) {
+    uint8_t status = inb(kStatusPort);
+    if ((status & kStatusOutputFull) == 0) {
         return;
     }
 
-    uint8_t scancode = inb(0x60);
+    uint8_t scancode = inb(kDataPort);
 
     if (scancode == 0xE0 || scancode == 0xE1) {
         g_extended_pending = true;

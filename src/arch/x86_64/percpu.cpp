@@ -48,6 +48,10 @@ Cpu* register_cpu(uint32_t lapic_id, uint32_t processor_id) {
     cpu.index = static_cast<uint32_t>(g_cpu_count - 1);
     cpu.registered = false;
     cpu.current_process = nullptr;
+    cpu.user_ticks = 0;
+    cpu.kernel_ticks = 0;
+    cpu.idle_ticks = 0;
+    cpu.irq_ticks = 0;
     return &cpu;
 }
 
@@ -103,6 +107,53 @@ void set_current_process(process::Process* proc) {
 process::Process* get_current_process() {
     Cpu* cpu = current_cpu();
     return cpu ? cpu->current_process : nullptr;
+}
+
+void record_tick(bool user_mode, bool has_process) {
+    Cpu* cpu = current_cpu();
+    if (cpu == nullptr) {
+        return;
+    }
+    if (!has_process) {
+        ++cpu->idle_ticks;
+        return;
+    }
+    if (user_mode) {
+        ++cpu->user_ticks;
+    } else {
+        ++cpu->kernel_ticks;
+    }
+}
+
+void record_irq() {
+    Cpu* cpu = current_cpu();
+    if (cpu == nullptr) {
+        return;
+    }
+    ++cpu->irq_ticks;
+}
+
+size_t usage_snapshot(descriptor_defs::CpuUsage* out, size_t max_entries) {
+    if (out == nullptr || max_entries == 0) {
+        return 0;
+    }
+    size_t count = cpu_count();
+    if (count > max_entries) {
+        count = max_entries;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        Cpu* cpu = cpu_from_index(i);
+        if (cpu == nullptr) {
+            continue;
+        }
+        out[i].cpu_index = static_cast<uint32_t>(i);
+        out[i].reserved = 0;
+        out[i].user_ticks = cpu->user_ticks;
+        out[i].kernel_ticks = cpu->kernel_ticks;
+        out[i].idle_ticks = cpu->idle_ticks;
+        out[i].irq_ticks = cpu->irq_ticks;
+    }
+    return count;
 }
 
 }  // namespace percpu

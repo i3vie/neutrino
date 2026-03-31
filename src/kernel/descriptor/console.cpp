@@ -4,8 +4,77 @@
 #include "../process.hpp"
 
 namespace descriptor {
+int vty_set_property(uint32_t id,
+                     uint32_t property,
+                     const void* in,
+                     size_t size);
+}
+
+namespace descriptor {
 
 namespace console_descriptor {
+
+int console_set_property(DescriptorEntry& entry,
+                         uint32_t property,
+                         const void* in,
+                         size_t size) {
+    auto* console = static_cast<Console*>(entry.object);
+    if (console == nullptr) {
+        return -1;
+    }
+    uint32_t vty_id = 0;
+    if (entry.subsystem_data != nullptr) {
+        vty_id = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(entry.subsystem_data));
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleCursor)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::CursorPosition)) {
+            return -1;
+        }
+        auto* pos =
+            reinterpret_cast<const descriptor_defs::CursorPosition*>(in);
+        console->set_cursor(pos->x, pos->y);
+        if (vty_id != 0) {
+            return vty_set_property(
+                vty_id,
+                static_cast<uint32_t>(descriptor_defs::Property::VtyCursor),
+                in,
+                size);
+        }
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleClear)) {
+        console->clear();
+        if (vty_id != 0) {
+            return vty_set_property(
+                vty_id,
+                static_cast<uint32_t>(descriptor_defs::Property::VtyClear),
+                nullptr,
+                0);
+        }
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleColor)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::ColorPair)) {
+            return -1;
+        }
+        auto* colors =
+            reinterpret_cast<const descriptor_defs::ColorPair*>(in);
+        console->set_color(colors->fg, colors->bg);
+        if (vty_id != 0) {
+            return vty_set_property(
+                vty_id,
+                static_cast<uint32_t>(descriptor_defs::Property::VtyColor),
+                in,
+                size);
+        }
+        return 0;
+    }
+    return -1;
+}
 
 int64_t console_read(process::Process&,
                      DescriptorEntry&,
@@ -51,7 +120,7 @@ const Ops kConsoleOps{
     .read = console_read,
     .write = console_write,
     .get_property = nullptr,
-    .set_property = nullptr,
+    .set_property = console_set_property,
 };
 
 process::Process* g_console_owner = nullptr;
@@ -79,6 +148,8 @@ bool open_console(process::Process& proc,
         alloc.object = kconsole;
         alloc.close = nullptr;
         alloc.name = "console";
+        alloc.subsystem_data =
+            reinterpret_cast<void*>(static_cast<uintptr_t>(proc.vty_id));
         alloc.ops = &kConsoleOps;
         return true;
     }

@@ -30,6 +30,8 @@ public:
     void puts(const char* s);
     void printf(const char* fmt, ...);
     void clear();
+    void set_cursor(size_t x, size_t y);
+    void get_dimensions(size_t& out_cols, size_t& out_rows) const;
 
     void set_color(uint32_t fg, uint32_t bg);
 

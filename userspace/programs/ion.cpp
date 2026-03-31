@@ -27,6 +27,7 @@ struct Terminal {
     uint32_t height;
     uint32_t stride;
     uint32_t bytes_per_pixel;
+    wm::PixelFormat format;
     uint32_t cols;
     uint32_t rows;
     uint32_t scale;
@@ -40,6 +41,8 @@ struct Terminal {
     uint32_t bg;
     uint32_t cursor;
 };
+
+uint32_t pack_from_argb(const wm::PixelFormat& fmt, uint32_t argb);
 
 size_t str_len(const char* text) {
     size_t len = 0;
@@ -196,7 +199,10 @@ void clear_screen(const Terminal& term) {
         return;
     }
     uint8_t pixel_bytes[4] = {0, 0, 0, 0};
-    lattice::store_pixel(pixel_bytes, term.bytes_per_pixel, term.bg);
+    lattice::store_pixel(
+        pixel_bytes,
+        term.bytes_per_pixel,
+        pack_from_argb(term.format, term.bg));
     for (uint32_t y = 0; y < term.height; ++y) {
         uint8_t* row = term.buffer + static_cast<size_t>(y) * term.stride;
         for (uint32_t x = 0; x < term.width; ++x) {
@@ -208,10 +214,19 @@ void clear_screen(const Terminal& term) {
     }
 }
 
+uint32_t pack_from_argb(const wm::PixelFormat& fmt, uint32_t argb) {
+    uint8_t r = static_cast<uint8_t>((argb >> 16) & 0xFF);
+    uint8_t g = static_cast<uint8_t>((argb >> 8) & 0xFF);
+    uint8_t b = static_cast<uint8_t>(argb & 0xFF);
+    return lattice::pack_color(fmt, r, g, b);
+}
+
 void draw_glyph(const Terminal& term,
                 uint32_t cell_x,
                 uint32_t cell_y,
-                char ch) {
+                char ch,
+                uint32_t fg,
+                uint32_t bg) {
     if (term.buffer == nullptr) {
         return;
     }
@@ -225,6 +240,10 @@ void draw_glyph(const Terminal& term,
     uint32_t base_x = term.padding_x + cell_x * term.cell_width;
     uint32_t base_y = cell_y * term.cell_height;
     uint32_t scale = term.scale;
+
+    uint32_t packed_fg = pack_from_argb(term.format, fg);
+    uint32_t packed_bg = pack_from_argb(term.format, bg);
+
     for (uint32_t row = 0; row < kFontHeight; ++row) {
         uint8_t bits = font8x8_basic[uc][row];
         for (uint32_t sy = 0; sy < scale; ++sy) {
@@ -244,7 +263,7 @@ void draw_glyph(const Terminal& term,
                                          term.bytes_per_pixel,
                                          px,
                                          py,
-                                         on ? term.fg : term.bg);
+                                         on ? packed_fg : packed_bg);
                 }
             }
         }
@@ -265,6 +284,7 @@ void draw_cursor(const Terminal& term, uint32_t cell_x, uint32_t cell_y) {
         cursor_height = term.glyph_height;
     }
     uint32_t start_y = base_y + term.glyph_height - cursor_height;
+    uint32_t packed_cursor = pack_from_argb(term.format, term.cursor);
     for (uint32_t row = 0; row < cursor_height; ++row) {
         uint32_t py = start_y + row;
         if (py >= term.height) {
@@ -280,7 +300,7 @@ void draw_cursor(const Terminal& term, uint32_t cell_x, uint32_t cell_y) {
                                  term.bytes_per_pixel,
                                  px,
                                  py,
-                                 term.cursor);
+                                 packed_cursor);
         }
     }
 }
@@ -314,7 +334,14 @@ bool update_vty(const Terminal& term,
             for (uint32_t col = 0; col < term.cols; ++col) {
                 size_t idx = base + col;
                 const auto& cell = cells[idx];
-                draw_glyph(term, col, row, static_cast<char>(cell.ch));
+                uint32_t fg = cell.fg ? cell.fg : term.fg;
+                uint32_t bg = cell.bg ? cell.bg : term.bg;
+                draw_glyph(term,
+                           col,
+                           row,
+                           static_cast<char>(cell.ch),
+                           fg,
+                           bg);
                 prev_cells[idx] = cell;
             }
         }
@@ -333,7 +360,14 @@ bool update_vty(const Terminal& term,
         prev_cursor_y < term.rows &&
         cursor_moved) {
         const auto& cell = cells[prev_cursor_y * term.cols + prev_cursor_x];
-        draw_glyph(term, prev_cursor_x, prev_cursor_y, static_cast<char>(cell.ch));
+        uint32_t fg = cell.fg ? cell.fg : term.fg;
+        uint32_t bg = cell.bg ? cell.bg : term.bg;
+        draw_glyph(term,
+                   prev_cursor_x,
+                   prev_cursor_y,
+                   static_cast<char>(cell.ch),
+                   fg,
+                   bg);
         changed = true;
     }
 
@@ -343,7 +377,14 @@ bool update_vty(const Terminal& term,
             size_t idx = base + col;
             const auto& cell = cells[idx];
             if (!cells_equal(cell, prev_cells[idx])) {
-                draw_glyph(term, col, row, static_cast<char>(cell.ch));
+                uint32_t fg = cell.fg ? cell.fg : term.fg;
+                uint32_t bg = cell.bg ? cell.bg : term.bg;
+                draw_glyph(term,
+                           col,
+                           row,
+                           static_cast<char>(cell.ch),
+                           fg,
+                           bg);
                 prev_cells[idx] = cell;
                 changed = true;
             }
@@ -655,6 +696,7 @@ int main(uint64_t arg, uint64_t) {
         term.stride = term.width * bytes_per_pixel;
     }
     term.bytes_per_pixel = bytes_per_pixel;
+    term.format = response.format;
     term.cols = cols;
     term.rows = rows;
     term.scale = scale;
@@ -664,9 +706,9 @@ int main(uint64_t arg, uint64_t) {
     term.glyph_height = glyph_height;
     term.cursor_height = cursor_height;
     term.padding_x = kTextPaddingX;
-    term.fg = lattice::pack_color(response.format, 230, 230, 230);
-    term.bg = lattice::pack_color(response.format, 16, 18, 24);
-    term.cursor = lattice::pack_color(response.format, 128, 220, 128);
+    term.fg = 0xFFE6E6E6;
+    term.bg = 0xFF101218;
+    term.cursor = 0xFF80DC80;
 
     size_t cell_bytes =
         static_cast<size_t>(cols) * rows * sizeof(descriptor_defs::VtyCell);

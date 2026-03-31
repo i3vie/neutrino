@@ -275,6 +275,22 @@ void Console::present() {
     flush_all();
 }
 
+void Console::get_dimensions(size_t& out_cols, size_t& out_rows) const {
+    out_cols = columns;
+    out_rows = rows;
+}
+
+void Console::set_cursor(size_t x, size_t y) {
+    if (x >= columns) {
+        x = columns ? columns - 1 : 0;
+    }
+    if (y >= rows) {
+        y = rows ? rows - 1 : 0;
+    }
+    cursor_x = x;
+    cursor_y = y;
+}
+
 bool Console::refresh_framebuffer_info() {
     descriptor_defs::FramebufferInfo info{};
     int result = descriptor::get_property_kernel(

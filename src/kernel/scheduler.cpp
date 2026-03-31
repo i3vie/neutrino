@@ -10,6 +10,7 @@
 #include "userspace.hpp"
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/smp.hpp"
+#include "descriptor.hpp"
 
 namespace {
 
@@ -257,8 +258,22 @@ void enqueue(process::Process* proc) {
             next = pop_locked();
         }
         if (next == nullptr) {
+            process::set_current(nullptr);
             asm volatile("pause");
             asm volatile("sti; hlt");
+            continue;
+        }
+        if (next->is_kernel_task) {
+            process::set_current(next);
+            set_rsp0(next->kernel_stack_top);
+            asm volatile("sti");
+            if (next->kernel_entry != nullptr) {
+                next->kernel_entry(*next);
+            }
+            if (next->state == process::State::Ready) {
+                QueueGuard guard;
+                enqueue_locked(next);
+            }
             continue;
         }
         if (next->state == process::State::Terminated) {
@@ -305,8 +320,31 @@ void reschedule(syscall::SyscallFrame& frame) {
         }
 
         next = pop_locked();
-        while (next != nullptr && next->state == process::State::Terminated) {
+        while (next != nullptr &&
+               (next->state == process::State::Terminated)) {
             next = pop_locked();
+        }
+    }
+
+    // Run any ready kernel tasks immediately (they have no userspace frame)
+    while (next != nullptr && next->is_kernel_task) {
+        process::set_current(next);
+        set_rsp0(next->kernel_stack_top);
+        if (next->kernel_entry != nullptr) {
+            next->kernel_entry(*next);
+        }
+        if (next->state == process::State::Ready) {
+            QueueGuard guard;
+            enqueue_locked(next);
+        }
+        // fetch another runnable task (prefer userspace)
+        {
+            QueueGuard guard;
+            next = pop_locked();
+            while (next != nullptr &&
+                   (next->state == process::State::Terminated)) {
+                next = pop_locked();
+            }
         }
     }
 
@@ -333,17 +371,13 @@ void reschedule_from_interrupt(InterruptFrame& frame) {
 }
 
 void tick(InterruptFrame& frame) {
+    descriptor::service_block_io();
     if ((frame.cs & 0x3) != 0) {
         scheduler::reschedule_from_interrupt(frame);
-    } else {
-        process::Process* cur = process::current();
-        if (cur == nullptr) {
-            return;
-        }
-        syscall::SyscallFrame state{};
-        prepare_frame_for_process(*cur, state);
-        reschedule(state);
+        return;
     }
+    // If we interrupted kernel mode, avoid clobbering the kernel frame; the
+    // async I/O worker still makes progress above.
 }
 
 [[noreturn]] void run_cpu() {

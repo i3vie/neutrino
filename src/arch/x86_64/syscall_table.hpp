@@ -40,6 +40,13 @@ enum class SystemCall : uint64_t {
     DirectoryOpenAt       = 30,
     FileOpenAt            = 31,
     FileCreateAt          = 32,
+    PrincipalCreate       = 33,
+    PrincipalSet          = 34,
+    CapabilityGrant       = 35,
+    CapabilityPass        = 36,
+    UserCreate            = 37,
+    UserFind              = 38,
+    UserBumpGeneration    = 39,
 };
 
 Result handle_syscall(SyscallFrame& frame);

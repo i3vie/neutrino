@@ -15,6 +15,8 @@ enum class Type : uint16_t {
     Pipe        = 0x030,
     SharedMemory = 0x040,
     Vty         = 0x050,
+    CpuStats    = 0x060,
+    NetDevice   = 0x070,
 };
 
 enum class Flag : uint64_t {
@@ -30,6 +32,9 @@ enum class Flag : uint64_t {
 
 enum class Property : uint32_t {
     CommonName        = 0x00000001,
+    ConsoleCursor     = 0x00000002,
+    ConsoleClear      = 0x00000003,
+    ConsoleColor      = 0x00000004,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     BlockGeometry     = 0x00020001,
@@ -38,6 +43,12 @@ enum class Property : uint32_t {
     VtyInfo           = 0x00050001,
     VtyCells          = 0x00050002,
     VtyInjectInput    = 0x00050003,
+    VtyCursor         = 0x00050004,
+    VtyClear          = 0x00050005,
+    VtyColor          = 0x00050006,
+    NetDeviceInfo     = 0x00060001,
+    NetIpv4Config     = 0x00060002,
+    NetDeviceDebug    = 0x00060003,
 };
 
 enum KeyboardEventFlag : uint8_t {
@@ -106,6 +117,11 @@ struct MouseEvent {
     uint8_t reserved;
 };
 
+struct ColorPair {
+    uint32_t fg;
+    uint32_t bg;
+};
+
 enum class VtyOpen : uint64_t {
     Attach = 1ull << 0,
 };
@@ -121,10 +137,69 @@ struct VtyInfo {
 };
 
 struct VtyCell {
+    uint32_t fg;
+    uint32_t bg;
     uint8_t ch;
-    uint8_t fg;
-    uint8_t bg;
     uint8_t flags;
+    uint8_t reserved[2];
+};
+
+struct CursorPosition {
+    uint32_t x;
+    uint32_t y;
+};
+
+struct CpuUsage {
+    uint32_t cpu_index;
+    uint32_t reserved;
+    uint64_t user_ticks;
+    uint64_t kernel_ticks;
+    uint64_t idle_ticks;
+    uint64_t irq_ticks;
+};
+
+enum NetDeviceInfoFlag : uint32_t {
+    kNetDeviceFlagUp = 1u << 0,
+    kNetDeviceFlagIpv4Configured = 1u << 1,
+    kNetDeviceFlagRawEthernet = 1u << 2,
+};
+
+enum NetIpv4ConfigFlag : uint32_t {
+    kNetIpv4FlagEnabled = 1u << 0,
+    kNetIpv4FlagDhcp = 1u << 1,
+};
+
+struct NetDeviceInfo {
+    uint32_t index;
+    uint32_t flags;
+    uint32_t rx_queued;
+    uint16_t mtu;
+    uint16_t reserved0;
+    uint8_t mac[6];
+    uint8_t reserved1[2];
+};
+
+struct NetIpv4Config {
+    uint8_t address[4];
+    uint8_t netmask[4];
+    uint8_t gateway[4];
+    uint8_t reserved[4];
+    uint32_t flags;
+};
+
+struct NetDeviceDebug {
+    uint32_t status;
+    uint32_t rctl;
+    uint32_t tctl;
+    uint32_t rdh;
+    uint32_t rdt;
+    uint32_t tdh;
+    uint32_t tdt;
+    uint32_t tx_submitted;
+    uint32_t tx_completed;
+    uint32_t rx_desc_seen;
+    uint32_t rx_frames_passed;
+    uint32_t reserved;
 };
 
 }  // namespace descriptor_defs

@@ -3,15 +3,19 @@
 #include <stdint.h>
 
 #include "../drivers/console/console.hpp"
+#include "../drivers/driver_registry.hpp"
 #include "../drivers/fs/mount_manager.hpp"
 #include "../drivers/input/keyboard.hpp"
 #include "../drivers/input/mouse.hpp"
 #include "../drivers/interrupts/pic.hpp"
 #include "../drivers/limine/limine_requests.hpp"
 #include "../drivers/log/logging.hpp"
+#include "../drivers/net/e1000e.hpp"
+#include "../drivers/net/virtio_net.hpp"
 #include "../drivers/pci/pci.hpp"
 #include "../drivers/timer/pit.hpp"
 #include "../fs/vfs.hpp"
+#include "../net/network.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/idt.hpp"
 #include "arch/x86_64/io.hpp"
@@ -25,6 +29,8 @@
 #include "arch/x86_64/tss.hpp"
 #include "config.hpp"
 #include "descriptor.hpp"
+#include "capabilities.hpp"
+#include "users.hpp"
 #include "error.hpp"
 #include "loader.hpp"
 #include "memory/physical_allocator.hpp"
@@ -219,6 +225,9 @@ static void kernel_main_stage2() {
 
     descriptor::init();
     descriptor::register_builtin_types();
+    capabilities::init();
+    users::init();
+    users::load_from_disk();
 
     descriptor::register_framebuffer_device(framebuffer, fb_phys_addr);
     uint32_t framebuffer_handle =
@@ -340,17 +349,23 @@ static void kernel_main_stage2() {
             static_cast<unsigned long long>(fb_length));
     }
 
-    log_message(LogLevel::Info, "Initializing PCI subsystem");
-    pci::init();
-    log_message(LogLevel::Info, "PCI subsystem initialized");
-
-    vfs::init();
-
     const char* cmdline = nullptr;
     if (cmdline_request.response != nullptr &&
         cmdline_request.response->cmdline != nullptr) {
         cmdline = cmdline_request.response->cmdline;
     }
+
+    net::init(cmdline);
+
+    log_message(LogLevel::Info, "Initializing PCI subsystem");
+    pci::init();
+    log_message(LogLevel::Info, "PCI subsystem initialized");
+
+    virtio_net::register_driver();
+    e1000e::register_driver();
+    driver_registry::probe_pci_drivers();
+
+    vfs::init();
 
     constexpr size_t kMaxCmdline = 256;
     constexpr size_t kMaxMountSpecs = 16;
@@ -448,6 +463,21 @@ static void kernel_main_stage2() {
     char boot_mount_name[64] = {0};
     if (root_ptr != nullptr && root_ok) {
         string_util::copy(boot_mount_name, sizeof(boot_mount_name), root_ptr);
+        // Configure user storage path under the root mount.
+        char user_path[128];
+        user_path[0] = '\0';
+        string_util::copy(user_path, sizeof(user_path), root_ptr);
+        size_t len = string_util::length(user_path);
+        if (len + 1 < sizeof(user_path)) {
+            user_path[len++] = '/';
+            const char suffix[] = "system/users.ntd";
+            string_util::copy(user_path + len,
+                              sizeof(user_path) - len,
+                              suffix);
+            users::set_storage_path(user_path);
+        }
+
+        net::load_config(root_ptr);
     }
     char boot_cwd[128];
     boot_cwd[0] = '/';
@@ -576,6 +606,7 @@ static void kernel_main_stage2() {
 
     process::init();
     scheduler::init();
+    descriptor::start_block_io_worker();
 
     constexpr size_t kInitMaxSize = 64 * 1024;
     alignas(16) static uint8_t init_buffer[kInitMaxSize];

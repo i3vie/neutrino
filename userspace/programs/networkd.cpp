@@ -1,0 +1,565 @@
+#include <stddef.h>
+#include <stdint.h>
+
+#include "../crt/syscall.hpp"
+#include "../net/ipv4.hpp"
+#include "../net/network_protocol.hpp"
+#include "../net/udp.hpp"
+
+namespace {
+
+constexpr size_t kMaxBindings = 16;
+constexpr size_t kMaxArpEntries = 16;
+constexpr size_t kMaxPendingPings = 8;
+constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+struct ArpEntry {
+    bool in_use;
+    uint8_t ip[4];
+    uint8_t mac[6];
+};
+
+struct PendingPing {
+    bool in_use;
+    uint16_t identifier;
+    uint16_t sequence;
+    uint32_t pipe_handle;
+};
+
+struct Binding {
+    bool in_use;
+    uint16_t port;
+    uint32_t pipe_id;
+    uint32_t pipe_handle;
+};
+
+struct ServerContext {
+    usernet::Device device;
+    uint32_t server_pipe;
+    networkd_protocol::Registry* registry;
+    Binding bindings[kMaxBindings];
+    ArpEntry arp_entries[kMaxArpEntries];
+    PendingPing pending_pings[kMaxPendingPings];
+};
+
+void poll_network(ServerContext& ctx);
+
+void print(const char* text) {
+    static int32_t console = -1;
+    if (console < 0) {
+        console = static_cast<int32_t>(
+            descriptor_open(static_cast<uint32_t>(descriptor_defs::Type::Console), 0));
+        if (console < 0) {
+            return;
+        }
+    }
+    if (text == nullptr) {
+        return;
+    }
+    size_t len = 0;
+    while (text[len] != '\0') {
+        ++len;
+    }
+    if (len != 0) {
+        descriptor_write(static_cast<uint32_t>(console), text, len);
+    }
+}
+
+void print_line(const char* text) {
+    print(text);
+    print("\n");
+}
+
+Binding* find_binding(ServerContext& ctx, uint16_t port) {
+    for (size_t i = 0; i < kMaxBindings; ++i) {
+        if (ctx.bindings[i].in_use && ctx.bindings[i].port == port) {
+            return &ctx.bindings[i];
+        }
+    }
+    return nullptr;
+}
+
+Binding* allocate_binding(ServerContext& ctx) {
+    for (size_t i = 0; i < kMaxBindings; ++i) {
+        if (!ctx.bindings[i].in_use) {
+            return &ctx.bindings[i];
+        }
+    }
+    return nullptr;
+}
+
+ArpEntry* find_arp_entry(ServerContext& ctx, const uint8_t ip[4]) {
+    for (size_t i = 0; i < kMaxArpEntries; ++i) {
+        if (!ctx.arp_entries[i].in_use) {
+            continue;
+        }
+        bool match = true;
+        for (size_t j = 0; j < 4; ++j) {
+            if (ctx.arp_entries[i].ip[j] != ip[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return &ctx.arp_entries[i];
+        }
+    }
+    return nullptr;
+}
+
+ArpEntry* allocate_arp_entry(ServerContext& ctx) {
+    for (size_t i = 0; i < kMaxArpEntries; ++i) {
+        if (!ctx.arp_entries[i].in_use) {
+            return &ctx.arp_entries[i];
+        }
+    }
+    return &ctx.arp_entries[0];
+}
+
+void record_arp(ServerContext& ctx, const uint8_t ip[4], const uint8_t mac[6]) {
+    ArpEntry* entry = find_arp_entry(ctx, ip);
+    if (entry == nullptr) {
+        entry = allocate_arp_entry(ctx);
+    }
+    entry->in_use = true;
+    for (size_t i = 0; i < 4; ++i) {
+        entry->ip[i] = ip[i];
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        entry->mac[i] = mac[i];
+    }
+}
+
+PendingPing* allocate_pending_ping(ServerContext& ctx) {
+    for (size_t i = 0; i < kMaxPendingPings; ++i) {
+        if (!ctx.pending_pings[i].in_use) {
+            return &ctx.pending_pings[i];
+        }
+    }
+    return nullptr;
+}
+
+PendingPing* find_pending_ping(ServerContext& ctx,
+                               uint16_t identifier,
+                               uint16_t sequence) {
+    for (size_t i = 0; i < kMaxPendingPings; ++i) {
+        if (ctx.pending_pings[i].in_use &&
+            ctx.pending_pings[i].identifier == identifier &&
+            ctx.pending_pings[i].sequence == sequence) {
+            return &ctx.pending_pings[i];
+        }
+    }
+    return nullptr;
+}
+
+bool load_ipv4_config(ServerContext& ctx, descriptor_defs::NetIpv4Config& out) {
+    return net_device_get_ipv4_config(ctx.device.handle, &out) == 0 &&
+           (out.flags & descriptor_defs::kNetIpv4FlagEnabled) != 0;
+}
+
+bool resolve_next_hop(ServerContext& ctx,
+                      const uint8_t destination_ip[4],
+                      uint8_t next_hop_ip[4]) {
+    descriptor_defs::NetIpv4Config cfg{};
+    if (!load_ipv4_config(ctx, cfg)) {
+        return false;
+    }
+    const uint8_t* target = destination_ip;
+    if (!usernet::ipv4_same_subnet(cfg.address, destination_ip, cfg.netmask) &&
+        !usernet::ipv4_is_zero(cfg.gateway)) {
+        target = cfg.gateway;
+    }
+    for (size_t i = 0; i < 4; ++i) {
+        next_hop_ip[i] = target[i];
+    }
+    return true;
+}
+
+bool send_arp_request(ServerContext& ctx, const uint8_t target_ip[4]) {
+    descriptor_defs::NetIpv4Config cfg{};
+    if (!load_ipv4_config(ctx, cfg)) {
+        return false;
+    }
+    uint8_t frame[usernet::kMaxFrameSize];
+    size_t frame_length = 0;
+    if (!usernet::build_arp_request_frame(frame,
+                                          sizeof(frame),
+                                          frame_length,
+                                          ctx.device.info.mac,
+                                          cfg.address,
+                                          target_ip)) {
+        return false;
+    }
+    return descriptor_write(ctx.device.handle, frame, frame_length) > 0;
+}
+
+bool lookup_or_resolve_mac(ServerContext& ctx,
+                           const uint8_t destination_ip[4],
+                           uint8_t out_mac[6]);
+
+bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
+    long handle =
+        shared_memory_open(networkd_protocol::kRegistryName,
+                           sizeof(networkd_protocol::Registry));
+    if (handle < 0) {
+        return false;
+    }
+    descriptor_defs::SharedMemoryInfo info{};
+    if (shared_memory_get_info(static_cast<uint32_t>(handle), &info) != 0 ||
+        info.base == 0 ||
+        info.length < sizeof(networkd_protocol::Registry)) {
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+
+    auto* registry = reinterpret_cast<networkd_protocol::Registry*>(info.base);
+    registry->magic = networkd_protocol::kRegistryMagic;
+    registry->version = networkd_protocol::kRegistryVersion;
+    registry->server_pipe_id = server_pipe_id;
+    registry->reserved = 0;
+    registry->networkd_state = networkd_protocol::kStateStarting;
+    registry->dhcp_state = networkd_protocol::kStateIdle;
+    registry->dhcp_attempts = 0;
+    registry->dhcp_last_offer = 0;
+    registry->dhcp_last_ack = 0;
+    registry->dhcp_last_error = networkd_protocol::kErrorNone;
+    registry->net_rx_frames = 0;
+    registry->net_rx_udp = 0;
+    registry->net_rx_delivered = 0;
+    registry->net_tx_udp = 0;
+    ctx.registry = registry;
+    return true;
+}
+
+void send_bind_response(uint32_t handle, uint16_t port, int32_t status) {
+    networkd_protocol::Message message{};
+    networkd_protocol::init_message(message,
+                                    networkd_protocol::kBindUdpResponse);
+    message.bind_response.status = status;
+    message.bind_response.port = port;
+    (void)networkd_protocol::write_message(handle, message);
+}
+
+void send_udp_packet(Binding& binding, const usernet::UdpPacketView& packet) {
+    if (binding.pipe_handle == kInvalidDescriptor ||
+        packet.payload_length > networkd_protocol::kMaxUdpPayload) {
+        return;
+    }
+
+    networkd_protocol::Message message{};
+    networkd_protocol::init_message(message,
+                                    networkd_protocol::kUdpPacketEvent);
+    message.udp_event.source_port = packet.source_port;
+    message.udp_event.destination_port = packet.destination_port;
+    message.udp_event.payload_length =
+        static_cast<uint16_t>(packet.payload_length);
+    for (size_t i = 0; i < 4; ++i) {
+        message.udp_event.source_ip[i] = packet.source_ip[i];
+        message.udp_event.destination_ip[i] = packet.destination_ip[i];
+    }
+    for (size_t i = 0; i < packet.payload_length; ++i) {
+        message.udp_event.payload[i] = packet.payload[i];
+    }
+    (void)networkd_protocol::write_message(binding.pipe_handle, message);
+}
+
+void send_icmp_reply(PendingPing& ping, const usernet::IcmpEchoReplyView& reply) {
+    if (ping.pipe_handle == kInvalidDescriptor ||
+        reply.payload_length > networkd_protocol::kMaxUdpPayload) {
+        return;
+    }
+    networkd_protocol::Message message{};
+    networkd_protocol::init_message(message, networkd_protocol::kIcmpEchoReplyEvent);
+    message.icmp_event.identifier = reply.identifier;
+    message.icmp_event.sequence = reply.sequence;
+    message.icmp_event.payload_length = static_cast<uint16_t>(reply.payload_length);
+    message.icmp_event.ttl = reply.ttl;
+    for (size_t i = 0; i < 4; ++i) {
+        message.icmp_event.source_ip[i] = reply.source_ip[i];
+        message.icmp_event.destination_ip[i] = reply.destination_ip[i];
+    }
+    for (size_t i = 0; i < reply.payload_length; ++i) {
+        message.icmp_event.payload[i] = reply.payload[i];
+    }
+    (void)networkd_protocol::write_message(ping.pipe_handle, message);
+}
+
+void handle_bind_request(ServerContext& ctx,
+                         const networkd_protocol::BindUdpRequest& request) {
+    if (ctx.registry != nullptr) {
+        ctx.registry->dhcp_state = networkd_protocol::kStateBindSeen;
+    }
+    if (request.reply_pipe_id == 0 || request.port == 0) {
+        return;
+    }
+
+    Binding* existing = find_binding(ctx, request.port);
+    if (existing != nullptr) {
+        uint64_t flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
+                         static_cast<uint64_t>(descriptor_defs::Flag::Async);
+        long handle = pipe_open_existing(flags, request.reply_pipe_id);
+        if (handle >= 0) {
+            send_bind_response(static_cast<uint32_t>(handle),
+                               request.port,
+                               networkd_protocol::kStatusInUse);
+            if (ctx.registry != nullptr) {
+                ctx.registry->dhcp_state = networkd_protocol::kStateBindReplySent;
+            }
+            descriptor_close(static_cast<uint32_t>(handle));
+        }
+        return;
+    }
+
+    Binding* binding = allocate_binding(ctx);
+    if (binding == nullptr) {
+        return;
+    }
+
+    uint64_t flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
+                     static_cast<uint64_t>(descriptor_defs::Flag::Async);
+    long handle = pipe_open_existing(flags, request.reply_pipe_id);
+    if (handle < 0) {
+        return;
+    }
+
+    binding->in_use = true;
+    binding->port = request.port;
+    binding->pipe_id = request.reply_pipe_id;
+    binding->pipe_handle = static_cast<uint32_t>(handle);
+    send_bind_response(binding->pipe_handle,
+                       binding->port,
+                       networkd_protocol::kStatusOk);
+    if (ctx.registry != nullptr) {
+        ctx.registry->dhcp_state = networkd_protocol::kStateBindReplySent;
+    }
+}
+
+void handle_send_request(ServerContext& ctx,
+                         const networkd_protocol::SendUdpRequest& request) {
+    if (request.source_port == 0 ||
+        request.destination_port == 0 ||
+        request.payload_length > networkd_protocol::kMaxUdpPayload ||
+        find_binding(ctx, request.source_port) == nullptr) {
+        return;
+    }
+
+    uint8_t destination_mac_storage[6];
+    const uint8_t* destination_mac = nullptr;
+    if ((request.flags & networkd_protocol::kSendFlagBroadcast) != 0) {
+        destination_mac = kBroadcastMac;
+    } else if (lookup_or_resolve_mac(ctx, request.destination_ip, destination_mac_storage)) {
+        destination_mac = destination_mac_storage;
+    } else {
+        return;
+    }
+
+    uint8_t frame[usernet::kMaxFrameSize];
+    size_t frame_length = 0;
+    if (!usernet::build_udp_ipv4_frame(frame,
+                                       sizeof(frame),
+                                       frame_length,
+                                       ctx.device.info.mac,
+                                       destination_mac,
+                                       request.source_ip,
+                                       request.destination_ip,
+                                       request.source_port,
+                                       request.destination_port,
+                                       request.payload,
+                                       request.payload_length)) {
+        return;
+    }
+
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->net_tx_udp;
+    }
+    (void)descriptor_write(ctx.device.handle, frame, frame_length);
+}
+
+void handle_icmp_request(ServerContext& ctx,
+                         const networkd_protocol::SendIcmpEchoRequest& request) {
+    if (request.reply_pipe_id == 0 ||
+        request.payload_length > networkd_protocol::kMaxUdpPayload) {
+        return;
+    }
+    descriptor_defs::NetIpv4Config cfg{};
+    if (!load_ipv4_config(ctx, cfg)) {
+        return;
+    }
+    uint64_t flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
+                     static_cast<uint64_t>(descriptor_defs::Flag::Async);
+    long handle = pipe_open_existing(flags, request.reply_pipe_id);
+    if (handle < 0) {
+        return;
+    }
+    PendingPing* pending = allocate_pending_ping(ctx);
+    if (pending == nullptr) {
+        descriptor_close(static_cast<uint32_t>(handle));
+        return;
+    }
+    uint8_t destination_mac[6];
+    if (!lookup_or_resolve_mac(ctx, request.destination_ip, destination_mac)) {
+        descriptor_close(static_cast<uint32_t>(handle));
+        return;
+    }
+    uint8_t frame[usernet::kMaxFrameSize];
+    size_t frame_length = 0;
+    if (!usernet::build_icmp_echo_frame(frame,
+                                        sizeof(frame),
+                                        frame_length,
+                                        ctx.device.info.mac,
+                                        destination_mac,
+                                        cfg.address,
+                                        request.destination_ip,
+                                        request.identifier,
+                                        request.sequence,
+                                        request.payload,
+                                        request.payload_length)) {
+        descriptor_close(static_cast<uint32_t>(handle));
+        return;
+    }
+    pending->in_use = true;
+    pending->identifier = request.identifier;
+    pending->sequence = request.sequence;
+    pending->pipe_handle = static_cast<uint32_t>(handle);
+    (void)descriptor_write(ctx.device.handle, frame, frame_length);
+}
+
+void poll_control(ServerContext& ctx) {
+    for (;;) {
+        networkd_protocol::Message message{};
+        if (!networkd_protocol::read_message(ctx.server_pipe, message)) {
+            break;
+        }
+        if (message.type == networkd_protocol::kBindUdpRequest) {
+            handle_bind_request(ctx, message.bind_request);
+        } else if (message.type == networkd_protocol::kSendUdpRequest) {
+            handle_send_request(ctx, message.send_request);
+        } else if (message.type == networkd_protocol::kSendIcmpEchoRequest) {
+            handle_icmp_request(ctx, message.icmp_request);
+        }
+    }
+}
+
+bool lookup_or_resolve_mac(ServerContext& ctx,
+                           const uint8_t destination_ip[4],
+                           uint8_t out_mac[6]) {
+    uint8_t next_hop_ip[4];
+    if (!resolve_next_hop(ctx, destination_ip, next_hop_ip)) {
+        return false;
+    }
+    ArpEntry* entry = find_arp_entry(ctx, next_hop_ip);
+    if (entry != nullptr) {
+        for (size_t i = 0; i < 6; ++i) {
+            out_mac[i] = entry->mac[i];
+        }
+        return true;
+    }
+    if (!send_arp_request(ctx, next_hop_ip)) {
+        return false;
+    }
+    for (size_t i = 0; i < 5000; ++i) {
+        poll_network(ctx);
+        entry = find_arp_entry(ctx, next_hop_ip);
+        if (entry != nullptr) {
+            for (size_t j = 0; j < 6; ++j) {
+                out_mac[j] = entry->mac[j];
+            }
+            return true;
+        }
+        yield();
+    }
+    return false;
+}
+
+void poll_network(ServerContext& ctx) {
+    uint8_t frame[usernet::kMaxFrameSize];
+    for (;;) {
+        long result = descriptor_read(ctx.device.handle, frame, sizeof(frame));
+        if (result == kDescriptorWouldBlock || result <= 0) {
+            break;
+        }
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->net_rx_frames;
+        }
+
+        usernet::ArpPacketView arp{};
+        if (usernet::parse_arp_frame(frame, static_cast<size_t>(result), arp)) {
+            if (arp.operation == 0x0001 || arp.operation == 0x0002) {
+                record_arp(ctx, arp.sender_ip, arp.sender_mac);
+            }
+            continue;
+        }
+
+        usernet::UdpPacketView packet{};
+        if (!usernet::parse_udp_frame(frame, static_cast<size_t>(result), packet)) {
+            usernet::IcmpEchoReplyView icmp{};
+            if (!usernet::parse_icmp_echo_reply_frame(frame,
+                                                      static_cast<size_t>(result),
+                                                      icmp)) {
+                continue;
+            }
+            PendingPing* pending =
+                find_pending_ping(ctx, icmp.identifier, icmp.sequence);
+            if (pending == nullptr) {
+                continue;
+            }
+            send_icmp_reply(*pending, icmp);
+            descriptor_close(pending->pipe_handle);
+            pending->in_use = false;
+            pending->pipe_handle = kInvalidDescriptor;
+            continue;
+        }
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->net_rx_udp;
+        }
+
+        Binding* binding = find_binding(ctx, packet.destination_port);
+        if (binding == nullptr) {
+            continue;
+        }
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->net_rx_delivered;
+        }
+        send_udp_packet(*binding, packet);
+    }
+}
+
+}  // namespace
+
+int main(uint64_t, uint64_t) {
+    ServerContext ctx{};
+
+    uint64_t net_flags = static_cast<uint64_t>(descriptor_defs::Flag::Async);
+    if (!usernet::open_device(ctx.device, 0, net_flags)) {
+        print_line("networkd: failed to open net device 0");
+        return 1;
+    }
+
+    uint64_t server_flags = static_cast<uint64_t>(descriptor_defs::Flag::Readable) |
+                            static_cast<uint64_t>(descriptor_defs::Flag::Async);
+    long server_pipe = pipe_open_new(server_flags);
+    if (server_pipe < 0) {
+        print_line("networkd: failed to create server pipe");
+        return 1;
+    }
+    ctx.server_pipe = static_cast<uint32_t>(server_pipe);
+
+    descriptor_defs::PipeInfo info{};
+    if (pipe_get_info(ctx.server_pipe, &info) != 0 || info.id == 0) {
+        print_line("networkd: failed to query server pipe");
+        return 1;
+    }
+    if (!populate_registry(ctx, info.id)) {
+        print_line("networkd: failed to publish registry");
+        return 1;
+    }
+    ctx.registry->networkd_state = networkd_protocol::kStateReady;
+
+    print_line("networkd: ready");
+
+    for (;;) {
+        poll_control(ctx);
+        poll_network(ctx);
+        yield();
+    }
+}

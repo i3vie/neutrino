@@ -46,6 +46,7 @@ struct FilesystemOps {
                         const char* path,
                         void*& out_file_context,
                         DirEntry* out_metadata);
+    bool (*create_directory)(void* fs_context, const char* path);
     bool (*read_file)(void* file_context,
                       uint64_t offset,
                       void* buffer,
@@ -81,6 +82,7 @@ bool read_file(const char* path,
 
 bool open_file(const char* path, FileHandle& out_handle);
 bool create_file(const char* path, FileHandle& out_handle);
+bool create_directory(const char* path);
 void close_file(FileHandle& handle);
 bool read_file(FileHandle& handle,
                uint64_t offset,

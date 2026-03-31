@@ -19,13 +19,30 @@ LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 # === QEMU configuration ===
 QEMU ?= qemu-system-x86_64
 QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
+QEMU_NET_MAC ?= 52:54:00:12:34:56
+QEMU_NET_BACKEND ?= user
+QEMU_NET_DEVICE ?= e1000e
+QEMU_TAP_IFACE ?= tap0
+QEMU_TAP_SCRIPT ?= no
+QEMU_TAP_DOWN_SCRIPT ?= no
+ifeq ($(QEMU_NET_BACKEND),tap)
+QEMU_NET_ARGS := -netdev tap,id=net0,ifname=$(QEMU_TAP_IFACE),script=$(QEMU_TAP_SCRIPT),downscript=$(QEMU_TAP_DOWN_SCRIPT) \
+		-device $(QEMU_NET_DEVICE),netdev=net0,mac=$(QEMU_NET_MAC)
+else
+QEMU_NET_ARGS := -netdev user,id=net0 \
+		-device $(QEMU_NET_DEVICE),netdev=net0,mac=$(QEMU_NET_MAC)
+endif
 QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		-drive file=hdd.img,format=raw,if=ide \
-		-enable-kvm -display sdl
+		-enable-kvm -display sdl \
+		$(QEMU_NET_ARGS)
 QEMU_DEBUG_ARGS := -d int \
 		-monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot
 QEMU_DEBUG_WAIT_ARGS := -s -S
+
+TARGET_DISK_IMG := hdd_target.img
+TARGET_DISK_SIZE ?= 128M
 
 TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
@@ -69,20 +86,27 @@ $(LIMINE_DIR):
 # === Build bootable UEFI ISO ===
 ISO_ROOT := $(OUT_DIR)/iso_root
 
-$(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
+$(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	@echo "[ISO] Building $@"
 
+	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
 	cp -v out/kernel.elf $(ISO_ROOT)/boot/kernel.elf
+	cp -v hdd.img $(ISO_ROOT)/boot/rootfs.img
 	mkdir -p $(ISO_ROOT)/boot/limine
 	cp -v $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	
-	echo 'timeout: 1' > $(ISO_ROOT)/limine.conf
-	echo '' >> $(ISO_ROOT)/limine.conf
-	echo '/Neutrino' >> $(ISO_ROOT)/limine.conf
-	echo '    protocol: limine' >> $(ISO_ROOT)/limine.conf
-	echo '    path: boot():/boot/kernel.elf' >> $(ISO_ROOT)/limine.conf
-	echo '    cmdline: ROOT=IDE_PM_0' >> $(ISO_ROOT)/limine.conf
+	printf 'timeout: 1\n\n' > $(ISO_ROOT)/limine.conf
+	printf '/Neutrino (disk install)\n' >> $(ISO_ROOT)/limine.conf
+	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
+	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
+	printf '    cmdline: ROOT=IDE_PM_0\n\n' >> $(ISO_ROOT)/limine.conf
+	printf '/Neutrino (live ISO)\n' >> $(ISO_ROOT)/limine.conf
+	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
+	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
+	printf '    cmdline: ROOT=MEMDISK_0_0\n' >> $(ISO_ROOT)/limine.conf
+	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT)/limine.conf
+	printf '    module_cmdline: rootfs\n\n' >> $(ISO_ROOT)/limine.conf
 
 	mkdir -p $(ISO_ROOT)/EFI/BOOT
 	cp -v $(LIMINE_DIR)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/
@@ -96,7 +120,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR)
 	
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO)
 
-$(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img
+$(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	@echo "[ISO] Building $@ (RAMFS)"
 
 	rm -rf $(ISO_ROOT_RAMFS)
@@ -154,4 +178,16 @@ clean:
 iso-ramfs: $(TARGET_ISO_RAMFS)
 	@echo ISO with RAMFS created at $(TARGET_ISO_RAMFS)
 
-.PHONY: all clean iso iso-ramfs run
+.PHONY: userspace-rootfs
+userspace-rootfs: hdd.img
+	$(MAKE) -C userspace install
+
+.PHONY: target-disk
+target-disk: $(TARGET_DISK_IMG)
+	@echo "Target disk ready at $(TARGET_DISK_IMG)"
+
+$(TARGET_DISK_IMG):
+	truncate -s $(TARGET_DISK_SIZE) $(TARGET_DISK_IMG)
+	mkfs.fat -F 32 --mbr=y $(TARGET_DISK_IMG)
+
+.PHONY: all clean iso iso-ramfs run userspace-rootfs

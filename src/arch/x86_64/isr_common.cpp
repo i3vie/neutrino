@@ -5,7 +5,10 @@
 #include "../../drivers/input/mouse.hpp"
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
+#include "../../drivers/net/e1000e.hpp"
+#include "../../drivers/net/virtio_net.hpp"
 #include "../../kernel/error.hpp"
+#include "../../kernel/descriptor.hpp"
 #include "../../kernel/process.hpp"
 #include "../../kernel/scheduler.hpp"
 #include "percpu.hpp"
@@ -48,14 +51,55 @@ constexpr const char* exception_names[32] = {
     "RESERVED"
 };
 
+namespace {
+
+constexpr uint16_t kExitCodeKernelFaultFlag = 0x8000u;
+
+uint16_t exit_code_from_exception(uint64_t vector) {
+    return static_cast<uint16_t>(kExitCodeKernelFaultFlag |
+                                 static_cast<uint16_t>(vector & 0x7FFFu));
+}
+
+void terminate_current_process(uint16_t exit_code) {
+    process::Process* proc = process::current();
+    if (proc == nullptr) {
+        return;
+    }
+
+    proc->state = process::State::Terminated;
+    proc->has_exited = true;
+    proc->exit_code = exit_code;
+
+    process::Process* parent = proc->parent;
+    if (parent != nullptr && parent->waiting_on == proc) {
+        parent->waiting_on = nullptr;
+        parent->context.rax = proc->exit_code;
+        parent->state = process::State::Ready;
+        if (parent->console_transferred) {
+            descriptor::restore_console_owner(*parent);
+            parent->console_transferred = false;
+        }
+        scheduler::enqueue(parent);
+    }
+    proc->parent = nullptr;
+}
+
+}  // namespace
+
 extern "C" void isr_handler(InterruptFrame* regs) {
     if (regs == nullptr) {
         return;
     }
 
     if (regs->int_no >= 32) {
+        percpu::record_irq();
         uint64_t irq = regs->int_no - 32;
         if (irq == 0) {
+            bool user_mode = (regs->cs & 0x3) != 0;
+            bool has_proc = process::current() != nullptr;
+            percpu::record_tick(user_mode, has_proc);
+            e1000e::poll();
+            virtio_net::poll();
             scheduler::tick(*regs);
             pic::send_eoi(0);
             lapic::eoi();
@@ -71,6 +115,11 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             lapic::eoi();
             return;
         } else if (regs->int_no == 0x40) {
+            bool user_mode = (regs->cs & 0x3) != 0;
+            bool has_proc = process::current() != nullptr;
+            percpu::record_tick(user_mode, has_proc);
+            e1000e::poll();
+            virtio_net::poll();
             scheduler::tick(*regs);
             lapic::eoi();
             return;
@@ -155,6 +204,24 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                     static_cast<unsigned long long>(stack[3]),
                     static_cast<unsigned long long>(stack[4]),
                     static_cast<unsigned long long>(stack[5]));
+    }
+
+    // If the fault originated from userspace, terminate the offending process
+    // instead of halting the whole system. This lets parent processes observe
+    // that the kernel killed the task (exit code has the high bit set) and
+    // continue running.
+    if ((regs->cs & 0x3) != 0) {
+        uint16_t exit_code = exit_code_from_exception(regs->int_no);
+        log_message(LogLevel::Error,
+                    "Terminating userspace pid=%u due to exception %s (#%u) rip=%016llx exit=%u",
+                    process::current() ? static_cast<unsigned int>(process::current()->pid) : 0,
+                    regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown",
+                    static_cast<unsigned int>(regs->int_no),
+                    static_cast<unsigned long long>(regs->rip),
+                    static_cast<unsigned int>(exit_code));
+        terminate_current_process(exit_code);
+        scheduler::reschedule_from_interrupt(*regs);
+        return;
     }
 
     const char* secondary =

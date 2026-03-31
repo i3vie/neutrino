@@ -3,6 +3,8 @@
 
 constexpr uint64_t PAGE_FLAG_WRITE  = 1ull << 1;
 constexpr uint64_t PAGE_FLAG_USER   = 1ull << 2;
+constexpr uint64_t PAGE_FLAG_WRITE_THROUGH = 1ull << 3;
+constexpr uint64_t PAGE_FLAG_CACHE_DISABLE = 1ull << 4;
 constexpr uint64_t PAGE_FLAG_GLOBAL = 1ull << 8;
 
 void paging_init();

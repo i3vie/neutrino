@@ -3,6 +3,7 @@
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/registers.hpp"
 #include "arch/x86_64/memory/paging.hpp"
+#include "capabilities.hpp"
 #include "lib/mem.hpp"
 
 namespace {
@@ -10,6 +11,7 @@ namespace {
 process::Process g_process_table[process::kMaxProcesses];
 alignas(16) uint8_t g_kernel_stacks[process::kMaxProcesses][process::kKernelStackSize];
 uint32_t g_next_pid = 1;
+uint32_t g_next_kernel_pid = 0x80000000u;
 
 }  // namespace
 
@@ -21,6 +23,8 @@ void init() {
     for (size_t i = 0; i < kMaxProcesses; ++i) {
         g_process_table[i].state = State::Unused;
         g_process_table[i].has_context = false;
+        g_process_table[i].is_kernel_task = false;
+        g_process_table[i].kernel_entry = nullptr;
         g_process_table[i].pid = 0;
         g_process_table[i].cr3 = paging_kernel_cr3();
         g_process_table[i].fs_base = 0;
@@ -38,6 +42,9 @@ void init() {
         g_process_table[i].vty_id = 0;
         g_process_table[i].cwd[0] = '/';
         g_process_table[i].cwd[1] = '\0';
+        g_process_table[i].principal = nullptr;
+        capabilities::cap_table_clear(g_process_table[i].cap_handles,
+                                      capabilities::kMaxProcessCapabilities);
         descriptor::init_table(g_process_table[i].descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             g_process_table[i].file_handles[fh].in_use = false;
@@ -60,7 +67,7 @@ Process* allocate() {
         }
         memset(&proc.context, 0, sizeof(proc.context));
         proc.state = State::Ready;
-        proc.pid = g_next_pid++;
+        proc.pid = g_next_kernel_pid++;
         uint64_t new_cr3 = paging_create_address_space();
         if (new_cr3 == 0) {
             proc.state = State::Unused;
@@ -70,6 +77,8 @@ Process* allocate() {
         proc.cr3 = new_cr3;
         proc.fs_base = 0;
         proc.has_context = false;
+        proc.is_kernel_task = false;
+        proc.kernel_entry = nullptr;
         proc.preferred_cpu = UINT32_MAX;
         proc.parent = nullptr;
         proc.waiting_on = nullptr;
@@ -79,6 +88,9 @@ Process* allocate() {
         proc.cwd[0] = '/';
         proc.cwd[1] = '\0';
         proc.vty_id = 0;
+        proc.principal = nullptr;
+        capabilities::cap_table_clear(proc.cap_handles,
+                                      capabilities::kMaxProcessCapabilities);
         descriptor::init_table(proc.descriptors);
         for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
             proc.file_handles[fh].in_use = false;
@@ -117,6 +129,64 @@ Process* table_entry(size_t index) {
         return nullptr;
     }
     return &g_process_table[index];
+}
+
+Process* find_by_pid(uint32_t pid) {
+    if (pid == 0) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < kMaxProcesses; ++i) {
+        Process& p = g_process_table[i];
+        if (p.state != State::Unused && p.pid == pid) {
+            return &p;
+        }
+    }
+    return nullptr;
+}
+
+Process* allocate_kernel_task(void (*entry)(Process&)) {
+    if (entry == nullptr) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < kMaxProcesses; ++i) {
+        Process& proc = g_process_table[i];
+        if (proc.state != State::Unused) {
+            continue;
+        }
+        memset(&proc.context, 0, sizeof(proc.context));
+        proc.state = State::Ready;
+        proc.pid = g_next_pid++;
+        proc.cr3 = paging_kernel_cr3();
+        proc.fs_base = 0;
+        proc.has_context = false;
+        proc.is_kernel_task = true;
+        proc.kernel_entry = entry;
+        proc.preferred_cpu = UINT32_MAX;
+        proc.parent = nullptr;
+        proc.waiting_on = nullptr;
+        proc.exit_code = 0;
+        proc.has_exited = false;
+        proc.console_transferred = false;
+        proc.cwd[0] = '/';
+        proc.cwd[1] = '\0';
+        proc.vty_id = 0;
+        proc.principal = nullptr;
+        capabilities::cap_table_clear(proc.cap_handles,
+                                      capabilities::kMaxProcessCapabilities);
+        descriptor::init_table(proc.descriptors);
+        for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
+            proc.file_handles[fh].in_use = false;
+            proc.file_handles[fh].handle = {};
+            proc.file_handles[fh].position = 0;
+        }
+        for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
+            proc.directory_handles[dh].in_use = false;
+            proc.directory_handles[dh].handle = {};
+            proc.directory_handles[dh].path[0] = '\0';
+        }
+        return &proc;
+    }
+    return nullptr;
 }
 
 }  // namespace process

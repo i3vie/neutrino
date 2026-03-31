@@ -11,6 +11,7 @@ int64_t mouse_read(process::Process&,
                    uint64_t user_address,
                    uint64_t length,
                    uint64_t offset) {
+    (void)entry;
     if (offset != 0) {
         return -1;
     }

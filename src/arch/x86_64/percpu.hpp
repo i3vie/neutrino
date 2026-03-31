@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "descriptors.hpp"
 #include "arch/x86_64/tss.hpp"
 
 namespace process {
@@ -24,6 +25,10 @@ struct Cpu {
     alignas(16) uint8_t gdt_area[8 * 8];
     alignas(16) uint8_t bootstrap_stack[kBootstrapStackSize];
     process::Process* current_process;
+    uint64_t user_ticks;
+    uint64_t kernel_ticks;
+    uint64_t idle_ticks;
+    uint64_t irq_ticks;
 };
 
 void init_bsp(uint32_t lapic_id, uint32_t processor_id);
@@ -37,5 +42,8 @@ void setup_cpu_tss(Cpu& cpu);
 void setup_cpu_gdt(Cpu& cpu);
 void set_current_process(process::Process* proc);
 process::Process* get_current_process();
+void record_tick(bool user_mode, bool has_process);
+void record_irq();
+size_t usage_snapshot(descriptor_defs::CpuUsage* out, size_t max_entries);
 
 }  // namespace percpu

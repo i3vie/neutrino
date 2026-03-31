@@ -64,6 +64,7 @@ syscall_entry:
     mov rsp, rbx
     mov r15, rbx
 .dispatch:
+    sti                     ; re-enable interrupts now that we're on the kernel stack
     mov rdi, rsp
     call syscall_dispatch
     mov r15, rsp

@@ -1121,6 +1121,113 @@ bool fat32_create_file(Fat32Volume& volume,
     return true;
 }
 
+bool fat32_create_directory(Fat32Volume& volume,
+                            const char* path,
+                            Fat32DirEntry& out_entry) {
+    if (!volume.mounted || path == nullptr) {
+        return false;
+    }
+
+    char name[kMaxSegmentLength]{};
+    uint32_t parent_cluster = 0;
+    if (!split_parent_and_name(volume, path, parent_cluster, name)) {
+        return false;
+    }
+
+    Fat32DirEntry existing{};
+    if (fat32_find_entry(volume, parent_cluster, name, existing)) {
+        return false;
+    }
+
+    uint8_t short_name[11];
+    if (!build_short_name(name, short_name)) {
+        return false;
+    }
+
+    uint32_t new_cluster = 0;
+    if (!allocate_cluster(volume, new_cluster)) {
+        return false;
+    }
+
+    // Initialize directory cluster with "." and ".."
+    size_t cluster_size =
+        static_cast<size_t>(volume.sectors_per_cluster) * 512u;
+    if (cluster_size > sizeof(cluster_buffer)) {
+        log_message(LogLevel::Warn,
+                    "FAT32: cluster size %zu exceeds buffer capacity",
+                    cluster_size);
+        return false;
+    }
+    memset(cluster_buffer, 0, cluster_size);
+    uint8_t* dot = reinterpret_cast<uint8_t*>(cluster_buffer);
+    uint8_t* dotdot = reinterpret_cast<uint8_t*>(cluster_buffer + 32);
+
+    auto fill_entry = [&](uint8_t* entry, const uint8_t* name83,
+                          uint32_t first_cluster) {
+        memcpy(entry, name83, 11);
+        entry[11] = ATTR_DIRECTORY;
+        *reinterpret_cast<uint16_t*>(entry + 20) =
+            static_cast<uint16_t>(first_cluster >> 16);
+        *reinterpret_cast<uint16_t*>(entry + 26) =
+            static_cast<uint16_t>(first_cluster & 0xFFFF);
+        *reinterpret_cast<uint32_t*>(entry + 28) = 0;
+    };
+
+    uint8_t dot_name[11]{' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
+    dot_name[0] = '.';
+    uint8_t dotdot_name[11]{' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
+    dotdot_name[0] = '.';
+    dotdot_name[1] = '.';
+
+    fill_entry(dot, dot_name, new_cluster);
+    fill_entry(dotdot, dotdot_name, parent_cluster == 0 ? volume.root_dir_first_cluster : parent_cluster);
+
+    if (!write_sectors(volume.device,
+                       cluster_to_lba(volume, new_cluster),
+                       volume.sectors_per_cluster,
+                       cluster_buffer)) {
+        return false;
+    }
+
+    DirectorySlot slot{};
+    if (!find_directory_slot(volume, parent_cluster, slot)) {
+        return false;
+    }
+
+    uint8_t* raw =
+        reinterpret_cast<uint8_t*>(cluster_buffer + slot.entry_index * 32);
+    memset(raw, 0, 32);
+    for (size_t i = 0; i < 11; ++i) {
+        raw[i] = short_name[i];
+    }
+    raw[11] = ATTR_DIRECTORY;
+    *reinterpret_cast<uint16_t*>(raw + 20) =
+        static_cast<uint16_t>(new_cluster >> 16);
+    *reinterpret_cast<uint16_t*>(raw + 26) =
+        static_cast<uint16_t>(new_cluster & 0xFFFF);
+    *reinterpret_cast<uint32_t*>(raw + 28) = 0;
+
+    if (slot.was_end_marker) {
+        size_t next_index = slot.entry_index + 1;
+        const size_t cluster_entries = entries_per_cluster(volume);
+        if (next_index < cluster_entries) {
+            uint8_t* next_entry =
+                reinterpret_cast<uint8_t*>(cluster_buffer + next_index * 32);
+            next_entry[0] = 0x00;
+        }
+    }
+
+    if (!write_sectors(volume.device,
+                       cluster_to_lba(volume, slot.cluster),
+                       volume.sectors_per_cluster,
+                       cluster_buffer)) {
+        return false;
+    }
+
+    copy_entry(raw, slot.cluster, slot.raw_index, nullptr, out_entry);
+    return true;
+}
+
 void to_vfs_entry(const Fat32DirEntry& source, vfs::DirEntry& dest) {
     memset(&dest, 0, sizeof(dest));
     size_t i = 0;
@@ -1693,6 +1800,19 @@ bool fat32_vfs_create_file(void* fs_context,
     return true;
 }
 
+bool fat32_vfs_create_directory(void* fs_context, const char* path) {
+    auto* volume = static_cast<Fat32Volume*>(fs_context);
+    if (volume == nullptr || path == nullptr) {
+        return false;
+    }
+    Fat32DirEntry entry{};
+    if (!fat32_create_directory(*volume, path, entry)) {
+        return false;
+    }
+    (void)entry;
+    return true;
+}
+
 bool fat32_vfs_read_file(void* file_context,
                          uint64_t offset,
                          void* buffer,
@@ -1804,6 +1924,7 @@ const vfs::FilesystemOps kFat32FilesystemOps{
     &fat32_vfs_list_directory,
     &fat32_vfs_open_file,
     &fat32_vfs_create_file,
+    &fat32_vfs_create_directory,
     &fat32_vfs_read_file,
     &fat32_vfs_write_file,
     &fat32_vfs_close_file,

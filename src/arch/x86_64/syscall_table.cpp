@@ -2,6 +2,7 @@
 
 #include "../../drivers/log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/capabilities.hpp"
 #include "../../kernel/file_io.hpp"
 #include "../../kernel/loader.hpp"
 #include "../../kernel/process.hpp"
@@ -11,6 +12,7 @@
 #include "../../fs/vfs.hpp"
 #include "../../lib/mem.hpp"
 #include "../../kernel/string_util.hpp"
+#include "../../kernel/users.hpp"
 #include "arch/x86_64/percpu.hpp"
 
 namespace syscall {
@@ -18,7 +20,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 0;
-constexpr uint64_t kAbiMinor = 1;
+constexpr uint64_t kAbiMinor = 2;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
@@ -70,6 +72,49 @@ uint32_t pick_child_cpu(process::Process* parent) {
         return cpu->index;
     }
     return UINT32_MAX;
+}
+
+// Validate that all capability handles provided in user memory correspond to
+// tokens permitting the requested kind. r12: pointer to handles array in user
+// space, r13: number of handles. We cap the number to avoid large copies.
+bool require_capability(process::Process& proc,
+                        capabilities::CapabilityKind kind,
+                        const syscall::SyscallFrame& frame) {
+    // Bootstrapping allowance: if no principal is associated, permit.
+    if (proc.principal == nullptr) {
+        return true;
+    }
+    const uint64_t* user_handles = reinterpret_cast<const uint64_t*>(frame.r12);
+    size_t count = static_cast<size_t>(frame.r13 & 0xFFFF);
+    constexpr size_t kMaxHandles = 8;
+    if (count > kMaxHandles) {
+        count = kMaxHandles;
+    }
+    if (count == 0) {
+        return false;
+    }
+
+    uint64_t local_handles[kMaxHandles];
+    if (!vm::copy_from_user(proc.cr3,
+                            local_handles,
+                            reinterpret_cast<uint64_t>(user_handles),
+                            count * sizeof(uint64_t))) {
+        return false;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        uint64_t h = local_handles[i];
+        capabilities::CapabilityToken* tok = capabilities::cap_table_lookup(
+            proc.cap_handles,
+            capabilities::kMaxProcessCapabilities,
+            h,
+            true);
+        if (tok != nullptr && tok->kind == kind &&
+            capabilities::token_valid(*tok)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool load_program_image(const char* path, loader::ProgramImage& out_image) {
@@ -356,6 +401,10 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc, capabilities::CapabilityKind::ProcessSpawn, frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             const char* path_user = reinterpret_cast<const char*>(frame.rdi);
             const char* args = reinterpret_cast<const char*>(frame.rsi);
             uint64_t flags = frame.rdx;
@@ -399,6 +448,10 @@ Result handle_syscall(SyscallFrame& frame) {
             child->exit_code = 0;
             child->has_exited = false;
             child->vty_id = proc->vty_id;
+            child->principal = proc->principal;
+            if (child->principal != nullptr) {
+                capabilities::principal_add_ref(child->principal);
+            }
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
@@ -456,6 +509,10 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc, capabilities::CapabilityKind::ProcessSpawn, frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
 
             const char* path_user = reinterpret_cast<const char*>(frame.rdi);
             const char* args = reinterpret_cast<const char*>(frame.rsi);
@@ -501,6 +558,10 @@ Result handle_syscall(SyscallFrame& frame) {
             child->exit_code = 0;
             child->has_exited = false;
             child->vty_id = proc->vty_id;
+            child->principal = proc->principal;
+            if (child->principal != nullptr) {
+                capabilities::principal_add_ref(child->principal);
+            }
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
@@ -743,6 +804,126 @@ Result handle_syscall(SyscallFrame& frame) {
             frame.rax = descriptor::framebuffer_is_active(slot)
                             ? 0
                             : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::PrincipalCreate: {
+            void* backing_user = reinterpret_cast<void*>(frame.rdi);
+            uint64_t allowed_mask = frame.rsi;
+            capabilities::Principal* principal =
+                capabilities::create_principal(backing_user, allowed_mask);
+            frame.rax = reinterpret_cast<uint64_t>(principal);
+            return Result::Continue;
+        }
+        case SystemCall::PrincipalSet: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            auto* principal = reinterpret_cast<capabilities::Principal*>(frame.rdi);
+            if (!capabilities::principal_is_valid(principal)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            capabilities::principal_add_ref(principal);
+            if (proc->principal != nullptr) {
+                capabilities::principal_release(proc->principal);
+            }
+            proc->principal = principal;
+            capabilities::cap_table_clear(proc->cap_handles,
+                                          capabilities::kMaxProcessCapabilities);
+            frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::CapabilityGrant: {
+            process::Process* proc = process::current();
+            if (proc == nullptr || proc->principal == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            capabilities::CapabilityKind kind{};
+            if (!capabilities::capability_from_value(frame.rdi, kind)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            capabilities::CapabilityToken* token =
+                capabilities::issue_token(*proc->principal, kind);
+            if (token == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint64_t handle = 0;
+            if (!capabilities::cap_table_insert(proc->cap_handles,
+                                                capabilities::kMaxProcessCapabilities,
+                                                token,
+                                                handle)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = handle;
+            return Result::Continue;
+        }
+        case SystemCall::CapabilityPass: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            process::Process* child = process::find_by_pid(static_cast<uint32_t>(frame.rdi));
+            const uint64_t* user_handles = reinterpret_cast<const uint64_t*>(frame.rsi);
+            size_t handle_count = static_cast<size_t>(frame.rdx & 0xFFFF);
+            constexpr size_t kMaxHandles = 8;
+            if (handle_count > kMaxHandles) {
+                handle_count = kMaxHandles;
+            }
+            if (child == nullptr || !child->has_context) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            uint64_t local_handles[kMaxHandles];
+            if (handle_count > 0) {
+                if (!vm::copy_from_user(proc->cr3,
+                                        local_handles,
+                                        reinterpret_cast<uint64_t>(user_handles),
+                                        handle_count * sizeof(uint64_t))) {
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+                if (!capabilities::cap_table_copy_handles(
+                        child->cap_handles,
+                        capabilities::kMaxProcessCapabilities,
+                        proc->cap_handles,
+                        capabilities::kMaxProcessCapabilities,
+                        local_handles,
+                        handle_count)) {
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+            }
+            frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::UserCreate: {
+            const char* name = reinterpret_cast<const char*>(frame.rdi);
+            uint64_t caps = frame.rsi;
+            users::User* user = users::create(name, caps);
+            frame.rax = reinterpret_cast<uint64_t>(user);
+            return Result::Continue;
+        }
+        case SystemCall::UserFind: {
+            const char* name = reinterpret_cast<const char*>(frame.rdi);
+            users::User* user = users::find(name);
+            frame.rax = reinterpret_cast<uint64_t>(user);
+            return Result::Continue;
+        }
+        case SystemCall::UserBumpGeneration: {
+            auto* user = reinterpret_cast<users::User*>(frame.rdi);
+            if (user != nullptr) {
+                users::bump_generation(*user);
+                frame.rax = 0;
+            } else {
+                frame.rax = static_cast<uint64_t>(-1);
+            }
             return Result::Continue;
         }
         default: {

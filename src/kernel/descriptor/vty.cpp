@@ -23,8 +23,8 @@ struct Vty {
     uint32_t cursor_x;
     uint32_t cursor_y;
     uint32_t flags;
-    uint8_t fg;
-    uint8_t bg;
+    uint32_t fg;
+    uint32_t bg;
     descriptor_defs::VtyCell cells[kMaxCols * kMaxRows];
     uint8_t input[kInputBufferSize];
     size_t input_head;
@@ -51,12 +51,14 @@ size_t cell_index(const Vty& vty, uint32_t x, uint32_t y) {
 
 void fill_cell(descriptor_defs::VtyCell& cell,
                uint8_t ch,
-               uint8_t fg,
-               uint8_t bg) {
-    cell.ch = ch;
+               uint32_t fg,
+               uint32_t bg) {
     cell.fg = fg;
     cell.bg = bg;
+    cell.ch = ch;
     cell.flags = 0;
+    cell.reserved[0] = 0;
+    cell.reserved[1] = 0;
 }
 
 void clear_row(Vty& vty, uint32_t row) {
@@ -75,6 +77,21 @@ void clear_all(Vty& vty) {
     }
     vty.cursor_x = 0;
     vty.cursor_y = 0;
+}
+
+bool set_cursor(Vty& vty, uint32_t x, uint32_t y) {
+    if (vty.cols == 0 || vty.rows == 0) {
+        return false;
+    }
+    if (x >= vty.cols) {
+        x = vty.cols - 1;
+    }
+    if (y >= vty.rows) {
+        y = vty.rows - 1;
+    }
+    vty.cursor_x = x;
+    vty.cursor_y = y;
+    return true;
 }
 
 void scroll_up(Vty& vty) {
@@ -197,8 +214,8 @@ Vty* allocate_vty() {
             vty.cursor_x = 0;
             vty.cursor_y = 0;
             vty.flags = 0;
-            vty.fg = 7;
-            vty.bg = 0;
+            vty.fg = 0xFFFFFFFF;   // white
+            vty.bg = 0x00000000;   // black
             vty.input_head = 0;
             vty.input_tail = 0;
             vty.lock = 0;
@@ -354,6 +371,51 @@ int vty_set_property(DescriptorEntry& entry,
         unlock_vty(*vty);
         return 0;
     }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyCursor)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::CursorPosition)) {
+            return -1;
+        }
+        auto* pos =
+            reinterpret_cast<const descriptor_defs::CursorPosition*>(in);
+        lock_vty(*vty);
+        bool ok = set_cursor(*vty, pos->x, pos->y);
+        unlock_vty(*vty);
+        return ok ? 0 : -1;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyClear)) {
+        lock_vty(*vty);
+        clear_all(*vty);
+        unlock_vty(*vty);
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyColor)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::ColorPair)) {
+            return -1;
+        }
+        auto* colors =
+            reinterpret_cast<const descriptor_defs::ColorPair*>(in);
+        lock_vty(*vty);
+        vty->fg = colors->fg;
+        vty->bg = colors->bg;
+        unlock_vty(*vty);
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyCells)) {
+        size_t cells = static_cast<size_t>(vty->cols) * vty->rows;
+        size_t required = cells * sizeof(descriptor_defs::VtyCell);
+        if (in == nullptr || size < required) {
+            return -1;
+        }
+        auto* cells_in = reinterpret_cast<const descriptor_defs::VtyCell*>(in);
+        lock_vty(*vty);
+        memcpy_fast(vty->cells, cells_in, required);
+        unlock_vty(*vty);
+        return 0;
+    }
     return -1;
 }
 
@@ -422,6 +484,76 @@ bool register_vty_descriptor() {
     return register_type(kTypeVty,
                          descriptor_vty::open_vty,
                          &descriptor_vty::kVtyOps);
+}
+
+int vty_set_property(uint32_t id,
+                     uint32_t property,
+                     const void* in,
+                     size_t size) {
+    using namespace descriptor_vty;
+    Vty* vty = find_vty(id);
+    if (vty == nullptr || !vty->in_use) {
+        return -1;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyCursor)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::CursorPosition)) {
+            return -1;
+        }
+        auto* pos =
+            reinterpret_cast<const descriptor_defs::CursorPosition*>(in);
+        lock_vty(*vty);
+        bool ok = set_cursor(*vty, pos->x, pos->y);
+        unlock_vty(*vty);
+        return ok ? 0 : -1;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyClear)) {
+        lock_vty(*vty);
+        clear_all(*vty);
+        unlock_vty(*vty);
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyColor)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::ColorPair)) {
+            return -1;
+        }
+        auto* colors =
+            reinterpret_cast<const descriptor_defs::ColorPair*>(in);
+        lock_vty(*vty);
+        vty->fg = colors->fg;
+        vty->bg = colors->bg;
+        unlock_vty(*vty);
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyCells)) {
+        size_t cells = static_cast<size_t>(vty->cols) * vty->rows;
+        size_t required = cells * sizeof(descriptor_defs::VtyCell);
+        if (in == nullptr || size < required) {
+            return -1;
+        }
+        auto* cells_in = reinterpret_cast<const descriptor_defs::VtyCell*>(in);
+        lock_vty(*vty);
+        memcpy_fast(vty->cells, cells_in, required);
+        unlock_vty(*vty);
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::VtyInjectInput)) {
+        if (in == nullptr || size == 0) {
+            return 0;
+        }
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(in);
+        lock_vty(*vty);
+        for (size_t i = 0; i < size; ++i) {
+            enqueue_input(*vty, bytes[i]);
+        }
+        unlock_vty(*vty);
+        return 0;
+    }
+    return -1;
 }
 
 }  // namespace descriptor

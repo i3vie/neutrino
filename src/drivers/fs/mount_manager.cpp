@@ -103,7 +103,9 @@ bool mount_requested_filesystems(const char* root_spec,
         }
         device_count += added;
         for (size_t j = 0; j < added; ++j) {
-            if (!descriptor::register_block_device(discovered[start_index + j], true)) {
+            // Allow user processes (e.g., installer) to access block devices,
+            // so do not lock them to kernel-only.
+            if (!descriptor::register_block_device(discovered[start_index + j], false)) {
                 log_message(LogLevel::Warn,
                             "MountManager: failed to register descriptor for %s",
                             discovered[start_index + j].name != nullptr

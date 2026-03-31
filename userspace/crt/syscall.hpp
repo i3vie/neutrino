@@ -39,6 +39,13 @@ enum class SystemCall : long {
     DirectoryOpenAt      = 30,
     FileOpenAt           = 31,
     FileCreateAt         = 32,
+    PrincipalCreate      = 33,
+    PrincipalSet         = 34,
+    CapabilityGrant      = 35,
+    CapabilityPass       = 36,
+    UserCreate           = 37,
+    UserFind             = 38,
+    UserBumpGeneration   = 39,
 };
 
 enum : uint32_t {
@@ -50,6 +57,7 @@ enum : uint64_t {
 };
 
 constexpr uint32_t kInvalidDescriptor = 0xFFFFFFFFu;
+constexpr long kDescriptorWouldBlock = -2;
 
 struct DirEntry {
     char name[64];
@@ -327,6 +335,52 @@ static inline long pipe_get_info(uint32_t handle,
         sizeof(*info));
 }
 
+static inline long net_device_open(uint32_t index = 0,
+                                   uint64_t requested_flags = 0) {
+    return descriptor_open(static_cast<uint32_t>(descriptor_defs::Type::NetDevice),
+                           index,
+                           requested_flags,
+                           0);
+}
+
+static inline long net_device_get_info(uint32_t handle,
+                                       descriptor_defs::NetDeviceInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::NetDeviceInfo),
+        info,
+        sizeof(*info));
+}
+
+static inline long net_device_get_ipv4_config(
+    uint32_t handle,
+    descriptor_defs::NetIpv4Config* config) {
+    if (config == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::NetIpv4Config),
+        config,
+        sizeof(*config));
+}
+
+static inline long net_device_set_ipv4_config(
+    uint32_t handle,
+    const descriptor_defs::NetIpv4Config* config) {
+    if (config == nullptr) {
+        return -1;
+    }
+    return descriptor_set_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::NetIpv4Config),
+        config,
+        sizeof(*config));
+}
+
 static inline long descriptor_read(uint32_t handle,
                                        void* buffer,
                                        size_t length,
@@ -445,4 +499,48 @@ static inline long directory_read(uint32_t handle, DirEntry* out_entry) {
 static inline long directory_close(uint32_t handle) {
     return raw_syscall1(SystemCall::DirectoryClose,
                         static_cast<long>(handle));
+}
+// user and principal helpers
+static inline void* user_create(const char* name, uint64_t caps) {
+    long ret = raw_syscall2(SystemCall::UserCreate,
+                            reinterpret_cast<long>(name),
+                            static_cast<long>(caps));
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+}
+
+static inline void* user_find(const char* name) {
+    long ret = raw_syscall1(SystemCall::UserFind,
+                            reinterpret_cast<long>(name));
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+}
+
+static inline long user_bump_generation(void* user) {
+    return raw_syscall1(SystemCall::UserBumpGeneration,
+                        reinterpret_cast<long>(user));
+}
+
+static inline void* principal_create(void* backing_user, uint64_t allowed_caps) {
+    long ret = raw_syscall2(SystemCall::PrincipalCreate,
+                            reinterpret_cast<long>(backing_user),
+                            static_cast<long>(allowed_caps));
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(ret));
+}
+
+static inline long principal_set(void* principal) {
+    return raw_syscall1(SystemCall::PrincipalSet,
+                        reinterpret_cast<long>(principal));
+}
+
+static inline long capability_grant(uint64_t kind_value) {
+    return raw_syscall1(SystemCall::CapabilityGrant,
+                        static_cast<long>(kind_value));
+}
+
+static inline long capability_pass(uint32_t child_pid,
+                                   const uint64_t* handles,
+                                   uint64_t count) {
+    return raw_syscall3(SystemCall::CapabilityPass,
+                        static_cast<long>(child_pid),
+                        reinterpret_cast<long>(handles),
+                        static_cast<long>(count));
 }
