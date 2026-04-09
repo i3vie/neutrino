@@ -372,7 +372,6 @@ static void kernel_main_stage2() {
     virtio_net::register_driver();
     e1000e::register_driver();
     intel_uhd::register_driver();
-    driver_registry::probe_pci_drivers();
 
     vfs::init();
 
@@ -618,6 +617,7 @@ static void kernel_main_stage2() {
     process::init();
     scheduler::init();
     descriptor::start_block_io_worker();
+    driver_registry::start_pci_probe_worker();
 
     constexpr size_t kInitMaxSize = 64 * 1024;
     alignas(16) static uint8_t init_buffer[kInitMaxSize];

@@ -27,5 +27,6 @@ bool register_pci_driver(const char* name,
                          InitFn init);
 
 void probe_pci_drivers();
+void start_pci_probe_worker();
 
 }  // namespace driver_registry
