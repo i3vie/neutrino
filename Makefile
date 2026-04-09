@@ -22,6 +22,7 @@ QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
 QEMU_NET_DEVICE ?= e1000e
+QEMU_HOSTFWD ?=
 QEMU_TAP_IFACE ?= tap0
 QEMU_TAP_SCRIPT ?= no
 QEMU_TAP_DOWN_SCRIPT ?= no
@@ -29,13 +30,18 @@ ifeq ($(QEMU_NET_BACKEND),tap)
 QEMU_NET_ARGS := -netdev tap,id=net0,ifname=$(QEMU_TAP_IFACE),script=$(QEMU_TAP_SCRIPT),downscript=$(QEMU_TAP_DOWN_SCRIPT) \
 		-device $(QEMU_NET_DEVICE),netdev=net0,mac=$(QEMU_NET_MAC)
 else
-QEMU_NET_ARGS := -netdev user,id=net0 \
+QEMU_NETDEV_USER := -netdev user,id=net0
+ifneq ($(strip $(QEMU_HOSTFWD)),)
+QEMU_NETDEV_USER := $(QEMU_NETDEV_USER),hostfwd=$(QEMU_HOSTFWD)
+endif
+QEMU_NET_ARGS := $(QEMU_NETDEV_USER) \
 		-device $(QEMU_NET_DEVICE),netdev=net0,mac=$(QEMU_NET_MAC)
 endif
 QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		-drive file=hdd.img,format=raw,if=ide \
 		-enable-kvm -display sdl \
+		-machine pc -cpu qemu64,+apic \
 		$(QEMU_NET_ARGS)
 QEMU_DEBUG_ARGS := -d int \
 		-monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot

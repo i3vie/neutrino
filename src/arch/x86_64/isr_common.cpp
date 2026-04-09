@@ -3,6 +3,7 @@
 
 #include "../../drivers/input/keyboard.hpp"
 #include "../../drivers/input/mouse.hpp"
+#include "../../drivers/interrupts/ioapic.hpp"
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
 #include "../../drivers/net/e1000e.hpp"
@@ -106,12 +107,16 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             return;
         } else if (irq == 1) {
             keyboard::handle_irq();
-            pic::send_eoi(1);
+            if (!ioapic::handles_irq(1)) {
+                pic::send_eoi(1);
+            }
             lapic::eoi();
             return;
         } else if (irq == 12) {
             mouse::handle_irq();
-            pic::send_eoi(12);
+            if (!ioapic::handles_irq(12)) {
+                pic::send_eoi(12);
+            }
             lapic::eoi();
             return;
         } else if (regs->int_no == 0x40) {

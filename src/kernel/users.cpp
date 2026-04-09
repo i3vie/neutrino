@@ -39,6 +39,112 @@ static bool path_valid() {
     return g_has_storage_path && g_storage_path[0] != '\0';
 }
 
+bool build_root_relative_path(const char* suffix,
+                              char* out,
+                              size_t out_size) {
+    if (!path_valid() || suffix == nullptr || out == nullptr || out_size == 0) {
+        return false;
+    }
+    size_t root_len = 0;
+    while (g_storage_path[root_len] != '\0' && g_storage_path[root_len] != '/') {
+        ++root_len;
+    }
+    if (root_len == 0 || root_len + 1 >= out_size) {
+        return false;
+    }
+    for (size_t i = 0; i < root_len; ++i) {
+        out[i] = g_storage_path[i];
+    }
+    size_t idx = root_len;
+    out[idx++] = '/';
+    for (size_t i = 0; suffix[i] != '\0'; ++i) {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = suffix[i];
+    }
+    out[idx] = '\0';
+    return true;
+}
+
+void ensure_directory(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+    vfs::DirectoryHandle handle{};
+    if (vfs::open_directory(path, handle)) {
+        vfs::close_directory(handle);
+        return;
+    }
+    if (!vfs::create_directory(path)) {
+        log_message(LogLevel::Warn, "Users: failed to create directory '%s'", path);
+    }
+}
+
+void ensure_parent_directories(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return;
+    }
+
+    char current[path_util::kMaxPathLength];
+    size_t path_len = string_util::length(path);
+    if (path_len >= sizeof(current)) {
+        path_len = sizeof(current) - 1;
+    }
+    for (size_t i = 0; i < path_len; ++i) {
+        current[i] = path[i];
+    }
+    current[path_len] = '\0';
+
+    int last_slash = -1;
+    for (size_t i = 0; current[i] != '\0'; ++i) {
+        if (current[i] == '/') {
+            last_slash = static_cast<int>(i);
+        }
+    }
+    if (last_slash <= 0) {
+        return;
+    }
+    current[last_slash] = '\0';
+
+    char partial[path_util::kMaxPathLength];
+    size_t out = 0;
+    for (size_t i = 0; current[i] != '\0' && out + 1 < sizeof(partial); ++i) {
+        partial[out++] = current[i];
+        partial[out] = '\0';
+        if (current[i] == '/') {
+            continue;
+        }
+        char next = current[i + 1];
+        if (next == '/' || next == '\0') {
+            ensure_directory(partial);
+        }
+    }
+}
+
+void ensure_home_directory(const char* name) {
+    if (name == nullptr || name[0] == '\0') {
+        return;
+    }
+
+    char user_root[128];
+    if (!build_root_relative_path("user", user_root, sizeof(user_root))) {
+        return;
+    }
+    ensure_directory(user_root);
+
+    char user_home[128];
+    size_t len = string_util::length(user_root);
+    if (len + 1 >= sizeof(user_home)) {
+        return;
+    }
+    string_util::copy(user_home, sizeof(user_home), user_root);
+    user_home[len++] = '/';
+    user_home[len] = '\0';
+    string_util::copy(user_home + len, sizeof(user_home) - len, name);
+    ensure_directory(user_home);
+}
+
 }  // namespace
 
 namespace users {
@@ -73,6 +179,7 @@ User* create(const char* name, uint64_t allowed_caps) {
         u.generation = 1;
         u.active = true;
         User* out = &u;
+        ensure_home_directory(u.name);
         if (!g_loading_from_disk) {
             if (!persist()) {
                 log_message(LogLevel::Warn, "Users: persist failed after create");
@@ -158,33 +265,9 @@ bool persist() {
     if (!path_valid()) {
         return false;
     }
-
-    // Ensure parent directory exists if path contains subdirectories.
-    auto ensure_parent_dir = [](const char* path) {
-        char dir[path_util::kMaxPathLength];
-        string_util::copy(dir, sizeof(dir), path);
-        // strip filename
-        for (int i = static_cast<int>(string_util::length(dir)) - 1; i >= 0; --i) {
-            if (dir[i] == '/') {
-                dir[i] = '\0';
-                break;
-            }
-        }
-        if (dir[0] == '\0') {
-            return;
-        }
-        // Try to open the directory to see if it exists
-        vfs::DirectoryHandle dh{};
-        if (vfs::open_directory(dir, dh)) {
-            vfs::close_directory(dh);
-            return;
-        }
-        // No mkdir capability yet; if missing, persist will still fail and log.
-    };
-
-    ensure_parent_dir(g_storage_path);
+    ensure_parent_directories(g_storage_path);
     if (g_storage_path_fallback[0] != '\0') {
-        ensure_parent_dir(g_storage_path_fallback);
+        ensure_parent_directories(g_storage_path_fallback);
     }
     Header hdr{};
     hdr.magic = kMagic;
@@ -249,21 +332,21 @@ bool load_from_disk() {
     }
     g_loading_from_disk = true;
     uint8_t buffer[4096];
-    size_t read = 0;
-    vfs::FileHandle handle{};
+    size_t read_size = 0;
+    const char* loaded_path = nullptr;
     auto try_load = [&](const char* p) -> bool {
         Header hdr{};
         vfs::FileHandle h{};
-        size_t read_size = 0;
+        size_t local_read_size = 0;
         if (!vfs::open_file(p, h)) {
             return false;
         }
-        bool ok = vfs::read_file(h, 0, buffer, sizeof(buffer), read_size);
+        bool ok = vfs::read_file(h, 0, buffer, sizeof(buffer), local_read_size);
         vfs::close_file(h);
         if (!ok) {
             return false;
         }
-        if (read_size < sizeof(Header)) {
+        if (local_read_size < sizeof(Header)) {
             return false;
         }
         memcpy(&hdr, buffer, sizeof(Header));
@@ -273,9 +356,11 @@ bool load_from_disk() {
         }
         size_t expected = sizeof(Header) +
                           static_cast<size_t>(hdr.count) * sizeof(PackedUser);
-        if (read_size < expected) {
+        if (local_read_size < expected) {
             return false;
         }
+        read_size = local_read_size;
+        loaded_path = p;
         return true;
     };
 
@@ -293,13 +378,7 @@ bool load_from_disk() {
         persist();  // create blank store
         return false;
     }
-    if (!vfs::read_file(handle, 0, buffer, sizeof(buffer), read)) {
-        vfs::close_file(handle);
-        g_loading_from_disk = false;
-        return false;
-    }
-    vfs::close_file(handle);
-    if (read < sizeof(Header)) {
+    if (read_size < sizeof(Header)) {
         g_loading_from_disk = false;
         return false;
     }
@@ -314,8 +393,14 @@ bool load_from_disk() {
         if (u != nullptr) {
             u->generation = p.generation;
             u->active = p.active != 0;
+            ensure_home_directory(u->name);
         }
     }
+    log_message(LogLevel::Info,
+                "Users: loaded %u entr%s from '%s'",
+                static_cast<unsigned int>(limit),
+                (limit == 1) ? "y" : "ies",
+                (loaded_path != nullptr) ? loaded_path : "(unknown)");
     g_loading_from_disk = false;
     return true;
 }

@@ -21,6 +21,7 @@ struct MountEntry {
 };
 
 MountEntry g_mounts[kMaxMounts]{};
+const char* g_root_mount = nullptr;
 
 struct RootDirectoryContext {
     size_t index;
@@ -114,7 +115,15 @@ MountEntry* find_mount_for_path(const char* path, const char*& remainder) {
     size_t mount_len = static_cast<size_t>(mount_end - trimmed);
     MountEntry* entry = find_mount(trimmed, mount_len);
     if (entry == nullptr) {
-        return nullptr;
+        if (g_root_mount == nullptr) {
+            return nullptr;
+        }
+        entry = find_mount(g_root_mount, string_length(g_root_mount));
+        if (entry == nullptr) {
+            return nullptr;
+        }
+        remainder = trimmed;
+        return entry;
     }
 
     const char* next = mount_end;
@@ -187,6 +196,7 @@ void init() {
     for (auto& mount : g_mounts) {
         mount = {};
     }
+    g_root_mount = nullptr;
 }
 
 bool register_mount(const char* name,
@@ -218,6 +228,23 @@ bool register_mount(const char* name,
 
     log_message(LogLevel::Warn, "VFS: no free mount slots for '%s'", name);
     return false;
+}
+
+void set_root_mount(const char* name) {
+    if (name == nullptr || *name == '\0') {
+        g_root_mount = nullptr;
+        return;
+    }
+    size_t name_len = string_length(name);
+    MountEntry* mount = find_mount(name, name_len);
+    if (mount == nullptr) {
+        log_message(LogLevel::Warn,
+                    "VFS: cannot set root mount to unknown '%s'",
+                    name);
+        return;
+    }
+    g_root_mount = mount->name;
+    log_message(LogLevel::Info, "VFS: root mount alias set to '%s'", g_root_mount);
 }
 
 size_t enumerate_mounts(const char** names, size_t max_names) {

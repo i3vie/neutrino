@@ -1,6 +1,7 @@
 #include "mouse.hpp"
 
 #include "arch/x86_64/io.hpp"
+#include "../interrupts/ioapic.hpp"
 #include "../interrupts/pic.hpp"
 #include "../log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
@@ -37,6 +38,8 @@ SlotBuffer g_buffers[kInputSlots];
 bool g_initialized = false;
 uint8_t g_packet[3];
 uint8_t g_packet_index = 0;
+bool g_have_last_event = false;
+Event g_last_event{};
 
 bool wait_input_clear() {
     for (size_t i = 0; i < 100000; ++i) {
@@ -121,6 +124,8 @@ void init() {
         buf.tail = 0;
     }
     g_packet_index = 0;
+    g_have_last_event = false;
+    g_last_event = {};
 
     write_command(kCommandEnableAux);
     write_command(kCommandReadConfig);
@@ -137,8 +142,10 @@ void init() {
         log_message(LogLevel::Warn, "Mouse: failed to enable streaming");
     }
 
-    pic::set_mask(2, false);
-    pic::set_mask(12, false);
+    if (!ioapic::handles_irq(12)) {
+        pic::set_mask(2, false);
+        pic::set_mask(12, false);
+    }
 
     g_initialized = true;
 }
@@ -168,6 +175,15 @@ void handle_irq() {
         ev.dx = static_cast<int8_t>(g_packet[1]);
         ev.dy = static_cast<int8_t>(g_packet[2]);
         ev.reserved = 0;
+
+        if (g_have_last_event &&
+            ev.buttons == g_last_event.buttons &&
+            ev.dx == 0 && ev.dy == 0 &&
+            g_last_event.dx == 0 && g_last_event.dy == 0) {
+            continue;
+        }
+        g_last_event = ev;
+        g_have_last_event = true;
 
         uint32_t slot = descriptor::framebuffer_active_slot();
         if (slot >= kInputSlots) {

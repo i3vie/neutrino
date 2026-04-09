@@ -21,6 +21,9 @@ constexpr size_t kMaxCommandLength = 128;
 constexpr size_t kPathMax = 128;
 constexpr size_t kMaxSegments = 64;
 constexpr size_t kMaxSearchDirs = 8;
+constexpr uint32_t kPromptUserColor = 0xFF8FD0FFu;
+constexpr uint32_t kPromptPathColor = 0xFFF2F4F8u;
+constexpr uint32_t kPromptBgColor = 0x00000000u;
 struct PathSegment {
     const char* data;
     size_t length;
@@ -111,6 +114,20 @@ void copy_string(char* dest, size_t dest_size, const char* src) {
     dest[idx] = '\0';
 }
 
+bool starts_with(const char* text, const char* prefix) {
+    if (text == nullptr || prefix == nullptr) {
+        return false;
+    }
+    size_t idx = 0;
+    while (prefix[idx] != '\0') {
+        if (text[idx] != prefix[idx]) {
+            return false;
+        }
+        ++idx;
+    }
+    return true;
+}
+
 bool strings_equal(const char* a, const char* b) {
     if (a == nullptr || b == nullptr) {
         return false;
@@ -152,6 +169,7 @@ uint32_t parse_vty_arg(const char* args) {
 
 char g_current_cwd[128] = "/";
 char g_boot_mount[64] = {0};
+char g_session_user[32] = "root";
 
 bool is_space(char ch) {
     return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
@@ -271,10 +289,16 @@ size_t build_search_directories(const char* cwd,
         }
     };
 
+    append("/binary");
+    append("/BINARY");
+
     char mount_name[64];
     extract_mount_name(cwd, mount_name, sizeof(mount_name));
-    if (mount_name[0] == '\0' && g_boot_mount[0] != '\0') {
-        copy_string(mount_name, sizeof(mount_name), g_boot_mount);
+    if (strings_equal(mount_name, "binary") ||
+        strings_equal(mount_name, "config") ||
+        strings_equal(mount_name, "system") ||
+        strings_equal(mount_name, "user")) {
+        mount_name[0] = '\0';
     }
     append_mount_dirs(mount_name);
     if (g_boot_mount[0] != '\0' &&
@@ -420,20 +444,34 @@ bool resolve_path(const char* base,
 }
 
 size_t build_prompt(char* buffer, size_t buffer_size) {
-    if (buffer == nullptr || buffer_size < 3) {
+    if (buffer == nullptr || buffer_size < 6) {
         return 0;
     }
+    size_t user_len = string_length(g_session_user);
     size_t cwd_len = string_length(g_current_cwd);
-    if (cwd_len + 3 > buffer_size) {
-        if (buffer_size <= 3) {
+    size_t needed = user_len + cwd_len + 6;
+    if (needed > buffer_size) {
+        if (buffer_size <= 6) {
             buffer[0] = '>';
             buffer[1] = ' ';
             buffer[2] = '\0';
             return 2;
         }
-        cwd_len = buffer_size - 3;
+        size_t available = buffer_size - 6;
+        if (user_len > available) {
+            user_len = available;
+            cwd_len = 0;
+        } else {
+            cwd_len = available - user_len;
+        }
     }
     size_t idx = 0;
+    for (size_t i = 0; i < user_len; ++i) {
+        buffer[idx++] = g_session_user[i];
+    }
+    buffer[idx++] = ' ';
+    buffer[idx++] = '|';
+    buffer[idx++] = ' ';
     for (size_t i = 0; i < cwd_len; ++i) {
         buffer[idx++] = g_current_cwd[i];
     }
@@ -442,6 +480,90 @@ size_t build_prompt(char* buffer, size_t buffer_size) {
     buffer[idx++] = ' ';
     buffer[idx] = '\0';
     return idx;
+}
+
+bool set_console_color(long console, uint32_t fg, uint32_t bg) {
+    descriptor_defs::ColorPair colors{fg, bg};
+    return descriptor_set_property(
+               static_cast<uint32_t>(console),
+               static_cast<uint32_t>(descriptor_defs::Property::ConsoleColor),
+               &colors,
+               sizeof(colors)) == 0;
+}
+
+void write_prompt(long console, const char* prompt, size_t prompt_len) {
+    size_t user_len = string_length(g_session_user);
+    size_t prefix_len = user_len + 3;
+    if (prefix_len > prompt_len) {
+        prefix_len = prompt_len;
+    }
+
+    set_console_color(console, kPromptUserColor, kPromptBgColor);
+    if (prefix_len > 0) {
+        descriptor_write(static_cast<uint32_t>(console), prompt, prefix_len);
+    }
+    set_console_color(console, kPromptPathColor, kPromptBgColor);
+    if (prompt_len > prefix_len) {
+        descriptor_write(static_cast<uint32_t>(console),
+                         prompt + prefix_len,
+                         prompt_len - prefix_len);
+    }
+}
+
+void parse_session_user(const char* args) {
+    if (args == nullptr) {
+        return;
+    }
+    const char* cursor = args;
+    while (*cursor != '\0') {
+        while (is_space(*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char* token = cursor;
+        while (*cursor != '\0' && !is_space(*cursor)) {
+            ++cursor;
+        }
+        size_t len = static_cast<size_t>(cursor - token);
+        if (len > 5 && starts_with(token, "user=")) {
+            size_t copy_len = len - 5;
+            if (copy_len >= sizeof(g_session_user)) {
+                copy_len = sizeof(g_session_user) - 1;
+            }
+            for (size_t i = 0; i < copy_len; ++i) {
+                g_session_user[i] = token[5 + i];
+            }
+            g_session_user[copy_len] = '\0';
+            return;
+        }
+    }
+}
+
+void maybe_enter_home_directory() {
+    if (g_session_user[0] == '\0') {
+        return;
+    }
+
+    char home[128];
+    size_t idx = 0;
+    const char prefix[] = "/user/";
+    for (size_t i = 0; prefix[i] != '\0' && idx + 1 < sizeof(home); ++i) {
+        home[idx++] = prefix[i];
+    }
+    for (size_t i = 0; g_session_user[i] != '\0' && idx + 1 < sizeof(home); ++i) {
+        home[idx++] = g_session_user[i];
+    }
+    home[idx] = '\0';
+
+    long dir = directory_open(home);
+    if (dir < 0) {
+        return;
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    copy_string(g_current_cwd, sizeof(g_current_cwd), home);
+    (void)setcwd(g_current_cwd);
 }
 
 bool join_path(char* dest,
@@ -603,8 +725,9 @@ size_t render_line(long console,
                    size_t buffer_len,
                    size_t previous_len) {
     descriptor_write(static_cast<uint32_t>(console), "\r", 1);
-    descriptor_write(static_cast<uint32_t>(console), prompt, prompt_len);
+    write_prompt(console, prompt, prompt_len);
     if (buffer_len > 0) {
+        set_console_color(console, kPromptPathColor, kPromptBgColor);
         descriptor_write(static_cast<uint32_t>(console),
                          buffer,
                          buffer_len);
@@ -617,8 +740,9 @@ size_t render_line(long console,
             descriptor_write(static_cast<uint32_t>(console), " ", 1);
         }
         descriptor_write(static_cast<uint32_t>(console), "\r", 1);
-        descriptor_write(static_cast<uint32_t>(console), prompt, prompt_len);
+        write_prompt(console, prompt, prompt_len);
         if (buffer_len > 0) {
+            set_console_color(console, kPromptPathColor, kPromptBgColor);
             descriptor_write(static_cast<uint32_t>(console),
                              buffer,
                              buffer_len);
@@ -758,6 +882,8 @@ void execute_command(long console, const char* line) {
             message[idx] = '\0';
             print_line(console, message);
         }
+    } else if (equals_literal(command, "whoami")) {
+        print_line(console, g_session_user);
     } else if (equals_literal(command, "help")) {
         char path_info[192];
         size_t idx = 0;
@@ -780,7 +906,7 @@ void execute_command(long console, const char* line) {
         append_literal(")");
         path_info[idx] = '\0';
         print_line(console, path_info);
-        print_line(console, "builtins: cd, help, spawn, burst");
+        print_line(console, "builtins: cd, help, whoami, spawn, burst");
     } else if (equals_literal(command, "burst")) {
         // Spawn multiple no-op tasks without waiting.
         int spawned = 0;
@@ -825,6 +951,7 @@ void execute_command(long console, const char* line) {
 
 int main(uint64_t arg, uint64_t) {
     const char* args = reinterpret_cast<const char*>(arg);
+    parse_session_user(args);
     uint32_t vty_id = parse_vty_arg(args);
     long vty_handle = -1;
     if (vty_id != 0) {
@@ -850,12 +977,13 @@ int main(uint64_t arg, uint64_t) {
         g_current_cwd[0] = '/';
         g_current_cwd[1] = '\0';
     }
+    maybe_enter_home_directory();
     extract_mount_name(g_current_cwd, g_boot_mount, sizeof(g_boot_mount));
 
     char prompt_buffer[160];
     size_t prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
     descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-    descriptor_write(static_cast<uint32_t>(console), prompt_buffer, prompt_len);
+    write_prompt(console, prompt_buffer, prompt_len);
 
     char input_buffer[kMaxInputLength];
     size_t input_length = 0;
@@ -872,9 +1000,7 @@ int main(uint64_t arg, uint64_t) {
                 input_length = 0;
                 input_buffer[0] = '\0';
                 prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
-                descriptor_write(static_cast<uint32_t>(console),
-                                 prompt_buffer,
-                                 prompt_len);
+                write_prompt(console, prompt_buffer, prompt_len);
                 rendered_length = prompt_len;
             } else if (key == '\b' || key == 0x7F) {
                 if (input_length > 0) {

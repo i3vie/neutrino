@@ -84,6 +84,9 @@ bool require_capability(process::Process& proc,
     if (proc.principal == nullptr) {
         return true;
     }
+    if (capabilities::principal_allows(*proc.principal, kind)) {
+        return true;
+    }
     const uint64_t* user_handles = reinterpret_cast<const uint64_t*>(frame.r12);
     size_t count = static_cast<size_t>(frame.r13 & 0xFFFF);
     constexpr size_t kMaxHandles = 8;

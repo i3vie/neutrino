@@ -1,6 +1,7 @@
 #include "keyboard.hpp"
 
 #include "arch/x86_64/io.hpp"
+#include "../interrupts/ioapic.hpp"
 #include "../interrupts/pic.hpp"
 #include "../log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
@@ -215,7 +216,9 @@ void init() {
     write_command(kCommandWriteConfig);
     write_data(config);
 
-    pic::set_mask(1, false);
+    if (!ioapic::handles_irq(1)) {
+        pic::set_mask(1, false);
+    }
 }
 
 void handle_irq() {

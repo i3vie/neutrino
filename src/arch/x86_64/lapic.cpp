@@ -37,7 +37,7 @@ void init(uint64_t hhdm_offset) {
         return;
     }
 
-    // Enable LAPIC and set spurious vector (use 0xFF).
+    // enable LAPIC and set spurious vector (use 0xFF)
     write(0xF0, read(0xF0) | 0x100 | 0xFF);
 }
 
@@ -51,12 +51,12 @@ uint32_t id() {
 void setup_timer(uint8_t vector, uint32_t initial_count) {
     if (g_lapic == nullptr) return;
 
-    // Divide by 16 (binary 0b0011 = 16)
+    // divide by 16 (binary 0b0011 = 16)
     write(0x3E0, 0x3);
-    // Mask timer during setup
+    // mask timer during setup
     write(0x320, (1u << 16) | vector);
     write(0x380, initial_count);
-    // Unmask periodic
+    // unmask periodic
     write(0x320, 0x20000 | vector);
 }
 
@@ -67,7 +67,7 @@ void eoi() {
 
 void send_ipi_all_others(uint8_t vector) {
     if (g_lapic == nullptr) return;
-    // All excluding self, shorthand=3
+    // all excluding self, shorthand=3
     write(0x310, 0x0);
     write(0x300, (3u << 18) | vector);
 }

@@ -56,6 +56,8 @@ struct Icon {
     char glyph;
 };
 
+char g_session_user[32] = {0};
+
 void copy_string(char* dest, size_t dest_size, const char* src) {
     if (dest == nullptr || dest_size == 0) {
         return;
@@ -67,6 +69,51 @@ void copy_string(char* dest, size_t dest_size, const char* src) {
         }
     }
     dest[i] = '\0';
+}
+
+bool starts_with(const char* text, const char* prefix) {
+    if (text == nullptr || prefix == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; prefix[i] != '\0'; ++i) {
+        if (text[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void parse_session_user(const char* args) {
+    if (args == nullptr) {
+        return;
+    }
+    const char* cursor = args;
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' ||
+               *cursor == '\r' || *cursor == '\n') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char* token = cursor;
+        while (*cursor != '\0' && *cursor != ' ' &&
+               *cursor != '\t' && *cursor != '\r' && *cursor != '\n') {
+            ++cursor;
+        }
+        size_t len = static_cast<size_t>(cursor - token);
+        if (len > 5 && starts_with(token, "user=")) {
+            size_t copy_len = len - 5;
+            if (copy_len >= sizeof(g_session_user)) {
+                copy_len = sizeof(g_session_user) - 1;
+            }
+            for (size_t i = 0; i < copy_len; ++i) {
+                g_session_user[i] = token[5 + i];
+            }
+            g_session_user[copy_len] = '\0';
+            return;
+        }
+    }
 }
 
 bool string_equal_n(const char* left, const char* right, size_t max_len) {
@@ -493,7 +540,8 @@ void draw_icon(const Surface& surface,
 
 }  // namespace
 
-int main(uint64_t, uint64_t) {
+int main(uint64_t arg_ptr, uint64_t) {
+    parse_session_user(reinterpret_cast<const char*>(arg_ptr));
     long registry_handle = shared_memory_open(kRegistryName, sizeof(wm::Registry));
     if (registry_handle < 0) {
         return 1;
@@ -637,6 +685,7 @@ int main(uint64_t, uint64_t) {
     uint32_t icon_fill = lattice::pack_color(surface.format, 78, 110, 190);
     uint32_t icon_border = lattice::pack_color(surface.format, 16, 18, 26);
     uint32_t label_color = lattice::pack_color(surface.format, 230, 235, 245);
+    uint32_t user_color = lattice::pack_color(surface.format, 143, 208, 255);
 
     wm::MenuBar menu_bar{};
     char focused_title[32];
@@ -685,6 +734,16 @@ int main(uint64_t, uint64_t) {
         int32_t title_y =
             static_cast<int32_t>((g_top_bar_height - g_label_height) / 2);
         draw_text(surface, title_x, title_y, focused_title, label_color);
+
+        if (g_session_user[0] != '\0') {
+            uint32_t user_width = text_width(g_session_user);
+            int32_t user_x = static_cast<int32_t>(surface.width) -
+                             static_cast<int32_t>(g_top_bar_padding_x + user_width);
+            if (user_x < static_cast<int32_t>(g_top_bar_padding_x)) {
+                user_x = static_cast<int32_t>(g_top_bar_padding_x);
+            }
+            draw_text(surface, user_x, title_y, g_session_user, user_color);
+        }
 
         uint32_t menu_start = g_top_bar_padding_x + title_width + g_menu_gap;
         if (menu_start < g_top_bar_padding_x + g_menu_gap) {
@@ -786,6 +845,7 @@ int main(uint64_t, uint64_t) {
 
     uint8_t buffer[2048];
     size_t pending = 0;
+    bool left_down = false;
 
     while (1) {
         long read = descriptor_read(static_cast<uint32_t>(reply_handle),
@@ -811,8 +871,10 @@ int main(uint64_t, uint64_t) {
                                     buffer + offset,
                                     sizeof(msg));
                 offset += sizeof(msg);
-                bool left = (msg.buttons & 0x1u) != 0;
-                if (left) {
+                bool new_left = (msg.buttons & 0x1u) != 0;
+                bool left_pressed = new_left && !left_down;
+                left_down = new_left;
+                if (left_pressed) {
                     bool handled = false;
                     uint32_t title_width = text_width(focused_title);
                     uint32_t menu_start =

@@ -5,8 +5,10 @@
 #include "../drivers/console/console.hpp"
 #include "../drivers/driver_registry.hpp"
 #include "../drivers/fs/mount_manager.hpp"
+#include "../drivers/gpu/intel_uhd.hpp"
 #include "../drivers/input/keyboard.hpp"
 #include "../drivers/input/mouse.hpp"
+#include "../drivers/interrupts/ioapic.hpp"
 #include "../drivers/interrupts/pic.hpp"
 #include "../drivers/limine/limine_requests.hpp"
 #include "../drivers/log/logging.hpp"
@@ -227,7 +229,6 @@ static void kernel_main_stage2() {
     descriptor::register_builtin_types();
     capabilities::init();
     users::init();
-    users::load_from_disk();
 
     descriptor::register_framebuffer_device(framebuffer, fb_phys_addr);
     uint32_t framebuffer_handle =
@@ -279,6 +280,21 @@ static void kernel_main_stage2() {
     syscall::init();
     log_message(LogLevel::Info, "Syscall interface initialized");
 
+    log_message(LogLevel::Info, "Initializing paging");
+    paging_init();
+    log_message(LogLevel::Info, "Paging initialized");
+
+    lapic::init(hhdm_request.response->offset);
+    log_message(LogLevel::Info, "Local APIC initialized");
+
+    uint64_t rsdp_address = 0;
+    if (rsdp_request.response != nullptr) {
+        rsdp_address = reinterpret_cast<uint64_t>(rsdp_request.response->address);
+    }
+    ioapic::init(rsdp_address, hhdm_request.response->offset, bsp_lapic);
+    (void)ioapic::route_isa_irq(1, 32 + 1);
+    (void)ioapic::route_isa_irq(12, 32 + 12);
+
     log_message(LogLevel::Info, "Initializing PIC");
     pic::init();
     log_message(LogLevel::Info, "PIC initialized");
@@ -308,18 +324,11 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Debug, "HHDM offset: %016x",
                 (unsigned long long)hhdm_request.response->offset);
 
-    log_message(LogLevel::Info, "Initializing paging");
-    paging_init();
     log_message(LogLevel::Info, "Initializing physical memory pools");
     memory::init();
     if (kconsole != nullptr) {
         kconsole->enable_back_buffer();
     }
-    log_message(LogLevel::Info, "Paging initialized");
-
-    lapic::init(hhdm_request.response->offset);
-    log_message(LogLevel::Info, "Local APIC initialized");
-
     smp::init();
 
     bool pat_ok = cpu::configure_pat_write_combining();
@@ -354,7 +363,6 @@ static void kernel_main_stage2() {
         cmdline_request.response->cmdline != nullptr) {
         cmdline = cmdline_request.response->cmdline;
     }
-
     net::init(cmdline);
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
@@ -363,6 +371,7 @@ static void kernel_main_stage2() {
 
     virtio_net::register_driver();
     e1000e::register_driver();
+    intel_uhd::register_driver();
     driver_registry::probe_pci_drivers();
 
     vfs::init();
@@ -463,6 +472,7 @@ static void kernel_main_stage2() {
     char boot_mount_name[64] = {0};
     if (root_ptr != nullptr && root_ok) {
         string_util::copy(boot_mount_name, sizeof(boot_mount_name), root_ptr);
+        vfs::set_root_mount(root_ptr);
         // Configure user storage path under the root mount.
         char user_path[128];
         user_path[0] = '\0';
@@ -475,6 +485,7 @@ static void kernel_main_stage2() {
                               sizeof(user_path) - len,
                               suffix);
             users::set_storage_path(user_path);
+            users::load_from_disk();
         }
 
         net::load_config(root_ptr);
