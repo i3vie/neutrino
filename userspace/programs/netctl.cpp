@@ -367,10 +367,14 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
         print_u32(registry->net_rx_frames);
         print("\nrx udp: ");
         print_u32(registry->net_rx_udp);
+        print("\nrx tcp: ");
+        print_u32(registry->net_rx_tcp);
         print("\nrx delivered: ");
         print_u32(registry->net_rx_delivered);
         print("\ntx udp: ");
         print_u32(registry->net_tx_udp);
+        print("\ntx tcp: ");
+        print_u32(registry->net_tx_tcp);
         print("\n");
         descriptor_close(static_cast<uint32_t>(handle));
         return 0;

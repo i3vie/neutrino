@@ -15,77 +15,86 @@ namespace {
 
 constexpr uint16_t kIntelVendorId = 0x8086;
 
+#define E1000E_SUPPORTED_DEVICES(X) \
+    X(0x10D3, "82574L") \
+    X(0x10F6, "82574LA") \
+    X(0x150C, "82583V") \
+    X(0x153A, "I217-LM") \
+    X(0x153B, "I217-V") \
+    X(0x1559, "I218-V") \
+    X(0x155A, "I218-LM") \
+    X(0x156F, "I219-LM") \
+    X(0x1570, "I219-V") \
+    X(0x15A0, "I218-LM2") \
+    X(0x15A1, "I218-V2") \
+    X(0x15A2, "I218-LM3") \
+    X(0x15A3, "I218-V3") \
+    X(0x15B7, "I219-LM2") \
+    X(0x15B8, "I219-V2") \
+    X(0x15B9, "I219-LM3") \
+    X(0x15BB, "I219-LM7") \
+    X(0x15BC, "I219-V7") \
+    X(0x15BD, "I219-LM6") \
+    X(0x15BE, "I219-V6") \
+    X(0x15D6, "I219-V5") \
+    X(0x15D7, "I219-LM4") \
+    X(0x15D8, "I219-V4") \
+    X(0x15DF, "I219-LM8") \
+    X(0x15E0, "I219-V8") \
+    X(0x15E1, "I219-LM9") \
+    X(0x15E2, "I219-V9") \
+    X(0x15E3, "I219-LM5") \
+    X(0x15F4, "I219-LM15") \
+    X(0x15F5, "I219-V15") \
+    X(0x15F9, "I219-LM14") \
+    X(0x15FA, "I219-V14") \
+    X(0x15FB, "I219-LM13") \
+    X(0x15FC, "I219-V13") \
+    X(0x0D4C, "I219-LM11") \
+    X(0x0D4D, "I219-V11") \
+    X(0x0D4E, "I219-LM10") \
+    X(0x0D4F, "I219-V10") \
+    X(0x0D53, "I219-LM12") \
+    X(0x0D55, "I219-V12") \
+    X(0x0DC5, "I219-LM23") \
+    X(0x0DC6, "I219-V23") \
+    X(0x0DC7, "I219-LM22") \
+    X(0x0DC8, "I219-V22") \
+    X(0x1A1C, "I219-LM17") \
+    X(0x1A1D, "I219-V17") \
+    X(0x1A1E, "I219-LM16") \
+    X(0x1A1F, "I219-V16") \
+    X(0x550A, "I219-LM18") \
+    X(0x550B, "I219-V18") \
+    X(0x550C, "I219-LM19") \
+    X(0x550D, "I219-V19") \
+    X(0x550E, "I219-LM20") \
+    X(0x550F, "I219-V20") \
+    X(0x5510, "I219-LM21") \
+    X(0x5511, "I219-V21") \
+    X(0x57A0, "I219-LM24") \
+    X(0x57A1, "I219-V24") \
+    X(0x57B3, "I219-LM25") \
+    X(0x57B4, "I219-V25") \
+    X(0x57B7, "I219-LM27") \
+    X(0x57B8, "I219-V27") \
+    X(0x57B9, "I219-LM29") \
+    X(0x57BA, "I219-V29")
+
 constexpr uint16_t kSupportedDeviceIds[] = {
-    0x10D3,  // 82574L
-    0x10F6,  // 82574LA
-    0x150C,  // 82583V
-    0x153A,  // I217-LM
-    0x153B,  // I217-V
-    0x1559,  // I218-V
-    0x155A,  // I218-LM
-    0x15A0,  // I218-LM2
-    0x15A1,  // I218-V2
-    0x15A2,  // I218-LM3
-    0x15A3,  // I218-V3
-    0x156F,  // I219-LM
-    0x1570,  // I219-V
-    0x15B7,  // I219-LM2
-    0x15B8,  // I219-V2
-    0x15B9,  // I219-LM3
-    0x15BD,  // I219-LM6
-    0x15BE,  // I219-V6
-    0x15BB,  // I219-LM7
-    0x15BC,  // I219-V7
-    0x15DF,  // I219-LM8
-    0x15E0,  // I219-V8
-    0x15E1,  // I219-LM9
-    0x15E2,  // I219-V9
-    0x0D4E,  // I219-LM10
-    0x0D4F,  // I219-V10
-    0x0D4C,  // I219-LM11
-    0x0D4D,  // I219-V11
-    0x0D53,  // I219-LM12
-    0x0D55,  // I219-V12
-    0x15FB,  // I219-LM13
-    0x15FC,  // I219-V13
-    0x15F9,  // I219-LM14
-    0x15FA,  // I219-V14
-    0x15F4,  // I219-LM15
-    0x15F5,  // I219-V15
-    0x0DC5,  // I219-LM23
-    0x0DC6,  // I219-V23
-    0x1A1E,  // I219-LM16
-    0x1A1F,  // I219-V16
-    0x1A1C,  // I219-LM17
-    0x1A1D,  // I219-V17
-    0x0DC7,  // I219-LM22
-    0x0DC8,  // I219-V22
-    0x550A,  // I219-LM18
-    0x550B,  // I219-V18
-    0x550C,  // I219-LM19
-    0x550D,  // I219-V19
-    0x550E,  // I219-LM20
-    0x550F,  // I219-V20
-    0x5510,  // I219-LM21
-    0x5511,  // I219-V21
-    0x57A0,  // I219-LM24
-    0x57A1,  // I219-V24
-    0x57B3,  // I219-LM25
-    0x57B4,  // I219-V25
-    0x57B7,  // I219-LM27
-    0x57B8,  // I219-V27
-    0x57B9,  // I219-LM29
-    0x57BA,  // I219-V29
+#define E1000E_DEVICE_ID_ENTRY(device_id, name) device_id,
+    E1000E_SUPPORTED_DEVICES(E1000E_DEVICE_ID_ENTRY)
+#undef E1000E_DEVICE_ID_ENTRY
 };
 
 constexpr driver_registry::PciMatch kPciMatches[] = {
-    {.vendor = kIntelVendorId, .device = 0x10D3, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
-    {.vendor = kIntelVendorId, .device = 0x153A, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
-    {.vendor = kIntelVendorId, .device = 0x1559, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
-    {.vendor = kIntelVendorId, .device = 0x15A1, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
-    {.vendor = kIntelVendorId, .device = 0x15A2, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
-    {.vendor = kIntelVendorId, .device = 0x15B7, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
+#define E1000E_PCI_MATCH_ENTRY(device_id, name) \
+    {.vendor = kIntelVendorId, .device = device_id, .class_code = 0x02, .subclass = 0x00, .prog_if = driver_registry::kAnyProgIf},
+    E1000E_SUPPORTED_DEVICES(E1000E_PCI_MATCH_ENTRY)
+#undef E1000E_PCI_MATCH_ENTRY
 };
+
+#undef E1000E_SUPPORTED_DEVICES
 
 constexpr uint8_t kPciCommandIo = 1u << 0;
 constexpr uint8_t kPciCommandMemory = 1u << 1;
@@ -101,7 +110,9 @@ constexpr uint32_t kPollSpinCount = 100000;
 
 constexpr uint32_t REG_CTRL = 0x00000;
 constexpr uint32_t REG_STATUS = 0x00008;
+constexpr uint32_t REG_EECD = 0x00010;
 constexpr uint32_t REG_CTRL_EXT = 0x00018;
+constexpr uint32_t REG_FEXTNVM7 = 0x000E4;
 constexpr uint32_t REG_ICR = 0x000C0;
 constexpr uint32_t REG_IMS = 0x000D0;
 constexpr uint32_t REG_IMC = 0x000D8;
@@ -127,13 +138,22 @@ constexpr uint32_t REG_TADV = 0x0382C;
 constexpr uint32_t REG_TXDCTL0 = 0x03828;
 constexpr uint32_t REG_RAL0 = 0x05400;
 constexpr uint32_t REG_RAH0 = 0x05404;
+constexpr uint32_t REG_SWSM = 0x05B50;
+constexpr uint32_t REG_FWSM = 0x05B54;
 
 constexpr uint32_t CTRL_SLU = 0x00000040u;
 constexpr uint32_t CTRL_ASDE = 0x00000020u;
+constexpr uint32_t CTRL_GIO_MASTER_DISABLE = 0x00000004u;
 constexpr uint32_t CTRL_RST = 0x04000000u;
+constexpr uint32_t CTRL_EXT_FORCE_SMBUS = 0x00000800u;
 constexpr uint32_t CTRL_EXT_DRV_LOAD = 0x10000000u;
 
 constexpr uint32_t STATUS_LU = 0x00000002u;
+constexpr uint32_t STATUS_LAN_INIT_DONE = 0x00000200u;
+constexpr uint32_t STATUS_GIO_MASTER_ENABLE = 0x00080000u;
+
+constexpr uint32_t EECD_AUTO_RD = 0x00000200u;
+constexpr uint32_t FEXTNVM7_NEED_DESCRIPTOR_FLUSH = 0x00000100u;
 
 constexpr uint32_t RCTL_EN = 0x00000002u;
 constexpr uint32_t RCTL_SBP = 0x00000004u;
@@ -148,11 +168,13 @@ constexpr uint32_t RCTL_RDMTS_HALF = 0x00000000u;
 
 constexpr uint32_t RXDCTL_PTHRESH = 0x00000020u;
 constexpr uint32_t RXDCTL_HTHRESH = 0x00000100u;
+constexpr uint32_t RXDCTL_WTHRESH = 0x00000000u;
 constexpr uint32_t RXDCTL_THRESH_UNIT_DESC = 0x01000000u;
 constexpr uint32_t RXDCTL_QUEUE_ENABLE = 0x02000000u;
 
 constexpr uint32_t TXDCTL_PTHRESH = 0x00000020u;
 constexpr uint32_t TXDCTL_HTHRESH = 0x00000100u;
+constexpr uint32_t TXDCTL_WTHRESH = 0x00000000u;
 constexpr uint32_t TXDCTL_THRESH_UNIT_DESC = 0x01000000u;
 constexpr uint32_t TXDCTL_QUEUE_ENABLE = 0x02000000u;
 
@@ -180,6 +202,11 @@ constexpr uint32_t RXD_ERR_FRAME_ERR_MASK = 0x97000000u;
 constexpr uint32_t kPba16k = 0x10u;
 constexpr uint32_t kTipg =
     8u | (8u << 10) | (6u << 20);
+constexpr uint32_t kResetSpinCount = 2000000;
+constexpr uint32_t kCfgDoneSpinCount = 4000000;
+constexpr uint32_t kQuiesceSpinCount = 500000;
+constexpr uint32_t kResetSettleSpinCount = 2000000;
+constexpr uint32_t kPchFwSettleSpinCount = 8000000;
 
 struct [[gnu::packed]] RxDescriptor {
     uint64_t buffer_addr;
@@ -345,14 +372,179 @@ volatile uint8_t* map_bar_region(const pci::PciDevice& device, uint8_t bar_index
     return reinterpret_cast<volatile uint8_t*>(virt_base + (bar_base - page_phys));
 }
 
-bool wait_for_mask(uint32_t reg, uint32_t mask, uint32_t expected) {
-    for (uint32_t i = 0; i < kPollSpinCount; ++i) {
+bool wait_for_mask_spins(uint32_t reg, uint32_t mask, uint32_t expected, uint32_t spins) {
+    for (uint32_t i = 0; i < spins; ++i) {
         if ((mmio_read32(reg) & mask) == expected) {
             return true;
         }
         cpu_relax();
     }
     return false;
+}
+
+void spin_delay(uint32_t spins) {
+    for (uint32_t i = 0; i < spins; ++i) {
+        cpu_relax();
+    }
+}
+
+void dma_write_barrier() {
+    asm volatile("" ::: "memory");
+}
+
+bool wait_for_cfg_done() {
+    if (wait_for_mask_spins(REG_STATUS,
+                            STATUS_LAN_INIT_DONE,
+                            STATUS_LAN_INIT_DONE,
+                            kCfgDoneSpinCount)) {
+        return true;
+    }
+    return wait_for_mask_spins(REG_EECD,
+                               EECD_AUTO_RD,
+                               EECD_AUTO_RD,
+                               kCfgDoneSpinCount);
+}
+
+bool verbose_stage_logs(const pci::PciDevice& device) {
+    return device.vendor == kIntelVendorId &&
+           (device.device == 0x155Au || device.device == 0x156Fu || device.device == 0x1570u);
+}
+
+void log_init_stage(const pci::PciDevice& device, const char* stage) {
+    if (!verbose_stage_logs(device) || stage == nullptr) {
+        return;
+    }
+    log_message(LogLevel::Info,
+                "e1000e: %02u:%02u.%u dev=%04x stage=%s",
+                static_cast<unsigned int>(device.bus),
+                static_cast<unsigned int>(device.slot),
+                static_cast<unsigned int>(device.function),
+                static_cast<unsigned int>(device.device),
+                stage);
+}
+
+bool is_pch_lan_device(uint16_t device_id) {
+    switch (device_id) {
+    case 0x153A:
+    case 0x153B:
+    case 0x1559:
+    case 0x155A:
+    case 0x156F:
+    case 0x1570:
+    case 0x15A0:
+    case 0x15A1:
+    case 0x15A2:
+    case 0x15A3:
+    case 0x15B7:
+    case 0x15B8:
+    case 0x15B9:
+    case 0x15BB:
+    case 0x15BC:
+    case 0x15BD:
+    case 0x15BE:
+    case 0x15D6:
+    case 0x15D7:
+    case 0x15D8:
+    case 0x15DF:
+    case 0x15E0:
+    case 0x15E1:
+    case 0x15E2:
+    case 0x15E3:
+    case 0x15F4:
+    case 0x15F5:
+    case 0x15F9:
+    case 0x15FA:
+    case 0x15FB:
+    case 0x15FC:
+    case 0x0D4C:
+    case 0x0D4D:
+    case 0x0D4E:
+    case 0x0D4F:
+    case 0x0D53:
+    case 0x0D55:
+    case 0x0DC5:
+    case 0x0DC6:
+    case 0x0DC7:
+    case 0x0DC8:
+    case 0x1A1C:
+    case 0x1A1D:
+    case 0x1A1E:
+    case 0x1A1F:
+    case 0x550A:
+    case 0x550B:
+    case 0x550C:
+    case 0x550D:
+    case 0x550E:
+    case 0x550F:
+    case 0x5510:
+    case 0x5511:
+    case 0x57A0:
+    case 0x57A1:
+    case 0x57B3:
+    case 0x57B4:
+    case 0x57B7:
+    case 0x57B8:
+    case 0x57B9:
+    case 0x57BA:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void log_register_snapshot(const pci::PciDevice& device, const char* stage) {
+    if (!verbose_stage_logs(device) || stage == nullptr) {
+        return;
+    }
+    log_message(LogLevel::Info,
+                "e1000e: %02u:%02u.%u stage=%s ctrl=%08x status=%08x ctrl_ext=%08x eecd=%08x "
+                "fextnvm7=%08x swsm=%08x fwsm=%08x",
+                static_cast<unsigned int>(device.bus),
+                static_cast<unsigned int>(device.slot),
+                static_cast<unsigned int>(device.function),
+                stage,
+                static_cast<unsigned int>(mmio_read32(REG_CTRL)),
+                static_cast<unsigned int>(mmio_read32(REG_STATUS)),
+                static_cast<unsigned int>(mmio_read32(REG_CTRL_EXT)),
+                static_cast<unsigned int>(mmio_read32(REG_EECD)),
+                static_cast<unsigned int>(mmio_read32(REG_FEXTNVM7)),
+                static_cast<unsigned int>(mmio_read32(REG_SWSM)),
+                static_cast<unsigned int>(mmio_read32(REG_FWSM)));
+}
+
+void clear_force_smbus_if_needed(const pci::PciDevice& device) {
+    uint32_t ctrl_ext = mmio_read32(REG_CTRL_EXT);
+    if ((ctrl_ext & CTRL_EXT_FORCE_SMBUS) == 0) {
+        return;
+    }
+
+    mmio_write32(REG_CTRL_EXT, ctrl_ext & ~CTRL_EXT_FORCE_SMBUS);
+    mmio_flush();
+    log_message(LogLevel::Info,
+                "e1000e: cleared CTRL_EXT.FORCE_SMBUS on %02u:%02u.%u device=%04x",
+                static_cast<unsigned int>(device.bus),
+                static_cast<unsigned int>(device.slot),
+                static_cast<unsigned int>(device.function),
+                static_cast<unsigned int>(device.device));
+}
+
+bool disable_pcie_master_requests() {
+    uint32_t ctrl = mmio_read32(REG_CTRL);
+    mmio_write32(REG_CTRL, ctrl | CTRL_GIO_MASTER_DISABLE);
+    mmio_flush();
+    return wait_for_mask_spins(REG_STATUS,
+                               STATUS_GIO_MASTER_ENABLE,
+                               0,
+                               kResetSpinCount);
+}
+
+void restore_master_requesting() {
+    uint32_t ctrl = mmio_read32(REG_CTRL);
+    if ((ctrl & CTRL_GIO_MASTER_DISABLE) == 0) {
+        return;
+    }
+    mmio_write32(REG_CTRL, ctrl & ~CTRL_GIO_MASTER_DISABLE);
+    mmio_flush();
 }
 
 uint64_t alloc_zeroed_pages(size_t page_count) {
@@ -438,21 +630,25 @@ bool setup_rx_ring() {
     mmio_write32(REG_RADV, 0);
     mmio_write32(REG_RXDCTL0,
                  RXDCTL_PTHRESH | RXDCTL_HTHRESH |
-                     RXDCTL_THRESH_UNIT_DESC | RXDCTL_QUEUE_ENABLE);
+                     RXDCTL_WTHRESH | RXDCTL_THRESH_UNIT_DESC);
     mmio_write32(REG_RDBAL0, static_cast<uint32_t>(g_state.rx_ring_phys & 0xFFFFFFFFu));
     mmio_write32(REG_RDBAH0, static_cast<uint32_t>(g_state.rx_ring_phys >> 32));
     mmio_write32(REG_RDLEN0, static_cast<uint32_t>(sizeof(RxDescriptor) * kRingCount));
     mmio_write32(REG_RDH0, 0);
     mmio_write32(REG_RDT0, static_cast<uint32_t>(kRingCount - 1));
+    mmio_write32(REG_RXDCTL0,
+                 RXDCTL_PTHRESH | RXDCTL_HTHRESH |
+                     RXDCTL_WTHRESH | RXDCTL_THRESH_UNIT_DESC |
+                     RXDCTL_QUEUE_ENABLE);
 
-    uint32_t rctl = RCTL_EN | RCTL_SBP | RCTL_UPE | RCTL_MPE |
-                    RCTL_BAM | RCTL_SECRC | RCTL_LBM_NO |
+    uint32_t rctl = RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_LBM_NO |
                     RCTL_RDMTS_HALF | RCTL_SZ_2048;
     rctl &= ~RCTL_BSEX;
     mmio_write32(REG_RCTL, rctl);
-    if (!wait_for_mask(REG_RXDCTL0,
-                       RXDCTL_QUEUE_ENABLE,
-                       RXDCTL_QUEUE_ENABLE)) {
+    if (!wait_for_mask_spins(REG_RXDCTL0,
+                             RXDCTL_QUEUE_ENABLE,
+                             RXDCTL_QUEUE_ENABLE,
+                             kResetSpinCount)) {
         log_message(LogLevel::Warn, "e1000e: RX queue enable timed out");
         return false;
     }
@@ -494,22 +690,27 @@ bool setup_tx_ring() {
     mmio_write32(REG_TADV, 0);
     mmio_write32(REG_TXDCTL0,
                  TXDCTL_PTHRESH | TXDCTL_HTHRESH |
-                     TXDCTL_THRESH_UNIT_DESC | TXDCTL_QUEUE_ENABLE);
+                     TXDCTL_WTHRESH | TXDCTL_THRESH_UNIT_DESC);
     mmio_write32(REG_TDBAL0, static_cast<uint32_t>(g_state.tx_ring_phys & 0xFFFFFFFFu));
     mmio_write32(REG_TDBAH0, static_cast<uint32_t>(g_state.tx_ring_phys >> 32));
     mmio_write32(REG_TDLEN0, static_cast<uint32_t>(sizeof(TxDescriptor) * kRingCount));
     mmio_write32(REG_TDH0, 0);
     mmio_write32(REG_TDT0, 0);
     mmio_write32(REG_TIPG, kTipg);
+    mmio_write32(REG_TXDCTL0,
+                 TXDCTL_PTHRESH | TXDCTL_HTHRESH |
+                     TXDCTL_WTHRESH | TXDCTL_THRESH_UNIT_DESC |
+                     TXDCTL_QUEUE_ENABLE);
 
     uint32_t tctl = TCTL_PSP | TCTL_RTLC |
                     (kCollisionThreshold << kCtShift) |
                     (kCollisionDistance << kColdShift);
     tctl |= TCTL_EN;
     mmio_write32(REG_TCTL, tctl);
-    if (!wait_for_mask(REG_TXDCTL0,
-                       TXDCTL_QUEUE_ENABLE,
-                       TXDCTL_QUEUE_ENABLE)) {
+    if (!wait_for_mask_spins(REG_TXDCTL0,
+                             TXDCTL_QUEUE_ENABLE,
+                             TXDCTL_QUEUE_ENABLE,
+                             kResetSpinCount)) {
         log_message(LogLevel::Warn, "e1000e: TX queue enable timed out");
         return false;
     }
@@ -526,12 +727,16 @@ bool init_device(const pci::PciDevice& device) {
     DriverState state{};
     state.initialized = true;
     state.device = device;
+    bool pch_lan = is_pch_lan_device(device.device);
+
+    log_init_stage(device, "pci-enable");
 
     uint16_t command = pci::read_config16(device, 0x04);
     command |= static_cast<uint16_t>(kPciCommandMemory | kPciCommandBusMaster);
     command &= static_cast<uint16_t>(~kPciCommandIo);
     pci::write_config16(device, 0x04, command);
 
+    log_init_stage(device, "map-bar0");
     state.regs = map_bar_region(device, 0);
     if (state.regs == nullptr) {
         log_message(LogLevel::Warn,
@@ -543,21 +748,100 @@ bool init_device(const pci::PciDevice& device) {
     }
 
     g_state = state;
+    log_register_snapshot(device, "mapped");
 
+    log_init_stage(device, "mask-interrupts");
     mmio_write32(REG_IMC, 0xFFFFFFFFu);
     (void)mmio_read32(REG_ICR);
 
-    uint32_t ctrl = mmio_read32(REG_CTRL);
-    mmio_write32(REG_CTRL, ctrl | CTRL_RST);
+    // Quiesce the device before reset. PCH LAN parts can wedge the PCIe bus
+    // if a full MAC reset is issued while bus mastering is still active.
+    log_init_stage(device, "quiesce");
+    mmio_write32(REG_RCTL, 0);
+    mmio_write32(REG_TCTL, TCTL_PSP);
     mmio_flush();
-    if (!wait_for_mask(REG_CTRL, CTRL_RST, 0)) {
+    spin_delay(kQuiesceSpinCount);
+    log_register_snapshot(device, "quiesced");
+
+    log_init_stage(device, "clear-force-smbus");
+    clear_force_smbus_if_needed(device);
+
+    log_init_stage(device, "disable-pcie-master");
+    if (!disable_pcie_master_requests()) {
         log_message(LogLevel::Warn,
-                    "e1000e: controller reset timed out at %02u:%02u.%u",
+                    "e1000e: pending PCIe master requests at %02u:%02u.%u device=%04x",
                     static_cast<unsigned int>(device.bus),
                     static_cast<unsigned int>(device.slot),
-                    static_cast<unsigned int>(device.function));
+                    static_cast<unsigned int>(device.function),
+                    static_cast<unsigned int>(device.device));
     }
 
+    log_init_stage(device, "disable-bus-master");
+    command = pci::read_config16(device, 0x04);
+    command &= static_cast<uint16_t>(~kPciCommandBusMaster);
+    pci::write_config16(device, 0x04, command);
+    spin_delay(kQuiesceSpinCount);
+    log_register_snapshot(device, "bus-master-disabled");
+
+    uint32_t ctrl = mmio_read32(REG_CTRL);
+    bool skip_hard_reset = false;
+    if (pch_lan) {
+        uint32_t fextnvm7 = mmio_read32(REG_FEXTNVM7);
+        if ((fextnvm7 & FEXTNVM7_NEED_DESCRIPTOR_FLUSH) != 0) {
+            log_message(LogLevel::Warn,
+                        "e1000e: FEXTNVM7 requests descriptor flush on %02u:%02u.%u "
+                        "device=%04x; avoiding hard reset",
+                        static_cast<unsigned int>(device.bus),
+                        static_cast<unsigned int>(device.slot),
+                        static_cast<unsigned int>(device.function),
+                        static_cast<unsigned int>(device.device));
+        } else {
+            log_message(LogLevel::Info,
+                        "e1000e: using PCH safe init path without hard reset on %02u:%02u.%u "
+                        "device=%04x",
+                        static_cast<unsigned int>(device.bus),
+                        static_cast<unsigned int>(device.slot),
+                        static_cast<unsigned int>(device.function),
+                        static_cast<unsigned int>(device.device));
+        }
+        skip_hard_reset = true;
+    }
+
+    if (!skip_hard_reset) {
+        log_init_stage(device, "issue-reset");
+        mmio_write32(REG_CTRL, ctrl | CTRL_RST);
+        // Let the MAC settle before polling registers after a global reset.
+        spin_delay(kResetSettleSpinCount);
+        if (!wait_for_mask_spins(REG_CTRL, CTRL_RST, 0, kResetSpinCount)) {
+            log_message(LogLevel::Warn,
+                        "e1000e: controller reset timed out at %02u:%02u.%u",
+                        static_cast<unsigned int>(device.bus),
+                        static_cast<unsigned int>(device.slot),
+                        static_cast<unsigned int>(device.function));
+        }
+
+        log_init_stage(device, "wait-config");
+        if (!wait_for_cfg_done()) {
+            log_message(LogLevel::Warn,
+                        "e1000e: config done timed out at %02u:%02u.%u",
+                        static_cast<unsigned int>(device.bus),
+                        static_cast<unsigned int>(device.slot),
+                        static_cast<unsigned int>(device.function));
+        }
+    } else {
+        log_init_stage(device, "pch-fw-settle");
+        spin_delay(kPchFwSettleSpinCount);
+        (void)wait_for_cfg_done();
+    }
+
+    log_init_stage(device, "reenable-bus-master");
+    command = pci::read_config16(device, 0x04);
+    command |= static_cast<uint16_t>(kPciCommandMemory | kPciCommandBusMaster);
+    command &= static_cast<uint16_t>(~kPciCommandIo);
+    pci::write_config16(device, 0x04, command);
+    restore_master_requesting();
+
+    log_init_stage(device, "post-reset-init");
     ctrl = mmio_read32(REG_CTRL);
     ctrl |= CTRL_SLU | CTRL_ASDE;
     mmio_write32(REG_CTRL, ctrl);
@@ -565,7 +849,9 @@ bool init_device(const pci::PciDevice& device) {
     mmio_write32(REG_PBA, kPba16k);
     mmio_write32(REG_IMC, 0xFFFFFFFFu);
     (void)mmio_read32(REG_ICR);
+    log_register_snapshot(device, "post-reset-init");
 
+    log_init_stage(device, "read-mac");
     if (!load_mac_address(g_state.mac)) {
         log_message(LogLevel::Warn,
                     "e1000e: failed to read MAC address at %02u:%02u.%u",
@@ -576,11 +862,13 @@ bool init_device(const pci::PciDevice& device) {
     }
     program_mac_address(g_state.mac);
 
+    log_init_stage(device, "setup-rings");
     if (!setup_rx_ring() || !setup_tx_ring()) {
         log_message(LogLevel::Warn, "e1000e: failed to allocate descriptor rings");
         return false;
     }
 
+    log_init_stage(device, "register-link");
     update_link_state();
 
     g_state.link_registered =
@@ -653,8 +941,17 @@ void init() {
         const pci::PciDevice& dev = list[i];
         if (dev.vendor != kIntelVendorId ||
             dev.class_code != 0x02 ||
-            dev.subclass != 0x00 ||
-            !supported_device_id(dev.device)) {
+            dev.subclass != 0x00) {
+            continue;
+        }
+
+        if (!supported_device_id(dev.device)) {
+            log_message(LogLevel::Info,
+                        "e1000e: skipping unsupported Intel ethernet device %04x at %02u:%02u.%u",
+                        static_cast<unsigned int>(dev.device),
+                        static_cast<unsigned int>(dev.bus),
+                        static_cast<unsigned int>(dev.slot),
+                        static_cast<unsigned int>(dev.function));
             continue;
         }
 
@@ -758,6 +1055,7 @@ bool transmit(const void* data, size_t length) {
     desc.special = 0;
 
     ++g_state.tx_submitted;
+    dma_write_barrier();
     g_state.tx_tail = next_tail;
     mmio_write32(REG_TDT0, static_cast<uint32_t>(g_state.tx_tail));
     return true;

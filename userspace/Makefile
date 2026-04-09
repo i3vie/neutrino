@@ -12,7 +12,7 @@ OBJ_DIR  := build
 PROG_DIR := programs
 BIN_DIR  := binary
 
-PROGRAMS := init shell photon wavelength ion orbital ls cat flux userctl hexedit installer netctl networkd dhcp ping
+PROGRAMS := init shell photon wavelength ion orbital ls cat flux userctl hexedit installer netctl networkd tcpd dhcp ping tcpecho netget
 PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64

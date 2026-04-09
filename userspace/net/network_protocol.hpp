@@ -9,7 +9,7 @@
 namespace networkd_protocol {
 
 constexpr uint32_t kRegistryMagic = 0x4E455457u;  // "NETW"
-constexpr uint32_t kRegistryVersion = 2;
+constexpr uint32_t kRegistryVersion = 3;
 constexpr const char kRegistryName[] = "network.registry";
 
 constexpr uint32_t kMessageMagic = 0x4E455450u;  // "NETP"
@@ -17,15 +17,21 @@ constexpr uint16_t kMessageVersion = 1;
 // Allow a full non-fragmented IPv4/UDP payload over Ethernet so DHCP
 // replies and future protocols are not truncated by the userspace IPC layer.
 constexpr size_t kMaxUdpPayload = 1472;
+constexpr size_t kMaxTcpOptionBytes = 40;
+constexpr size_t kMaxTcpPayload = 1460;
 
 enum MessageType : uint16_t {
     kBindUdpRequest = 1,
     kSendUdpRequest = 2,
     kSendIcmpEchoRequest = 3,
+    kBindTcpRequest = 4,
+    kSendTcpRequest = 5,
     kBindUdpResponse = 0x8001,
     kSendUdpResponse = 0x8002,
     kUdpPacketEvent = 0x8003,
     kIcmpEchoReplyEvent = 0x8004,
+    kBindTcpResponse = 0x8005,
+    kTcpSegmentEvent = 0x8006,
 };
 
 enum SendFlags : uint16_t {
@@ -54,8 +60,10 @@ struct Registry {
     uint32_t dhcp_last_error;
     uint32_t net_rx_frames;
     uint32_t net_rx_udp;
+    uint32_t net_rx_tcp;
     uint32_t net_rx_delivered;
     uint32_t net_tx_udp;
+    uint32_t net_tx_tcp;
 };
 
 enum RegistryState : uint32_t {
@@ -131,6 +139,33 @@ struct SendIcmpEchoRequest {
     uint8_t payload[kMaxUdpPayload];
 };
 
+struct BindTcpRequest {
+    uint32_t reply_pipe_id;
+    uint16_t port;
+    uint16_t reserved;
+};
+
+struct BindTcpResponse {
+    int32_t status;
+    uint16_t port;
+    uint16_t reserved;
+};
+
+struct SendTcpRequest {
+    uint16_t source_port;
+    uint16_t destination_port;
+    uint16_t flags;
+    uint16_t options_length;
+    uint16_t payload_length;
+    uint16_t window_size;
+    uint32_t sequence_number;
+    uint32_t acknowledgment_number;
+    uint8_t source_ip[4];
+    uint8_t destination_ip[4];
+    uint8_t options[kMaxTcpOptionBytes];
+    uint8_t payload[kMaxTcpPayload];
+};
+
 struct UdpPacketEvent {
     uint16_t source_port;
     uint16_t destination_port;
@@ -151,6 +186,21 @@ struct IcmpEchoReplyEvent {
     uint8_t payload[kMaxUdpPayload];
 };
 
+struct TcpSegmentEvent {
+    uint16_t source_port;
+    uint16_t destination_port;
+    uint16_t flags;
+    uint16_t options_length;
+    uint16_t payload_length;
+    uint16_t window_size;
+    uint32_t sequence_number;
+    uint32_t acknowledgment_number;
+    uint8_t source_ip[4];
+    uint8_t destination_ip[4];
+    uint8_t options[kMaxTcpOptionBytes];
+    uint8_t payload[kMaxTcpPayload];
+};
+
 struct Message {
     uint32_t magic;
     uint16_t version;
@@ -163,6 +213,10 @@ struct Message {
         UdpPacketEvent udp_event;
         SendIcmpEchoRequest icmp_request;
         IcmpEchoReplyEvent icmp_event;
+        BindTcpRequest bind_tcp_request;
+        BindTcpResponse bind_tcp_response;
+        SendTcpRequest send_tcp_request;
+        TcpSegmentEvent tcp_event;
     };
 };
 

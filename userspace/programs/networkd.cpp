@@ -4,6 +4,7 @@
 #include "../crt/syscall.hpp"
 #include "../net/ipv4.hpp"
 #include "../net/network_protocol.hpp"
+#include "../net/tcp.hpp"
 #include "../net/udp.hpp"
 
 namespace {
@@ -28,6 +29,7 @@ struct PendingPing {
 
 struct Binding {
     bool in_use;
+    uint8_t protocol;
     uint16_t port;
     uint32_t pipe_id;
     uint32_t pipe_handle;
@@ -41,6 +43,9 @@ struct ServerContext {
     ArpEntry arp_entries[kMaxArpEntries];
     PendingPing pending_pings[kMaxPendingPings];
 };
+
+constexpr uint8_t kBindingProtocolUdp = 17;
+constexpr uint8_t kBindingProtocolTcp = 6;
 
 void poll_network(ServerContext& ctx);
 
@@ -70,9 +75,11 @@ void print_line(const char* text) {
     print("\n");
 }
 
-Binding* find_binding(ServerContext& ctx, uint16_t port) {
+Binding* find_binding(ServerContext& ctx, uint8_t protocol, uint16_t port) {
     for (size_t i = 0; i < kMaxBindings; ++i) {
-        if (ctx.bindings[i].in_use && ctx.bindings[i].port == port) {
+        if (ctx.bindings[i].in_use &&
+            ctx.bindings[i].protocol == protocol &&
+            ctx.bindings[i].port == port) {
             return &ctx.bindings[i];
         }
     }
@@ -225,18 +232,27 @@ bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
     registry->dhcp_last_error = networkd_protocol::kErrorNone;
     registry->net_rx_frames = 0;
     registry->net_rx_udp = 0;
+    registry->net_rx_tcp = 0;
     registry->net_rx_delivered = 0;
     registry->net_tx_udp = 0;
+    registry->net_tx_tcp = 0;
     ctx.registry = registry;
     return true;
 }
 
-void send_bind_response(uint32_t handle, uint16_t port, int32_t status) {
+void send_bind_response(uint32_t handle,
+                        uint16_t type,
+                        uint16_t port,
+                        int32_t status) {
     networkd_protocol::Message message{};
-    networkd_protocol::init_message(message,
-                                    networkd_protocol::kBindUdpResponse);
-    message.bind_response.status = status;
-    message.bind_response.port = port;
+    networkd_protocol::init_message(message, type);
+    if (type == networkd_protocol::kBindTcpResponse) {
+        message.bind_tcp_response.status = status;
+        message.bind_tcp_response.port = port;
+    } else {
+        message.bind_response.status = status;
+        message.bind_response.port = port;
+    }
     (void)networkd_protocol::write_message(handle, message);
 }
 
@@ -263,6 +279,36 @@ void send_udp_packet(Binding& binding, const usernet::UdpPacketView& packet) {
     (void)networkd_protocol::write_message(binding.pipe_handle, message);
 }
 
+void send_tcp_segment(Binding& binding, const usernet::TcpSegmentView& segment) {
+    if (binding.pipe_handle == kInvalidDescriptor ||
+        segment.options_length > networkd_protocol::kMaxTcpOptionBytes ||
+        segment.payload_length > networkd_protocol::kMaxTcpPayload) {
+        return;
+    }
+
+    networkd_protocol::Message message{};
+    networkd_protocol::init_message(message, networkd_protocol::kTcpSegmentEvent);
+    message.tcp_event.source_port = segment.source_port;
+    message.tcp_event.destination_port = segment.destination_port;
+    message.tcp_event.flags = segment.flags;
+    message.tcp_event.options_length = static_cast<uint16_t>(segment.options_length);
+    message.tcp_event.payload_length = static_cast<uint16_t>(segment.payload_length);
+    message.tcp_event.window_size = segment.window_size;
+    message.tcp_event.sequence_number = segment.sequence_number;
+    message.tcp_event.acknowledgment_number = segment.acknowledgment_number;
+    for (size_t i = 0; i < 4; ++i) {
+        message.tcp_event.source_ip[i] = segment.source_ip[i];
+        message.tcp_event.destination_ip[i] = segment.destination_ip[i];
+    }
+    for (size_t i = 0; i < segment.options_length; ++i) {
+        message.tcp_event.options[i] = segment.options[i];
+    }
+    for (size_t i = 0; i < segment.payload_length; ++i) {
+        message.tcp_event.payload[i] = segment.payload[i];
+    }
+    (void)networkd_protocol::write_message(binding.pipe_handle, message);
+}
+
 void send_icmp_reply(PendingPing& ping, const usernet::IcmpEchoReplyView& reply) {
     if (ping.pipe_handle == kInvalidDescriptor ||
         reply.payload_length > networkd_protocol::kMaxUdpPayload) {
@@ -285,22 +331,26 @@ void send_icmp_reply(PendingPing& ping, const usernet::IcmpEchoReplyView& reply)
 }
 
 void handle_bind_request(ServerContext& ctx,
-                         const networkd_protocol::BindUdpRequest& request) {
+                         uint8_t protocol,
+                         uint32_t reply_pipe_id,
+                         uint16_t port,
+                         uint16_t response_type) {
     if (ctx.registry != nullptr) {
         ctx.registry->dhcp_state = networkd_protocol::kStateBindSeen;
     }
-    if (request.reply_pipe_id == 0 || request.port == 0) {
+    if (reply_pipe_id == 0 || port == 0) {
         return;
     }
 
-    Binding* existing = find_binding(ctx, request.port);
+    Binding* existing = find_binding(ctx, protocol, port);
     if (existing != nullptr) {
         uint64_t flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
                          static_cast<uint64_t>(descriptor_defs::Flag::Async);
-        long handle = pipe_open_existing(flags, request.reply_pipe_id);
+        long handle = pipe_open_existing(flags, reply_pipe_id);
         if (handle >= 0) {
             send_bind_response(static_cast<uint32_t>(handle),
-                               request.port,
+                               response_type,
+                               port,
                                networkd_protocol::kStatusInUse);
             if (ctx.registry != nullptr) {
                 ctx.registry->dhcp_state = networkd_protocol::kStateBindReplySent;
@@ -317,16 +367,18 @@ void handle_bind_request(ServerContext& ctx,
 
     uint64_t flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
                      static_cast<uint64_t>(descriptor_defs::Flag::Async);
-    long handle = pipe_open_existing(flags, request.reply_pipe_id);
+    long handle = pipe_open_existing(flags, reply_pipe_id);
     if (handle < 0) {
         return;
     }
 
     binding->in_use = true;
-    binding->port = request.port;
-    binding->pipe_id = request.reply_pipe_id;
+    binding->protocol = protocol;
+    binding->port = port;
+    binding->pipe_id = reply_pipe_id;
     binding->pipe_handle = static_cast<uint32_t>(handle);
     send_bind_response(binding->pipe_handle,
+                       response_type,
                        binding->port,
                        networkd_protocol::kStatusOk);
     if (ctx.registry != nullptr) {
@@ -334,12 +386,30 @@ void handle_bind_request(ServerContext& ctx,
     }
 }
 
+void handle_udp_bind_request(ServerContext& ctx,
+                             const networkd_protocol::BindUdpRequest& request) {
+    handle_bind_request(ctx,
+                        kBindingProtocolUdp,
+                        request.reply_pipe_id,
+                        request.port,
+                        networkd_protocol::kBindUdpResponse);
+}
+
+void handle_tcp_bind_request(ServerContext& ctx,
+                             const networkd_protocol::BindTcpRequest& request) {
+    handle_bind_request(ctx,
+                        kBindingProtocolTcp,
+                        request.reply_pipe_id,
+                        request.port,
+                        networkd_protocol::kBindTcpResponse);
+}
+
 void handle_send_request(ServerContext& ctx,
                          const networkd_protocol::SendUdpRequest& request) {
     if (request.source_port == 0 ||
         request.destination_port == 0 ||
         request.payload_length > networkd_protocol::kMaxUdpPayload ||
-        find_binding(ctx, request.source_port) == nullptr) {
+        find_binding(ctx, kBindingProtocolUdp, request.source_port) == nullptr) {
         return;
     }
 
@@ -371,6 +441,55 @@ void handle_send_request(ServerContext& ctx,
 
     if (ctx.registry != nullptr) {
         ++ctx.registry->net_tx_udp;
+    }
+    (void)descriptor_write(ctx.device.handle, frame, frame_length);
+}
+
+void handle_tcp_send_request(ServerContext& ctx,
+                             const networkd_protocol::SendTcpRequest& request) {
+    if (request.source_port == 0 ||
+        request.destination_port == 0 ||
+        request.options_length > networkd_protocol::kMaxTcpOptionBytes ||
+        (request.options_length % 4) != 0 ||
+        request.payload_length > networkd_protocol::kMaxTcpPayload ||
+        find_binding(ctx, kBindingProtocolTcp, request.source_port) == nullptr) {
+        return;
+    }
+
+    uint8_t destination_mac_storage[6];
+    const uint8_t* destination_mac = nullptr;
+    if ((request.flags & networkd_protocol::kSendFlagBroadcast) != 0) {
+        destination_mac = kBroadcastMac;
+    } else if (lookup_or_resolve_mac(ctx, request.destination_ip, destination_mac_storage)) {
+        destination_mac = destination_mac_storage;
+    } else {
+        return;
+    }
+
+    uint8_t frame[usernet::kMaxFrameSize];
+    size_t frame_length = 0;
+    if (!usernet::build_tcp_ipv4_frame(frame,
+                                       sizeof(frame),
+                                       frame_length,
+                                       ctx.device.info.mac,
+                                       destination_mac,
+                                       request.source_ip,
+                                       request.destination_ip,
+                                       request.source_port,
+                                       request.destination_port,
+                                       request.sequence_number,
+                                       request.acknowledgment_number,
+                                       request.flags,
+                                       request.window_size,
+                                       request.options,
+                                       request.options_length,
+                                       request.payload,
+                                       request.payload_length)) {
+        return;
+    }
+
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->net_tx_tcp;
     }
     (void)descriptor_write(ctx.device.handle, frame, frame_length);
 }
@@ -431,9 +550,13 @@ void poll_control(ServerContext& ctx) {
             break;
         }
         if (message.type == networkd_protocol::kBindUdpRequest) {
-            handle_bind_request(ctx, message.bind_request);
+            handle_udp_bind_request(ctx, message.bind_request);
+        } else if (message.type == networkd_protocol::kBindTcpRequest) {
+            handle_tcp_bind_request(ctx, message.bind_tcp_request);
         } else if (message.type == networkd_protocol::kSendUdpRequest) {
             handle_send_request(ctx, message.send_request);
+        } else if (message.type == networkd_protocol::kSendTcpRequest) {
+            handle_tcp_send_request(ctx, message.send_tcp_request);
         } else if (message.type == networkd_protocol::kSendIcmpEchoRequest) {
             handle_icmp_request(ctx, message.icmp_request);
         }
@@ -491,13 +614,27 @@ void poll_network(ServerContext& ctx) {
         }
 
         usernet::UdpPacketView packet{};
-        if (!usernet::parse_udp_frame(frame, static_cast<size_t>(result), packet)) {
-            usernet::IcmpEchoReplyView icmp{};
-            if (!usernet::parse_icmp_echo_reply_frame(frame,
-                                                      static_cast<size_t>(result),
-                                                      icmp)) {
+        if (usernet::parse_udp_frame(frame, static_cast<size_t>(result), packet)) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_rx_udp;
+            }
+
+            Binding* binding =
+                find_binding(ctx, kBindingProtocolUdp, packet.destination_port);
+            if (binding == nullptr) {
                 continue;
             }
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_rx_delivered;
+            }
+            send_udp_packet(*binding, packet);
+            continue;
+        }
+
+        usernet::IcmpEchoReplyView icmp{};
+        if (usernet::parse_icmp_echo_reply_frame(frame,
+                                                 static_cast<size_t>(result),
+                                                 icmp)) {
             PendingPing* pending =
                 find_pending_ping(ctx, icmp.identifier, icmp.sequence);
             if (pending == nullptr) {
@@ -509,18 +646,24 @@ void poll_network(ServerContext& ctx) {
             pending->pipe_handle = kInvalidDescriptor;
             continue;
         }
+
+        usernet::TcpSegmentView segment{};
+        if (!usernet::parse_tcp_frame(frame, static_cast<size_t>(result), segment)) {
+            continue;
+        }
         if (ctx.registry != nullptr) {
-            ++ctx.registry->net_rx_udp;
+            ++ctx.registry->net_rx_tcp;
         }
 
-        Binding* binding = find_binding(ctx, packet.destination_port);
+        Binding* binding =
+            find_binding(ctx, kBindingProtocolTcp, segment.destination_port);
         if (binding == nullptr) {
             continue;
         }
         if (ctx.registry != nullptr) {
             ++ctx.registry->net_rx_delivered;
         }
-        send_udp_packet(*binding, packet);
+        send_tcp_segment(*binding, segment);
     }
 }
 
