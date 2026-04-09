@@ -54,5 +54,7 @@ const char* class_name(uint8_t class_code);
 const char* subclass_name(uint8_t class_code, uint8_t subclass);
 const char* prog_if_name(uint8_t class_code, uint8_t subclass,
                          uint8_t prog_if);
+uint8_t find_capability(const PciDevice& device, uint8_t capability_id);
+bool enable_msi(const PciDevice& device, uint8_t vector, uint8_t apic_id);
 
 }  // namespace pci

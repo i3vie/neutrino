@@ -6,10 +6,9 @@
 #include "../../drivers/interrupts/ioapic.hpp"
 #include "../../drivers/interrupts/pic.hpp"
 #include "../../drivers/log/logging.hpp"
-#include "../../drivers/net/e1000e.hpp"
-#include "../../drivers/net/virtio_net.hpp"
 #include "../../kernel/error.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/interrupts.hpp"
 #include "../../kernel/process.hpp"
 #include "../../kernel/scheduler.hpp"
 #include "percpu.hpp"
@@ -94,13 +93,15 @@ extern "C" void isr_handler(InterruptFrame* regs) {
 
     if (regs->int_no >= 32) {
         percpu::record_irq();
+        if (interrupts::dispatch(static_cast<uint8_t>(regs->int_no))) {
+            lapic::eoi();
+            return;
+        }
         uint64_t irq = regs->int_no - 32;
         if (irq == 0) {
             bool user_mode = (regs->cs & 0x3) != 0;
             bool has_proc = process::current() != nullptr;
             percpu::record_tick(user_mode, has_proc);
-            e1000e::poll();
-            virtio_net::poll();
             scheduler::tick(*regs);
             pic::send_eoi(0);
             lapic::eoi();
@@ -123,8 +124,6 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             bool user_mode = (regs->cs & 0x3) != 0;
             bool has_proc = process::current() != nullptr;
             percpu::record_tick(user_mode, has_proc);
-            e1000e::poll();
-            virtio_net::poll();
             scheduler::tick(*regs);
             lapic::eoi();
             return;

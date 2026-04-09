@@ -3,8 +3,11 @@
 #include "drivers/driver_registry.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 #include "arch/x86_64/percpu.hpp"
+#include "arch/x86_64/lapic.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
+#include "kernel/interrupts.hpp"
+#include "kernel/scheduler.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "lib/mem.hpp"
 #include "net/network.hpp"
@@ -207,6 +210,13 @@ constexpr uint32_t kCfgDoneSpinCount = 4000000;
 constexpr uint32_t kQuiesceSpinCount = 500000;
 constexpr uint32_t kResetSettleSpinCount = 2000000;
 constexpr uint32_t kPchFwSettleSpinCount = 8000000;
+constexpr uint32_t IMS_TXDW = 0x00000001u;
+constexpr uint32_t IMS_LSC = 0x00000004u;
+constexpr uint32_t IMS_RXDMT0 = 0x00000010u;
+constexpr uint32_t IMS_RXO = 0x00000040u;
+constexpr uint32_t IMS_RXT0 = 0x00000080u;
+constexpr uint32_t kInterruptMask =
+    IMS_TXDW | IMS_LSC | IMS_RXDMT0 | IMS_RXO | IMS_RXT0;
 
 struct [[gnu::packed]] RxDescriptor {
     uint64_t buffer_addr;
@@ -231,6 +241,8 @@ struct DriverState {
     bool initialized;
     bool active;
     bool link_registered;
+    bool msi_enabled;
+    uint8_t interrupt_vector;
     pci::PciDevice device;
     volatile uint8_t* regs;
     uint8_t mac[6];
@@ -254,6 +266,8 @@ struct DriverState {
 
 DriverState g_state{};
 uint64_t g_mmio_next_virt = kMmioVirtBase;
+
+void handle_interrupt();
 
 inline uint32_t mmio_read32(uint32_t offset) {
     return *reinterpret_cast<volatile uint32_t*>(
@@ -879,6 +893,30 @@ bool init_device(const pci::PciDevice& device) {
     }
 
     g_state.active = true;
+    g_state.msi_enabled = false;
+    g_state.interrupt_vector = 0;
+
+    uint8_t vector = interrupts::allocate_vector();
+    if (vector != 0 &&
+        interrupts::register_vector(vector, handle_interrupt) &&
+        pci::enable_msi(device,
+                        vector,
+                        static_cast<uint8_t>(lapic::id()))) {
+        g_state.msi_enabled = true;
+        g_state.interrupt_vector = vector;
+        mmio_write32(REG_IMS, kInterruptMask);
+        (void)mmio_read32(REG_ICR);
+        log_message(LogLevel::Info, "e1000e: using MSI vector %u",
+                    static_cast<unsigned int>(vector));
+    } else {
+        if (vector != 0) {
+            interrupts::unregister_vector(vector);
+        }
+        if (!scheduler::register_poll(poll)) {
+        log_message(LogLevel::Warn,
+                    "e1000e: failed to register MSI or deferred poll");
+        }
+    }
 
     char mac_string[18];
     format_mac_string(g_state.mac, mac_string, sizeof(mac_string));
@@ -916,6 +954,54 @@ void recycle_rx_descriptor(size_t index) {
     desc.errors = 0;
     desc.special = 0;
     mmio_write32(REG_RDT0, static_cast<uint32_t>(index));
+}
+
+void service_device() {
+    update_link_state();
+    reap_tx();
+
+    for (;;) {
+        RxDescriptor& desc = g_state.rx_ring[g_state.rx_index];
+        uint8_t status = desc.status;
+        uint8_t errors = desc.errors;
+        if ((status & RXD_STAT_DD) == 0) {
+            break;
+        }
+        ++g_state.rx_desc_seen;
+
+        size_t length = desc.length;
+        if ((status & RXD_STAT_EOP) != 0 &&
+            errors == 0 &&
+            length != 0 &&
+            length <= kPacketBufferSize) {
+            ++g_state.rx_frames_passed;
+            net::receive_frame(&g_state.link_device,
+                               g_state.rx_buffer_virt[g_state.rx_index],
+                               length);
+        } else if (errors != 0) {
+            log_message(LogLevel::Debug,
+                        "e1000e: dropped RX frame status=%02x err=%02x len=%u",
+                        static_cast<unsigned int>(status),
+                        static_cast<unsigned int>(errors),
+                        static_cast<unsigned int>(length));
+        }
+
+        recycle_rx_descriptor(g_state.rx_index);
+        ++g_state.rx_index;
+        if (g_state.rx_index >= kRingCount) {
+            g_state.rx_index = 0;
+        }
+    }
+}
+
+void handle_interrupt() {
+    if (!g_state.active || !g_state.msi_enabled) {
+        return;
+    }
+    if (mmio_read32(REG_ICR) == 0) {
+        return;
+    }
+    service_device();
 }
 
 }  // namespace
@@ -968,45 +1054,10 @@ void poll() {
         return;
     }
 
-    percpu::Cpu* cpu = percpu::current_cpu();
-    if (cpu != nullptr && cpu->index != 0) {
+    if (g_state.msi_enabled) {
         return;
     }
-
-    update_link_state();
-    reap_tx();
-
-    for (;;) {
-        RxDescriptor& desc = g_state.rx_ring[g_state.rx_index];
-        uint8_t status = desc.status;
-        uint8_t errors = desc.errors;
-        if ((status & RXD_STAT_DD) == 0) {
-            break;
-        }
-        ++g_state.rx_desc_seen;
-
-        size_t length = desc.length;
-        if ((status & RXD_STAT_EOP) != 0 &&
-            errors == 0 &&
-            length != 0 &&
-            length <= kPacketBufferSize) {
-            ++g_state.rx_frames_passed;
-            net::receive_frame(&g_state.link_device, g_state.rx_buffer_virt[g_state.rx_index], length);
-        } else if (errors != 0) {
-            log_message(LogLevel::Debug,
-                        "e1000e: dropped RX frame status=%02x err=%02x len=%u",
-                        static_cast<unsigned int>(status),
-                        static_cast<unsigned int>(errors),
-                        static_cast<unsigned int>(length));
-        }
-
-        recycle_rx_descriptor(g_state.rx_index);
-        ++g_state.rx_index;
-        if (g_state.rx_index >= kRingCount) {
-            g_state.rx_index = 0;
-        }
-    }
-
+    service_device();
     (void)mmio_read32(REG_ICR);
 }
 

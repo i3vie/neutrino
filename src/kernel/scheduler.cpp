@@ -24,6 +24,10 @@ RunQueue g_run_queues[percpu::kMaxCpus];
 size_t g_cpu_total = 0;
 volatile int g_queue_lock = 0;
 uint32_t g_rr_assign = 0;
+constexpr size_t kMaxPollFns = 16;
+scheduler::PollFn g_poll_fns[kMaxPollFns]{};
+volatile int g_poll_lock = 0;
+process::Process* g_poll_worker = nullptr;
 
 [[maybe_unused]] void halt_system() {
     for (;;) {
@@ -81,11 +85,39 @@ void unlock_queue() {
     __atomic_clear(&g_queue_lock, __ATOMIC_RELEASE);
 }
 
+void lock_pollers() {
+    while (__atomic_test_and_set(&g_poll_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_pollers() {
+    __atomic_clear(&g_poll_lock, __ATOMIC_RELEASE);
+}
+
+size_t poll_count_locked() {
+    size_t count = 0;
+    for (size_t i = 0; i < kMaxPollFns; ++i) {
+        if (g_poll_fns[i] != nullptr) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 class QueueGuard {
 public:
     QueueGuard() { lock_queue(); }
     ~QueueGuard() { unlock_queue(); }
 };
+
+void poll_worker(process::Process& proc) {
+    scheduler::service_polls();
+    lock_pollers();
+    bool has_pollers = poll_count_locked() != 0;
+    unlock_pollers();
+    proc.state = has_pollers ? process::State::Ready : process::State::Blocked;
+}
 
 void enqueue_locked(process::Process* proc) {
     size_t total = g_cpu_total;
@@ -234,6 +266,63 @@ void register_cpu(percpu::Cpu* cpu) {
 
 size_t cpu_total() {
     return __atomic_load_n(&g_cpu_total, __ATOMIC_SEQ_CST);
+}
+
+bool register_poll(PollFn fn) {
+    if (fn == nullptr) {
+        return false;
+    }
+
+    lock_pollers();
+    for (size_t i = 0; i < kMaxPollFns; ++i) {
+        if (g_poll_fns[i] == fn) {
+            unlock_pollers();
+            return true;
+        }
+    }
+    for (size_t i = 0; i < kMaxPollFns; ++i) {
+        if (g_poll_fns[i] == nullptr) {
+            g_poll_fns[i] = fn;
+            unlock_pollers();
+            if (g_poll_worker == nullptr) {
+                process::Process* worker = process::allocate_kernel_task(poll_worker);
+                if (worker != nullptr) {
+                    worker->preferred_cpu = 0;
+                    g_poll_worker = worker;
+                    enqueue(worker);
+                }
+            } else if (g_poll_worker->state == process::State::Blocked) {
+                g_poll_worker->state = process::State::Ready;
+                g_poll_worker->waiting_on = nullptr;
+                enqueue(g_poll_worker);
+            }
+            return true;
+        }
+    }
+    unlock_pollers();
+    return false;
+}
+
+void service_polls() {
+    percpu::Cpu* cpu = percpu::current_cpu();
+    if (cpu != nullptr && cpu->index != 0) {
+        return;
+    }
+
+    PollFn pollers[kMaxPollFns]{};
+    size_t count = 0;
+
+    lock_pollers();
+    for (size_t i = 0; i < kMaxPollFns; ++i) {
+        if (g_poll_fns[i] != nullptr) {
+            pollers[count++] = g_poll_fns[i];
+        }
+    }
+    unlock_pollers();
+
+    for (size_t i = 0; i < count; ++i) {
+        pollers[i]();
+    }
 }
 
 void enqueue(process::Process* proc) {

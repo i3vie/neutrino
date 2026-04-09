@@ -8,6 +8,8 @@ namespace {
 constexpr uint16_t kConfigAddressPort = 0xCF8;
 constexpr uint16_t kConfigDataPort = 0xCFC;
 constexpr size_t kMaxDeviceCount = 256;
+constexpr uint16_t kStatusCapabilitiesList = 1u << 4;
+constexpr uint8_t kMsiCapabilityId = 0x05;
 
 pci::PciDevice g_devices[kMaxDeviceCount];
 size_t g_device_count = 0;
@@ -525,6 +527,56 @@ const char* prog_if_name(uint8_t class_code, uint8_t subclass,
     }
     const auto* prog = find_prog_if_descriptor(*sub, prog_if);
     return (prog != nullptr) ? prog->name : "Unknown programming interface";
+}
+
+uint8_t find_capability(const PciDevice& device, uint8_t capability_id) {
+    if ((read_config16(device, 0x06) & kStatusCapabilitiesList) == 0) {
+        return 0;
+    }
+
+    uint8_t cap_ptr = static_cast<uint8_t>(read_config8(device, 0x34) & 0xFCu);
+    for (size_t guard = 0; cap_ptr >= 0x40 && guard < 48; ++guard) {
+        if (read_config8(device, cap_ptr) == capability_id) {
+            return cap_ptr;
+        }
+        cap_ptr = static_cast<uint8_t>(read_config8(device, cap_ptr + 1) & 0xFCu);
+    }
+    return 0;
+}
+
+bool enable_msi(const PciDevice& device, uint8_t vector, uint8_t apic_id) {
+    uint8_t cap = find_capability(device, kMsiCapabilityId);
+    if (cap == 0) {
+        return false;
+    }
+
+    uint16_t control = read_config16(device, static_cast<uint8_t>(cap + 2));
+    bool addr64 = (control & (1u << 7)) != 0;
+    bool mask_capable = (control & (1u << 8)) != 0;
+
+    write_config32(device,
+                   static_cast<uint8_t>(cap + 4),
+                   0xFEE00000u | (static_cast<uint32_t>(apic_id) << 12));
+
+    uint8_t data_offset = static_cast<uint8_t>(cap + 8);
+    if (addr64) {
+        write_config32(device, static_cast<uint8_t>(cap + 8), 0);
+        data_offset = static_cast<uint8_t>(cap + 12);
+    }
+
+    write_config16(device, data_offset, vector);
+    if (mask_capable) {
+        write_config32(device, static_cast<uint8_t>(data_offset + 2), 0);
+    }
+
+    control &= static_cast<uint16_t>(~(0x7u << 4));
+    control |= 1u;
+    write_config16(device, static_cast<uint8_t>(cap + 2), control);
+
+    uint16_t command = read_config16(device, 0x04);
+    command |= static_cast<uint16_t>(1u << 10);
+    write_config16(device, 0x04, command);
+    return true;
 }
 
 }  // namespace pci

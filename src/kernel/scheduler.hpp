@@ -7,6 +7,8 @@
 
 namespace scheduler {
 
+using PollFn = void (*)();
+
 void init();
 void enqueue(process::Process* proc);
 [[noreturn]] void run();
@@ -17,5 +19,7 @@ process::Process* current();
 void register_cpu(percpu::Cpu* cpu);
 void tick(InterruptFrame& frame);
 size_t cpu_total();
+bool register_poll(PollFn fn);
+void service_polls();
 
 }  // namespace scheduler

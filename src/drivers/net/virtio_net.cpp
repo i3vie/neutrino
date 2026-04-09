@@ -5,6 +5,7 @@
 #include "arch/x86_64/percpu.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
+#include "kernel/scheduler.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "lib/mem.hpp"
 #include "net/network.hpp"
@@ -594,6 +595,9 @@ bool init_device(const pci::PciDevice& device) {
     g_state = state;
     g_state.active = true;
     g_state.initialized = true;
+    if (!scheduler::register_poll(poll)) {
+        log_message(LogLevel::Warn, "virtio-net: failed to register deferred poll");
+    }
 
     if (g_state.has_mac) {
         g_state.link_registered =
@@ -661,11 +665,6 @@ void init() {
 
 void poll() {
     if (!g_state.active) {
-        return;
-    }
-
-    percpu::Cpu* cpu = percpu::current_cpu();
-    if (cpu != nullptr && cpu->index != 0) {
         return;
     }
 
