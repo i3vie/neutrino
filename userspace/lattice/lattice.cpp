@@ -1067,6 +1067,7 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
     bool needs_redraw = true;
     uint8_t buffer[256];
     size_t pending = 0;
+    bool left_down = false;
 
     bool closing_requested = false;
     auto request_close_once = [&]() {
@@ -1117,7 +1118,10 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                            buffer + offset,
                            sizeof(msg));
                 offset += sizeof(msg);
-                if ((msg.buttons & 0x1u) != 0) {
+                bool new_left = (msg.buttons & 0x1u) != 0;
+                bool left_pressed = new_left && !left_down;
+                left_down = new_left;
+                if (left_pressed) {
                     int32_t panel_x = static_cast<int32_t>(kPickerPadding);
                     int32_t panel_y = static_cast<int32_t>(kPickerPadding);
                     uint32_t panel_w =

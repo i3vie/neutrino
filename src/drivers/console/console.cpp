@@ -199,6 +199,7 @@ bool Console::enable_back_buffer() {
 }
 
 void Console::flush_region(size_t x, size_t y, size_t width, size_t height) {
+    refresh_framebuffer_info();
     if (back_buffer == nullptr || primary_fb.base == nullptr) {
         return;
     }
@@ -249,6 +250,7 @@ void Console::flush_region(size_t x, size_t y, size_t width, size_t height) {
 }
 
 void Console::flush_all() {
+    refresh_framebuffer_info();
     if (back_buffer == nullptr || primary_fb.base == nullptr) {
         return;
     }
@@ -320,6 +322,10 @@ bool Console::refresh_framebuffer_info() {
     frame_bytes = (primary_fb.pitch != 0)
                       ? primary_fb.pitch * primary_fb.height
                       : 0;
+    if (back_buffer != nullptr) {
+        back_fb = primary_fb;
+        back_fb.base = back_buffer;
+    }
     return primary_fb.base != nullptr;
 }
 

@@ -511,6 +511,23 @@ void send_present(uint32_t handle) {
     write_pipe_all(handle, &msg, sizeof(msg));
 }
 
+void send_present_rect(uint32_t handle,
+                       uint16_t x,
+                       uint16_t y,
+                       uint16_t width,
+                       uint16_t height) {
+    if (handle == kInvalidDescriptor || width == 0 || height == 0) {
+        return;
+    }
+    wm::ClientPresentRect msg{};
+    msg.type = static_cast<uint8_t>(wm::ClientMessage::PresentRect);
+    msg.x = x;
+    msg.y = y;
+    msg.width = width;
+    msg.height = height;
+    write_pipe_all(handle, &msg, sizeof(msg));
+}
+
 }  // namespace
 
 int main(uint64_t, uint64_t) {
@@ -672,9 +689,68 @@ int main(uint64_t, uint64_t) {
     size_t selected_color = 0;
     uint32_t brush_size = kDefaultBrush;
     bool needs_redraw = true;
+    bool dirty_rect_valid = false;
+    wm::ClientPresentRect dirty_rect{};
 
     auto color_from_index = [&]() -> uint32_t {
         return palette_colors[selected_color];
+    };
+
+    auto mark_dirty = [&](uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+        if (width == 0 || height == 0) {
+            return;
+        }
+        if (!dirty_rect_valid) {
+            dirty_rect = {};
+            dirty_rect.x = static_cast<uint16_t>(x);
+            dirty_rect.y = static_cast<uint16_t>(y);
+            dirty_rect.width = static_cast<uint16_t>(width);
+            dirty_rect.height = static_cast<uint16_t>(height);
+            dirty_rect_valid = true;
+            return;
+        }
+        uint32_t left = (dirty_rect.x < x) ? dirty_rect.x : x;
+        uint32_t top = (dirty_rect.y < y) ? dirty_rect.y : y;
+        uint32_t right0 = static_cast<uint32_t>(dirty_rect.x) + dirty_rect.width;
+        uint32_t right1 = x + width;
+        uint32_t bottom0 = static_cast<uint32_t>(dirty_rect.y) + dirty_rect.height;
+        uint32_t bottom1 = y + height;
+        uint32_t right = (right0 > right1) ? right0 : right1;
+        uint32_t bottom = (bottom0 > bottom1) ? bottom0 : bottom1;
+        dirty_rect.x = static_cast<uint16_t>(left);
+        dirty_rect.y = static_cast<uint16_t>(top);
+        dirty_rect.width = static_cast<uint16_t>(right - left);
+        dirty_rect.height = static_cast<uint16_t>(bottom - top);
+    };
+
+    auto repaint_canvas_rect = [&](uint32_t rel_x,
+                                   uint32_t rel_y,
+                                   uint32_t width,
+                                   uint32_t height) {
+        if (width == 0 || height == 0) {
+            return;
+        }
+        for (uint32_t row = 0; row < height; ++row) {
+            uint32_t py = rel_y + row;
+            if (py >= canvas_height) {
+                break;
+            }
+            for (uint32_t col = 0; col < width; ++col) {
+                uint32_t px = rel_x + col;
+                if (px >= canvas_width) {
+                    break;
+                }
+                uint32_t color = canvas_pixels[static_cast<size_t>(py) *
+                                               canvas_width +
+                                               static_cast<size_t>(px)];
+                lattice::write_pixel(surface.buffer,
+                                     surface.stride,
+                                     surface.bytes_per_pixel,
+                                     canvas_origin_x + px,
+                                     canvas_origin_y + py,
+                                     color);
+            }
+        }
     };
 
     auto paint_brush = [&](int32_t x, int32_t y) {
@@ -689,6 +765,18 @@ int main(uint64_t, uint64_t) {
             return;
         }
         int32_t radius = static_cast<int32_t>(brush_size);
+        int32_t min_x = rel_x - radius;
+        int32_t min_y = rel_y - radius;
+        int32_t max_x = rel_x + radius;
+        int32_t max_y = rel_y + radius;
+        if (min_x < 0) min_x = 0;
+        if (min_y < 0) min_y = 0;
+        if (max_x >= static_cast<int32_t>(canvas_width)) {
+            max_x = static_cast<int32_t>(canvas_width) - 1;
+        }
+        if (max_y >= static_cast<int32_t>(canvas_height)) {
+            max_y = static_cast<int32_t>(canvas_height) - 1;
+        }
         for (int32_t dy = -radius; dy <= radius; ++dy) {
             int32_t py = rel_y + dy;
             if (py < 0 || py >= static_cast<int32_t>(canvas_height)) {
@@ -703,6 +791,15 @@ int main(uint64_t, uint64_t) {
                               static_cast<size_t>(px)] = color_from_index();
             }
         }
+        uint32_t dirty_x = static_cast<uint32_t>(canvas_origin_x + min_x);
+        uint32_t dirty_y = static_cast<uint32_t>(canvas_origin_y + min_y);
+        uint32_t dirty_w = static_cast<uint32_t>(max_x - min_x + 1);
+        uint32_t dirty_h = static_cast<uint32_t>(max_y - min_y + 1);
+        repaint_canvas_rect(static_cast<uint32_t>(min_x),
+                            static_cast<uint32_t>(min_y),
+                            dirty_w,
+                            dirty_h);
+        mark_dirty(dirty_x, dirty_y, dirty_w, dirty_h);
     };
 
     auto render_scene = [&]() {
@@ -1033,9 +1130,18 @@ int main(uint64_t, uint64_t) {
                 if (needs_redraw) {
                     render_scene();
                     if (present_handle != kInvalidDescriptor) {
-                        send_present(present_handle);
+                        if (dirty_rect_valid) {
+                            send_present_rect(present_handle,
+                                              dirty_rect.x,
+                                              dirty_rect.y,
+                                              dirty_rect.width,
+                                              dirty_rect.height);
+                        } else {
+                            send_present(present_handle);
+                        }
                     }
                     needs_redraw = false;
+                    dirty_rect_valid = false;
                 }
 
                 yield();

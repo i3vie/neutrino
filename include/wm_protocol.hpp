@@ -24,6 +24,7 @@ enum class ClientMessage : uint8_t {
     MenuInvoke = 3,
     Close = 4,
     Focus = 5,
+    PresentRect = 6,
 };
 
 enum class ServerMessage : uint8_t {
@@ -67,6 +68,15 @@ struct __attribute__((packed)) ClientMenuInvoke {
     uint8_t menu_index;
     uint8_t item_index;
     uint8_t reserved;
+};
+
+struct __attribute__((packed)) ClientPresentRect {
+    uint8_t type;
+    uint8_t reserved;
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
 };
 
 struct __attribute__((packed)) ServerMenuCommand {
