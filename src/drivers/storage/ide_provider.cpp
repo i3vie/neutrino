@@ -185,8 +185,6 @@ size_t enumerate_ide_devices(fs::BlockDevice* out_devices,
         }
 
         if (!ide_init(cfg.device)) {
-            log_message(LogLevel::Info, "IDE %s: no device present",
-                        ide_device_name(cfg.device));
             continue;
         }
 

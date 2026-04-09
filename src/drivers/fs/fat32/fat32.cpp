@@ -185,7 +185,11 @@ void format_83_name(const uint8_t* raw, char* out) {
     int pos = 0;
     for (int i = 0; i < 8; ++i) {
         if (raw[i] == ' ') continue;
-        out[pos++] = static_cast<char>(raw[i]);
+        char ch = static_cast<char>(raw[i]);
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch + ('a' - 'A'));
+        }
+        out[pos++] = ch;
     }
     int ext_len = 0;
     for (int i = 8; i < 11; ++i) {
@@ -195,7 +199,11 @@ void format_83_name(const uint8_t* raw, char* out) {
         out[pos++] = '.';
         for (int i = 8; i < 11; ++i) {
             if (raw[i] == ' ') continue;
-            out[pos++] = static_cast<char>(raw[i]);
+            char ch = static_cast<char>(raw[i]);
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch + ('a' - 'A'));
+            }
+            out[pos++] = ch;
         }
     }
     out[pos] = '\0';
