@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../include/descriptors.hpp"
+#include "descriptors.hpp"
 
 namespace process {
 struct Process;

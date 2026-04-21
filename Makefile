@@ -13,7 +13,7 @@ SRC_DIR    := src
 TARGET_ELF := $(OUT_DIR)/kernel.elf
 TARGET_ISO := $(OUT_DIR)/neutrino.iso
 
-CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Iinclude -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
+CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
 # === QEMU configuration ===
