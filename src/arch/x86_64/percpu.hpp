@@ -20,6 +20,8 @@ struct Cpu {
     uint32_t processor_id;
     uint32_t index;
     bool registered;
+    uint8_t reserved0[3];
+    uint64_t syscall_user_rsp;
     TSS tss;
     alignas(16) uint8_t tss_stack[65536];
     alignas(16) uint8_t gdt_area[8 * 8];
@@ -30,6 +32,11 @@ struct Cpu {
     uint64_t idle_ticks;
     uint64_t irq_ticks;
 };
+
+static_assert(offsetof(Cpu, syscall_user_rsp) == 16,
+              "Cpu syscall_user_rsp offset changed");
+static_assert(offsetof(Cpu, tss) + offsetof(TSS, rsp0) == 28,
+              "Cpu tss.rsp0 offset changed");
 
 void init_bsp(uint32_t lapic_id, uint32_t processor_id);
 Cpu* register_cpu(uint32_t lapic_id, uint32_t processor_id);

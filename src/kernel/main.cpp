@@ -702,6 +702,11 @@ static void kernel_main_stage2() {
         bool init_started = false;
         if (proc != nullptr) {
             string_util::copy(proc->cwd, sizeof(proc->cwd), boot_cwd);
+            if (init_path_used != nullptr) {
+                string_util::copy(proc->image_path,
+                                  sizeof(proc->image_path),
+                                  init_path_used);
+            }
             if (loader::load_into_process(image, *proc)) {
                 log_message(LogLevel::Info,
                             "Boot: launched init task from %s (%x bytes)",

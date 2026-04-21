@@ -413,4 +413,8 @@ uint64_t kernel_pool_size() {
     return g_kernel_pool_size;
 }
 
+size_t kernel_free_pages() {
+    return g_kernel_buddy.free_pages();
+}
+
 }  // namespace memory

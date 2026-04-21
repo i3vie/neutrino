@@ -47,6 +47,10 @@ Cpu* register_cpu(uint32_t lapic_id, uint32_t processor_id) {
     cpu.processor_id = processor_id;
     cpu.index = static_cast<uint32_t>(g_cpu_count - 1);
     cpu.registered = false;
+    cpu.reserved0[0] = 0;
+    cpu.reserved0[1] = 0;
+    cpu.reserved0[2] = 0;
+    cpu.syscall_user_rsp = 0;
     cpu.current_process = nullptr;
     cpu.user_ticks = 0;
     cpu.kernel_ticks = 0;
@@ -64,6 +68,9 @@ Cpu* cpu_from_index(size_t index) {
 
 Cpu* current_cpu() {
     uint64_t base = read_msr(kMsrKernelGsBase);
+    if (base == 0) {
+        base = read_msr(kMsrGsBase);
+    }
     return reinterpret_cast<Cpu*>(base);
 }
 
@@ -82,7 +89,7 @@ size_t cpu_count() {
 
 void set_current_cpu(Cpu* cpu) {
     if (cpu != nullptr) {
-        write_msr(kMsrGsBase, reinterpret_cast<uint64_t>(cpu));
+        write_msr(kMsrGsBase, 0);
         write_msr(kMsrKernelGsBase, reinterpret_cast<uint64_t>(cpu));
     }
 }

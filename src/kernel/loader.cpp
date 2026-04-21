@@ -2,6 +2,7 @@
 
 #include "drivers/log/logging.hpp"
 #include "lib/mem.hpp"
+#include "arch/x86_64/memory/paging.hpp"
 #include "vm.hpp"
 
 namespace {
@@ -29,6 +30,10 @@ enum : uint16_t {
 enum : uint32_t {
     PT_LOAD = 1,
     PT_DYNAMIC = 2,
+};
+
+enum : uint32_t {
+    PF_W = 2,
 };
 
 struct Elf64Ehdr {
@@ -385,6 +390,73 @@ bool load_elf_binary(const loader::ProgramImage& image,
                         return false;
                 }
             }
+        }
+    }
+
+    for (uint64_t page = aligned_min; page < aligned_max; page += kPageSize) {
+        bool writable = false;
+        bool covered = false;
+
+        for (uint16_t i = 0; i < header->phnum; ++i) {
+            uint64_t ph_offset =
+                header->phoff + static_cast<uint64_t>(i) * header->phentsize;
+            const auto* ph =
+                reinterpret_cast<const Elf64Phdr*>(image.data + ph_offset);
+            if (ph->type != PT_LOAD || ph->memsz == 0) {
+                continue;
+            }
+
+            uint64_t seg_start = align_down(ph->vaddr, kPageSize);
+            uint64_t seg_end = align_up(ph->vaddr + ph->memsz, kPageSize);
+            if (page < seg_start || page >= seg_end) {
+                continue;
+            }
+
+            covered = true;
+            if ((ph->flags & PF_W) != 0) {
+                writable = true;
+                break;
+            }
+        }
+
+        if (!covered || writable) {
+            continue;
+        }
+
+        uint64_t page_addr = load_bias + page;
+        if (!vm::set_user_region_writable(proc.cr3,
+                                          page_addr,
+                                          kPageSize,
+                                          false)) {
+            log_message(LogLevel::Error,
+                        "Loader: failed to protect ELF page 0x%llx",
+                        static_cast<unsigned long long>(page_addr));
+            return false;
+        }
+    }
+
+    uint64_t entry_va = load_bias + entry;
+    uint64_t entry_page = align_down(entry_va, kPageSize);
+    uint64_t entry_phys = 0;
+    uint64_t entry_flags = 0;
+    if (paging_resolve_cr3(proc.cr3, entry_va, entry_phys) &&
+        paging_flags_cr3(proc.cr3, entry_va, entry_flags)) {
+        if ((entry_flags & PAGE_FLAG_WRITE) != 0) {
+            log_message(LogLevel::Warn,
+                        "Loader: entry page still writable, forcing readonly pid=%u va=%016llx flags=%016llx",
+                        static_cast<unsigned int>(proc.pid),
+                        static_cast<unsigned long long>(entry_page),
+                        static_cast<unsigned long long>(entry_flags));
+            if (!vm::set_user_region_writable(proc.cr3,
+                                              entry_page,
+                                              kPageSize,
+                                              false)) {
+                log_message(LogLevel::Error,
+                            "Loader: failed to force entry page readonly va=%016llx",
+                            static_cast<unsigned long long>(entry_page));
+                return false;
+            }
+            paging_flags_cr3(proc.cr3, entry_va, entry_flags);
         }
     }
 

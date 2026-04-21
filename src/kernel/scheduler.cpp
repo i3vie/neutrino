@@ -7,6 +7,7 @@
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "arch/x86_64/registers.hpp"
+#include "arch/x86_64/memory/paging.hpp"
 #include "userspace.hpp"
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/smp.hpp"
@@ -172,9 +173,14 @@ void prepare_frame_for_process(process::Process& proc,
     }
     if (!proc.has_context) {
         log_message(LogLevel::Debug,
-                    "Scheduler: starting pid=%u rip=%llx rsp=%llx",
+                    "Scheduler: starting pid=%u image=%s code=%016llx+%zu rip=%016llx stack=%016llx..%016llx rsp=%016llx",
                     static_cast<unsigned int>(proc.pid),
+                    proc.image_path[0] != '\0' ? proc.image_path : "(unknown)",
+                    static_cast<unsigned long long>(proc.code_region.base),
+                    static_cast<size_t>(proc.code_region.length),
                     static_cast<unsigned long long>(proc.user_ip),
+                    static_cast<unsigned long long>(proc.stack_region.base),
+                    static_cast<unsigned long long>(proc.stack_region.top),
                     static_cast<unsigned long long>(proc.user_sp));
     }
 
@@ -346,6 +352,11 @@ void enqueue(process::Process* proc) {
             QueueGuard guard;
             next = pop_locked();
         }
+        while (next != nullptr && next->state == process::State::Terminated) {
+            process::reclaim(*next);
+            QueueGuard guard;
+            next = pop_locked();
+        }
         if (next == nullptr) {
             process::set_current(nullptr);
             asm volatile("pause");
@@ -411,6 +422,7 @@ void reschedule(syscall::SyscallFrame& frame) {
         next = pop_locked();
         while (next != nullptr &&
                (next->state == process::State::Terminated)) {
+            process::reclaim(*next);
             next = pop_locked();
         }
     }
@@ -432,12 +444,21 @@ void reschedule(syscall::SyscallFrame& frame) {
             next = pop_locked();
             while (next != nullptr &&
                    (next->state == process::State::Terminated)) {
+                process::reclaim(*next);
                 next = pop_locked();
             }
         }
     }
 
     if (next == nullptr) {
+        if (terminated) {
+            process::set_current(nullptr);
+            paging_switch_cr3(paging_kernel_cr3());
+            process::reclaim(*current_proc);
+            for (;;) {
+                asm volatile("sti; hlt");
+            }
+        }
         process::set_current(current_proc);
         prepare_frame_for_process(*current_proc, frame);
         asm volatile("pause");
@@ -445,6 +466,9 @@ void reschedule(syscall::SyscallFrame& frame) {
     }
 
     process::set_current(next);
+    if (terminated) {
+        process::reclaim(*current_proc);
+    }
     prepare_frame_for_process(*next, frame);
 }
 

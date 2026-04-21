@@ -13,6 +13,45 @@ alignas(16) uint8_t g_kernel_stacks[process::kMaxProcesses][process::kKernelStac
 uint32_t g_next_pid = 1;
 uint32_t g_next_kernel_pid = 0x80000000u;
 
+void reset_process_resources(process::Process& proc) {
+    proc.fs_base = 0;
+    proc.user_ip = 0;
+    proc.user_sp = 0;
+    proc.code_region = vm::Region{0, 0};
+    proc.stack_region = vm::Stack{0, 0, 0};
+    memset(&proc.context, 0, sizeof(proc.context));
+    proc.parent = nullptr;
+    proc.waiting_on = nullptr;
+    proc.exit_code = 0;
+    proc.has_exited = false;
+    proc.console_transferred = false;
+    proc.has_context = false;
+    proc.is_kernel_task = false;
+    proc.kernel_entry = nullptr;
+    proc.preferred_cpu = UINT32_MAX;
+    proc.vty_id = 0;
+    proc.cwd[0] = '/';
+    proc.cwd[1] = '\0';
+    proc.image_path[0] = '\0';
+    for (size_t i = 0; i < 3; ++i) {
+        proc.standard_descriptors[i] = descriptor::kInvalidHandle;
+    }
+    proc.principal = nullptr;
+    capabilities::cap_table_clear(proc.cap_handles,
+                                  capabilities::kMaxProcessCapabilities);
+    descriptor::init_table(proc.descriptors);
+    for (size_t fh = 0; fh < process::kMaxFileHandles; ++fh) {
+        proc.file_handles[fh].in_use = false;
+        proc.file_handles[fh].handle = {};
+        proc.file_handles[fh].position = 0;
+    }
+    for (size_t dh = 0; dh < process::kMaxDirectoryHandles; ++dh) {
+        proc.directory_handles[dh].in_use = false;
+        proc.directory_handles[dh].handle = {};
+        proc.directory_handles[dh].path[0] = '\0';
+    }
+}
+
 }  // namespace
 
 namespace process {
@@ -27,35 +66,12 @@ void init() {
         g_process_table[i].kernel_entry = nullptr;
         g_process_table[i].pid = 0;
         g_process_table[i].cr3 = paging_kernel_cr3();
-        g_process_table[i].fs_base = 0;
         g_process_table[i].kernel_stack_base =
             reinterpret_cast<uint64_t>(&g_kernel_stacks[i][0]);
         g_process_table[i].kernel_stack_top =
             g_process_table[i].kernel_stack_base + kKernelStackSize;
         g_process_table[i].kernel_stack_top &= ~0xFULL;
-        g_process_table[i].parent = nullptr;
-        g_process_table[i].waiting_on = nullptr;
-        g_process_table[i].exit_code = 0;
-        g_process_table[i].has_exited = false;
-        g_process_table[i].console_transferred = false;
-        g_process_table[i].preferred_cpu = UINT32_MAX;
-        g_process_table[i].vty_id = 0;
-        g_process_table[i].cwd[0] = '/';
-        g_process_table[i].cwd[1] = '\0';
-        g_process_table[i].principal = nullptr;
-        capabilities::cap_table_clear(g_process_table[i].cap_handles,
-                                      capabilities::kMaxProcessCapabilities);
-        descriptor::init_table(g_process_table[i].descriptors);
-        for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
-            g_process_table[i].file_handles[fh].in_use = false;
-            g_process_table[i].file_handles[fh].handle = {};
-            g_process_table[i].file_handles[fh].position = 0;
-        }
-        for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
-            g_process_table[i].directory_handles[dh].in_use = false;
-            g_process_table[i].directory_handles[dh].handle = {};
-            g_process_table[i].directory_handles[dh].path[0] = '\0';
-        }
+        reset_process_resources(g_process_table[i]);
     }
 }
 
@@ -75,33 +91,7 @@ Process* allocate() {
             return nullptr;
         }
         proc.cr3 = new_cr3;
-        proc.fs_base = 0;
-        proc.has_context = false;
-        proc.is_kernel_task = false;
-        proc.kernel_entry = nullptr;
-        proc.preferred_cpu = UINT32_MAX;
-        proc.parent = nullptr;
-        proc.waiting_on = nullptr;
-        proc.exit_code = 0;
-        proc.has_exited = false;
-        proc.console_transferred = false;
-        proc.cwd[0] = '/';
-        proc.cwd[1] = '\0';
-        proc.vty_id = 0;
-        proc.principal = nullptr;
-        capabilities::cap_table_clear(proc.cap_handles,
-                                      capabilities::kMaxProcessCapabilities);
-        descriptor::init_table(proc.descriptors);
-        for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
-            proc.file_handles[fh].in_use = false;
-            proc.file_handles[fh].handle = {};
-            proc.file_handles[fh].position = 0;
-        }
-        for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
-            proc.directory_handles[dh].in_use = false;
-            proc.directory_handles[dh].handle = {};
-            proc.directory_handles[dh].path[0] = '\0';
-        }
+        reset_process_resources(proc);
         return &proc;
     }
     return nullptr;
@@ -157,36 +147,32 @@ Process* allocate_kernel_task(void (*entry)(Process&)) {
         proc.state = State::Ready;
         proc.pid = g_next_pid++;
         proc.cr3 = paging_kernel_cr3();
-        proc.fs_base = 0;
-        proc.has_context = false;
+        reset_process_resources(proc);
         proc.is_kernel_task = true;
         proc.kernel_entry = entry;
-        proc.preferred_cpu = UINT32_MAX;
-        proc.parent = nullptr;
-        proc.waiting_on = nullptr;
-        proc.exit_code = 0;
-        proc.has_exited = false;
-        proc.console_transferred = false;
-        proc.cwd[0] = '/';
-        proc.cwd[1] = '\0';
-        proc.vty_id = 0;
-        proc.principal = nullptr;
-        capabilities::cap_table_clear(proc.cap_handles,
-                                      capabilities::kMaxProcessCapabilities);
-        descriptor::init_table(proc.descriptors);
-        for (size_t fh = 0; fh < kMaxFileHandles; ++fh) {
-            proc.file_handles[fh].in_use = false;
-            proc.file_handles[fh].handle = {};
-            proc.file_handles[fh].position = 0;
-        }
-        for (size_t dh = 0; dh < kMaxDirectoryHandles; ++dh) {
-            proc.directory_handles[dh].in_use = false;
-            proc.directory_handles[dh].handle = {};
-            proc.directory_handles[dh].path[0] = '\0';
-        }
         return &proc;
     }
     return nullptr;
+}
+
+void reclaim(Process& proc) {
+    descriptor::destroy_table(proc, proc.descriptors);
+    vm::release_user_region(proc.cr3, proc.code_region);
+    vm::release_user_region(proc.cr3,
+                            vm::Region{proc.stack_region.base,
+                                       proc.stack_region.length});
+    if (proc.principal != nullptr) {
+        capabilities::principal_release(proc.principal);
+    }
+    if (!proc.is_kernel_task && proc.cr3 != 0) {
+        vm::release_address_space(proc.cr3);
+        paging_destroy_address_space(proc.cr3);
+    }
+
+    proc.state = State::Unused;
+    proc.pid = 0;
+    proc.cr3 = paging_kernel_cr3();
+    reset_process_resources(proc);
 }
 
 }  // namespace process

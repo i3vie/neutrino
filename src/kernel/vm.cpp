@@ -9,12 +9,20 @@ namespace {
 
 constexpr uint64_t kPageSize = 0x1000;
 constexpr uint64_t kPageMask = kPageSize - 1;
+constexpr size_t kMaxAddressSpaces = 256;
 
 constexpr uint64_t kUserCodeBase = vm::kUserAddressSpaceBase;
 constexpr uint64_t kUserStackCeiling = vm::kUserAddressSpaceTop;
+uint64_t g_next_shared_user_code = kUserCodeBase;
 
-uint64_t g_next_user_code = kUserCodeBase;
-uint64_t g_next_user_stack = kUserStackCeiling;
+struct AddressSpaceState {
+    uint64_t cr3;
+    uint64_t next_user_code;
+    uint64_t next_user_stack;
+    bool in_use;
+};
+
+AddressSpaceState g_address_space_states[kMaxAddressSpaces]{};
 
 constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -22,6 +30,52 @@ constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
 
 constexpr uint64_t align_down(uint64_t value, uint64_t alignment) {
     return value & ~(alignment - 1);
+}
+
+AddressSpaceState* find_address_space_state(uint64_t cr3) {
+    if (cr3 == 0) {
+        return nullptr;
+    }
+    for (auto& state : g_address_space_states) {
+        if (state.in_use && state.cr3 == cr3) {
+            return &state;
+        }
+    }
+    for (auto& state : g_address_space_states) {
+        if (state.in_use) {
+            continue;
+        }
+        state.in_use = true;
+        state.cr3 = cr3;
+        state.next_user_code = kUserCodeBase;
+        state.next_user_stack = kUserStackCeiling;
+        return &state;
+    }
+    return nullptr;
+}
+
+vm::Region reserve_private_region(uint64_t cr3, size_t length) {
+    vm::Region region{0, 0};
+    if (cr3 == 0 || length == 0) {
+        return region;
+    }
+    AddressSpaceState* state = find_address_space_state(cr3);
+    if (state == nullptr) {
+        return region;
+    }
+
+    uint64_t base = align_up(state->next_user_code, kPageSize);
+    size_t padded = static_cast<size_t>(align_up(length, kPageSize));
+    size_t pages = padded / kPageSize;
+    uint64_t total = static_cast<uint64_t>(pages) * kPageSize;
+    if (!vm::is_user_range(base, total)) {
+        return vm::Region{0, 0};
+    }
+
+    region.base = base;
+    region.length = pages * kPageSize;
+    state->next_user_code = region.base + region.length;
+    return region;
 }
 
 }  // namespace
@@ -37,8 +91,13 @@ Region map_user_code(uint64_t cr3,
         entry_point = 0;
         return region;
     }
+    AddressSpaceState* state = find_address_space_state(cr3);
+    if (state == nullptr) {
+        entry_point = 0;
+        return region;
+    }
 
-    uint64_t base = align_up(g_next_user_code, kPageSize);
+    uint64_t base = align_up(state->next_user_code, kPageSize);
     size_t padded = static_cast<size_t>(align_up(length, kPageSize));
     size_t pages = padded / kPageSize;
 
@@ -68,7 +127,7 @@ Region map_user_code(uint64_t cr3,
 
     region.base = base;
     region.length = pages * kPageSize;
-    g_next_user_code = region.base + region.length;
+    state->next_user_code = region.base + region.length;
 
     uint64_t safe_offset = (entry_offset < length) ? entry_offset : 0;
     entry_point = region.base + safe_offset;
@@ -81,7 +140,7 @@ Region reserve_user_region(size_t length) {
         return region;
     }
 
-    uint64_t base = align_up(g_next_user_code, kPageSize);
+    uint64_t base = align_up(g_next_shared_user_code, kPageSize);
     size_t padded = static_cast<size_t>(align_up(length, kPageSize));
     size_t pages = padded / kPageSize;
     uint64_t total = static_cast<uint64_t>(pages) * kPageSize;
@@ -91,8 +150,12 @@ Region reserve_user_region(size_t length) {
 
     region.base = base;
     region.length = pages * kPageSize;
-    g_next_user_code = region.base + region.length;
+    g_next_shared_user_code = region.base + region.length;
     return region;
+}
+
+Region reserve_user_region(uint64_t cr3, size_t length) {
+    return reserve_private_region(cr3, length);
 }
 
 Region allocate_user_region(uint64_t cr3, size_t length) {
@@ -101,7 +164,7 @@ Region allocate_user_region(uint64_t cr3, size_t length) {
         return region;
     }
 
-    region = reserve_user_region(length);
+    region = reserve_private_region(cr3, length);
     if (region.base == 0 || region.length == 0) {
         return Region{0, 0};
     }
@@ -137,7 +200,14 @@ Stack allocate_user_stack(uint64_t cr3, size_t length) {
     size_t total = static_cast<size_t>(align_up(length, kPageSize));
     size_t pages = total / kPageSize;
 
-    uint64_t top = align_down(g_next_user_stack, kPageSize);
+    AddressSpaceState* state = find_address_space_state(cr3);
+    if (state == nullptr) {
+        log_message(LogLevel::Error,
+                    "VM: stack alloc failed (state unavailable)");
+        return Stack{0, 0, 0};
+    }
+
+    uint64_t top = align_down(state->next_user_stack, kPageSize);
     uint64_t base = top - static_cast<uint64_t>(total);
 
     for (size_t i = 0; i < pages; ++i) {
@@ -159,7 +229,7 @@ Stack allocate_user_stack(uint64_t cr3, size_t length) {
         memset(page, 0, kPageSize);
     }
 
-    g_next_user_stack = base;
+    state->next_user_stack = base;
     return Stack{base, top, total};
 }
 
@@ -219,11 +289,27 @@ uint64_t map_region(uint64_t cr3,
 }
 
 uint64_t map_anonymous(uint64_t cr3, size_t length, uint64_t flags) {
-    Region region = reserve_user_region(length);
+    Region region = reserve_private_region(cr3, length);
     if (region.base == 0 || region.length == 0) {
         return 0;
     }
     return map_region(cr3, region.base, region.length, flags);
+}
+
+void release_address_space(uint64_t cr3) {
+    if (cr3 == 0) {
+        return;
+    }
+    for (auto& state : g_address_space_states) {
+        if (!state.in_use || state.cr3 != cr3) {
+            continue;
+        }
+        state.in_use = false;
+        state.cr3 = 0;
+        state.next_user_code = 0;
+        state.next_user_stack = 0;
+        return;
+    }
 }
 
 uint64_t map_at(uint64_t cr3, uint64_t addr_hint, size_t length, uint64_t flags) {
@@ -258,6 +344,29 @@ bool unmap_region(uint64_t cr3, uint64_t addr, size_t length) {
             memory::free_user_page(phys);
         }
     }
+    return true;
+}
+
+bool set_user_region_writable(uint64_t cr3,
+                              uint64_t addr,
+                              size_t length,
+                              bool writable) {
+    if (cr3 == 0 || addr == 0 || length == 0) {
+        return false;
+    }
+
+    uint64_t base = align_down(addr, kPageSize);
+    uint64_t end = align_up(addr + length, kPageSize);
+    if (end < base || !is_user_range(base, end - base)) {
+        return false;
+    }
+
+    for (uint64_t virt = base; virt < end; virt += kPageSize) {
+        if (!paging_set_writable_cr3(cr3, virt, writable)) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -336,6 +445,11 @@ bool copy_to_user(uint64_t cr3,
         uint64_t dest_addr = dest + offset;
         uint64_t phys = 0;
         if (!paging_resolve_cr3(cr3, dest_addr, phys)) {
+            return false;
+        }
+        uint64_t page_flags = 0;
+        if (!paging_flags_cr3(cr3, dest_addr, page_flags) ||
+            (page_flags & PAGE_FLAG_WRITE) == 0) {
             return false;
         }
         size_t page_off = static_cast<size_t>(dest_addr & kPageMask);

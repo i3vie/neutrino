@@ -60,6 +60,8 @@ struct Process {
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
     uint32_t vty_id;
     char cwd[128];
+    char image_path[path_util::kMaxPathLength];
+    uint32_t standard_descriptors[3];
     descriptor::Table descriptors;
     capabilities::Principal* principal;
     capabilities::CapHandleEntry cap_handles[capabilities::kMaxProcessCapabilities];
@@ -74,5 +76,6 @@ Process* current();
 void set_current(Process* proc);
 Process* table_entry(size_t index);
 Process* find_by_pid(uint32_t pid);
+void reclaim(Process& proc);
 
 }  // namespace process

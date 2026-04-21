@@ -18,6 +18,9 @@
 %define FRAME_USER_RFLAGS 136
 %define FRAME_SIZE        144
 
+%define CPU_SYSCALL_USER_RSP 16
+%define CPU_TSS_RSP0         28
+
 %define USER_CS           0x1B
 %define USER_DS           0x23
 
@@ -25,9 +28,11 @@ section .text
 global syscall_entry
 global userspace_enter_frame
 extern syscall_dispatch
-extern syscall_kernel_stack_top
 
 syscall_entry:
+    swapgs
+    mov [gs:CPU_SYSCALL_USER_RSP], rsp
+    mov rsp, [gs:CPU_TSS_RSP0]
     sub rsp, FRAME_SIZE
 
     mov [rsp + FRAME_RAX], rax
@@ -46,23 +51,10 @@ syscall_entry:
     mov [rsp + FRAME_R14], r14
     mov [rsp + FRAME_R15], r15
 
-    lea r10, [rsp + FRAME_SIZE]
+    mov r10, [gs:CPU_SYSCALL_USER_RSP]
     mov [rsp + FRAME_USER_RSP], r10
     mov [rsp + FRAME_USER_RIP], rcx
     mov [rsp + FRAME_USER_RFLAGS], r11
-
-    mov r15, rsp
-    call syscall_kernel_stack_top
-    test rax, rax
-    jz .dispatch
-    sub rax, FRAME_SIZE
-    mov rbx, rax
-    mov rdi, rax
-    mov rsi, r15
-    mov rcx, FRAME_SIZE / 8
-    rep movsq
-    mov rsp, rbx
-    mov r15, rbx
 .dispatch:
     sti                     ; re-enable interrupts now that we're on the kernel stack
     mov rdi, rsp
@@ -97,6 +89,7 @@ syscall_entry:
     mov r14, [r15 + FRAME_R14]
     mov r15, [r15 + FRAME_R15]
 
+    swapgs
     iretq
 
 userspace_enter_frame:

@@ -11,6 +11,8 @@
 #include "../../kernel/interrupts.hpp"
 #include "../../kernel/process.hpp"
 #include "../../kernel/scheduler.hpp"
+#include "../../kernel/vm.hpp"
+#include "arch/x86_64/memory/paging.hpp"
 #include "percpu.hpp"
 #include "lapic.hpp"
 #include "isr.hpp"
@@ -155,9 +157,31 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     asm volatile("mov %%cr3, %0" : "=r"(cr3_reg));
     if (auto* cur = process::current()) {
         log_message(LogLevel::Error,
-                    "Faulting process pid=%u cr3=%016llx",
+                    "Faulting process pid=%u image=%s cr3=%016llx",
                     static_cast<unsigned int>(cur->pid),
+                    cur->image_path[0] != '\0' ? cur->image_path : "(unknown)",
                     static_cast<unsigned long long>(cr3_reg));
+        uint64_t code_base = cur->code_region.base;
+        uint64_t code_len = static_cast<uint64_t>(cur->code_region.length);
+        uint64_t stack_base = cur->stack_region.base;
+        uint64_t stack_top = cur->stack_region.top;
+        bool rip_in_code = code_base != 0 &&
+                           regs->rip >= code_base &&
+                           regs->rip < code_base + code_len;
+        bool rsp_in_stack = stack_base != 0 &&
+                            regs->rsp >= stack_base &&
+                            regs->rsp < stack_top;
+        log_message(LogLevel::Debug,
+                    "Process layout code=%016llx+%llu stack=%016llx..%016llx rip_off=%s%llx rsp_in_stack=%u",
+                    static_cast<unsigned long long>(code_base),
+                    static_cast<unsigned long long>(code_len),
+                    static_cast<unsigned long long>(stack_base),
+                    static_cast<unsigned long long>(stack_top),
+                    rip_in_code ? "" : "!",
+                    rip_in_code
+                        ? static_cast<unsigned long long>(regs->rip - code_base)
+                        : static_cast<unsigned long long>(regs->rip),
+                    rsp_in_stack ? 1u : 0u);
     } else {
         log_message(LogLevel::Error,
                     "Faulting process unknown (cr3=%016llx)",
@@ -168,6 +192,42 @@ extern "C" void isr_handler(InterruptFrame* regs) {
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         log_message(LogLevel::Error, "CR2=%016llx",
                     static_cast<unsigned long long>(cr2));
+    }
+
+    if ((regs->cs & 0x3) != 0) {
+        uint8_t insn[8]{};
+        bool have_insn = false;
+        if (auto* cur = process::current()) {
+            have_insn = vm::copy_from_user(cur->cr3, insn, regs->rip, sizeof(insn));
+            uint64_t rip_phys = 0;
+            uint64_t rip_flags = 0;
+            bool have_mapping =
+                paging_resolve_cr3(cur->cr3, regs->rip, rip_phys) &&
+                paging_flags_cr3(cur->cr3, regs->rip, rip_flags);
+            if (have_mapping) {
+                log_message(LogLevel::Debug,
+                            "RIP mapping: phys=%016llx flags=%016llx writable=%u",
+                            static_cast<unsigned long long>(rip_phys),
+                            static_cast<unsigned long long>(rip_flags),
+                            (rip_flags & PAGE_FLAG_WRITE) != 0 ? 1u : 0u);
+            } else {
+                log_message(LogLevel::Debug, "RIP mapping: unavailable");
+            }
+        }
+        if (have_insn) {
+            log_message(LogLevel::Debug,
+                        "Insn bytes: %02x %02x %02x %02x %02x %02x %02x %02x",
+                        static_cast<unsigned int>(insn[0]),
+                        static_cast<unsigned int>(insn[1]),
+                        static_cast<unsigned int>(insn[2]),
+                        static_cast<unsigned int>(insn[3]),
+                        static_cast<unsigned int>(insn[4]),
+                        static_cast<unsigned int>(insn[5]),
+                        static_cast<unsigned int>(insn[6]),
+                        static_cast<unsigned int>(insn[7]));
+        } else {
+            log_message(LogLevel::Debug, "Insn bytes: unavailable");
+        }
     }
 
     log_message(LogLevel::Debug, "RAX=%016x     RBX=%016x     RCX=%016x",
@@ -198,16 +258,37 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                 static_cast<unsigned int>(regs->cs),
                 static_cast<unsigned int>(regs->ss));
 
-    uint64_t* stack = reinterpret_cast<uint64_t*>(regs->rsp);
-    if (stack != nullptr) {
+    uint64_t stack_words[6]{};
+    bool have_stack_words = false;
+    if (regs->rsp != 0) {
+        if ((regs->cs & 0x3) != 0) {
+            if (auto* cur = process::current()) {
+                have_stack_words =
+                    vm::copy_from_user(cur->cr3,
+                                       stack_words,
+                                       regs->rsp,
+                                       sizeof(stack_words));
+            }
+        } else {
+            uint64_t* stack = reinterpret_cast<uint64_t*>(regs->rsp);
+            for (size_t i = 0; i < 6; ++i) {
+                stack_words[i] = stack[i];
+            }
+            have_stack_words = true;
+        }
+    }
+    if (have_stack_words) {
         log_message(LogLevel::Debug,
                     "Stack[0..5]: %016llx %016llx %016llx %016llx %016llx %016llx",
-                    static_cast<unsigned long long>(stack[0]),
-                    static_cast<unsigned long long>(stack[1]),
-                    static_cast<unsigned long long>(stack[2]),
-                    static_cast<unsigned long long>(stack[3]),
-                    static_cast<unsigned long long>(stack[4]),
-                    static_cast<unsigned long long>(stack[5]));
+                    static_cast<unsigned long long>(stack_words[0]),
+                    static_cast<unsigned long long>(stack_words[1]),
+                    static_cast<unsigned long long>(stack_words[2]),
+                    static_cast<unsigned long long>(stack_words[3]),
+                    static_cast<unsigned long long>(stack_words[4]),
+                    static_cast<unsigned long long>(stack_words[5]));
+    } else {
+        log_message(LogLevel::Debug,
+                    "Stack[0..5]: unavailable");
     }
 
     // If the fault originated from userspace, terminate the offending process
@@ -217,8 +298,12 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     if ((regs->cs & 0x3) != 0) {
         uint16_t exit_code = exit_code_from_exception(regs->int_no);
         log_message(LogLevel::Error,
-                    "Terminating userspace pid=%u due to exception %s (#%u) rip=%016llx exit=%u",
+                    "Terminating userspace pid=%u image=%s due to exception %s (#%u) rip=%016llx exit=%u",
                     process::current() ? static_cast<unsigned int>(process::current()->pid) : 0,
+                    (process::current() != nullptr &&
+                     process::current()->image_path[0] != '\0')
+                        ? process::current()->image_path
+                        : "(unknown)",
                     regs->int_no < 32 ? exception_names[regs->int_no] : "Unknown",
                     static_cast<unsigned int>(regs->int_no),
                     static_cast<unsigned long long>(regs->rip),
