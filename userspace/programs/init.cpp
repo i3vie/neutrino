@@ -1,7 +1,10 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <string.h>
 
 #include "../crt/syscall.hpp"
+#include "../auth/password_hash.hpp"
 #include "keyboard_scancode.hpp"
 
 namespace {
@@ -15,7 +18,7 @@ constexpr size_t kMaxPathLength = 160;
 constexpr size_t kMaxUserNameLength = 32;
 constexpr size_t kMaxLoginUsers = 32;
 constexpr const char* kRootUserName = "root";
-constexpr uint64_t kAllCapabilities = (1ull << 0) | (1ull << 1) | (1ull << 2);
+constexpr uint64_t kAllCapabilities = ~0ull;
 
 uint32_t g_console_handle = kInvalidDescriptor;
 
@@ -34,7 +37,7 @@ struct UserStoreHeader {
     uint32_t count;
 };
 
-struct PackedUser {
+struct PackedUserV1 {
     char name[kMaxUserNameLength];
     uint64_t allowed_caps;
     uint64_t generation;
@@ -42,8 +45,25 @@ struct PackedUser {
     uint8_t reserved[7];
 };
 
+struct PackedUser {
+    char name[kMaxUserNameLength];
+    uint64_t allowed_caps;
+    uint64_t generation;
+    uint8_t active;
+    uint8_t password_set;
+    uint16_t password_algorithm;
+    uint32_t password_iterations;
+    uint8_t password_salt[auth::kPasswordSaltSize];
+    uint8_t password_hash[auth::kPasswordHashSize];
+    uint8_t reserved[24];
+};
+
 struct LoginUsers {
     char names[kMaxLoginUsers][kMaxUserNameLength];
+    bool password_set[kMaxLoginUsers];
+    uint32_t password_iterations[kMaxLoginUsers];
+    uint8_t password_salt[kMaxLoginUsers][auth::kPasswordSaltSize];
+    uint8_t password_hash[kMaxLoginUsers][auth::kPasswordHashSize];
     size_t count;
 };
 
@@ -51,10 +71,7 @@ void print(const char* text) {
     if (g_console_handle == kInvalidDescriptor || text == nullptr) {
         return;
     }
-    size_t length = 0;
-    while (text[length] != '\0') {
-        ++length;
-    }
+    size_t length = strlen(text);
     if (length != 0) {
         descriptor_write(g_console_handle, text, length);
     }
@@ -67,40 +84,11 @@ void print_char(char ch) {
     descriptor_write(g_console_handle, &ch, 1);
 }
 
-bool strings_equal(const char* left, const char* right) {
-    if (left == nullptr || right == nullptr) {
-        return false;
-    }
-    size_t idx = 0;
-    while (left[idx] != '\0' && right[idx] != '\0') {
-        if (left[idx] != right[idx]) {
-            return false;
-        }
-        ++idx;
-    }
-    return left[idx] == '\0' && right[idx] == '\0';
-}
-
-size_t string_length(const char* text) {
-    size_t length = 0;
-    if (text == nullptr) {
-        return 0;
-    }
-    while (text[length] != '\0') {
-        ++length;
-    }
-    return length;
-}
-
-bool is_space(char ch) {
-    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
-}
-
 char* skip_spaces(char* text) {
     if (text == nullptr) {
         return nullptr;
     }
-    while (*text == ' ' || *text == '\t') {
+    while (*text != '\0' && isspace(*text)) {
         ++text;
     }
     return text;
@@ -112,12 +100,19 @@ void trim_trailing(char* start, char* end) {
     }
     while (end > start) {
         char ch = *(end - 1);
-        if (ch != ' ' && ch != '\t') {
+        if (!isspace(ch)) {
             break;
         }
         --end;
     }
     *end = '\0';
+}
+
+void zero_memory(void* ptr, size_t size) {
+    auto* bytes = static_cast<uint8_t*>(ptr);
+    for (size_t i = 0; i < size; ++i) {
+        bytes[i] = 0;
+    }
 }
 
 bool build_mount_subpath(const char* mount,
@@ -155,20 +150,6 @@ bool build_mount_subpath(const char* mount,
     return true;
 }
 
-void copy_string(char* out, size_t out_size, const char* in) {
-    if (out == nullptr || out_size == 0) {
-        return;
-    }
-    size_t idx = 0;
-    if (in != nullptr) {
-        while (in[idx] != '\0' && idx + 1 < out_size) {
-            out[idx] = in[idx];
-            ++idx;
-        }
-    }
-    out[idx] = '\0';
-}
-
 void* find_cached_principal(const char* user_name) {
     if (user_name == nullptr || user_name[0] == '\0') {
         return nullptr;
@@ -177,7 +158,7 @@ void* find_cached_principal(const char* user_name) {
         if (!g_principals[i].in_use) {
             continue;
         }
-        if (strings_equal(g_principals[i].name, user_name)) {
+        if (strcmp(g_principals[i].name, user_name) == 0) {
             return g_principals[i].principal;
         }
     }
@@ -191,9 +172,9 @@ bool cache_principal(const char* user_name, void* principal) {
     for (size_t i = 0; i < sizeof(g_principals) / sizeof(g_principals[0]); ++i) {
         if (!g_principals[i].in_use) {
             g_principals[i].in_use = true;
-            copy_string(g_principals[i].name,
-                        sizeof(g_principals[i].name),
-                        user_name);
+            strlcpy(g_principals[i].name,
+                    user_name,
+                    sizeof(g_principals[i].name));
             g_principals[i].principal = principal;
             return true;
         }
@@ -321,7 +302,7 @@ bool user_exists(const LoginUsers& users, const char* name) {
         return false;
     }
     for (size_t i = 0; i < users.count; ++i) {
-        if (strings_equal(users.names[i], name)) {
+        if (strcmp(users.names[i], name) == 0) {
             return true;
         }
     }
@@ -335,8 +316,32 @@ void ensure_login_user(LoginUsers& users, const char* name) {
     if (users.count >= kMaxLoginUsers) {
         return;
     }
-    copy_string(users.names[users.count], sizeof(users.names[users.count]), name);
+    strlcpy(users.names[users.count], name, sizeof(users.names[users.count]));
+    users.password_set[users.count] = false;
+    users.password_iterations[users.count] = 0;
+    zero_memory(users.password_salt[users.count], auth::kPasswordSaltSize);
+    zero_memory(users.password_hash[users.count], auth::kPasswordHashSize);
     ++users.count;
+}
+
+void set_login_user_password(LoginUsers& users,
+                             const char* name,
+                             uint32_t iterations,
+                             const uint8_t* salt,
+                             const uint8_t* hash) {
+    if (name == nullptr || salt == nullptr || hash == nullptr || iterations == 0) {
+        return;
+    }
+    for (size_t i = 0; i < users.count; ++i) {
+        if (strcmp(users.names[i], name) != 0) {
+            continue;
+        }
+        users.password_set[i] = true;
+        users.password_iterations[i] = iterations;
+        memcpy(users.password_salt[i], salt, auth::kPasswordSaltSize);
+        memcpy(users.password_hash[i], hash, auth::kPasswordHashSize);
+        return;
+    }
 }
 
 bool load_login_users(LoginUsers& users) {
@@ -360,16 +365,22 @@ bool load_login_users(LoginUsers& users) {
     }
 
     UserStoreHeader header{};
-    __builtin_memcpy(&header, buffer, sizeof(header));
-    if (header.magic != 0x4E544455u ||
-        header.version != 1 ||
-        header.entry_size != sizeof(PackedUser)) {
+    memcpy(&header, buffer, sizeof(header));
+    if (header.magic != 0x4E544455u) {
+        ensure_login_user(users, kRootUserName);
+        return users.count != 0;
+    }
+    bool current = header.version == 2 &&
+                   header.entry_size == sizeof(PackedUser);
+    bool legacy = header.version == 1 &&
+                  header.entry_size == sizeof(PackedUserV1);
+    if (!current && !legacy) {
         ensure_login_user(users, kRootUserName);
         return users.count != 0;
     }
 
     size_t available =
-        (len - sizeof(UserStoreHeader)) / sizeof(PackedUser);
+        (len - sizeof(UserStoreHeader)) / header.entry_size;
     size_t count = header.count;
     if (count > available) {
         count = available;
@@ -378,13 +389,33 @@ bool load_login_users(LoginUsers& users) {
         count = kMaxLoginUsers;
     }
 
-    const PackedUser* entries =
-        reinterpret_cast<const PackedUser*>(buffer + sizeof(UserStoreHeader));
-    for (size_t i = 0; i < count; ++i) {
-        if (entries[i].active == 0 || entries[i].name[0] == '\0') {
-            continue;
+    if (legacy) {
+        const PackedUserV1* entries =
+            reinterpret_cast<const PackedUserV1*>(buffer + sizeof(UserStoreHeader));
+        for (size_t i = 0; i < count; ++i) {
+            if (entries[i].active == 0 || entries[i].name[0] == '\0') {
+                continue;
+            }
+            ensure_login_user(users, entries[i].name);
         }
-        ensure_login_user(users, entries[i].name);
+    } else {
+        const PackedUser* entries =
+            reinterpret_cast<const PackedUser*>(buffer + sizeof(UserStoreHeader));
+        for (size_t i = 0; i < count; ++i) {
+            if (entries[i].active == 0 || entries[i].name[0] == '\0') {
+                continue;
+            }
+            ensure_login_user(users, entries[i].name);
+            if (entries[i].password_set != 0 &&
+                entries[i].password_algorithm == auth::kPasswordAlgorithmPbkdf2Sha256 &&
+                entries[i].password_iterations != 0) {
+                set_login_user_password(users,
+                                        entries[i].name,
+                                        entries[i].password_iterations,
+                                        entries[i].password_salt,
+                                        entries[i].password_hash);
+            }
+        }
     }
 
     ensure_login_user(users, kRootUserName);
@@ -447,16 +478,105 @@ bool read_login_name(char* out, size_t out_size) {
     }
 }
 
+bool read_secret_line(char* out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+    long keyboard = descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Keyboard), 0);
+    if (keyboard < 0) {
+        return false;
+    }
+
+    size_t length = 0;
+    out[0] = '\0';
+    for (;;) {
+        descriptor_defs::KeyboardEvent events[8]{};
+        long result = descriptor_read(static_cast<uint32_t>(keyboard),
+                                      events,
+                                      sizeof(events));
+        if (result <= 0) {
+            yield();
+            continue;
+        }
+        size_t count = static_cast<size_t>(result) / sizeof(events[0]);
+        for (size_t i = 0; i < count; ++i) {
+            if (!keyboard::is_pressed(events[i]) ||
+                keyboard::is_extended(events[i])) {
+                continue;
+            }
+            char ch = keyboard::scancode_to_char(events[i].scancode,
+                                                 events[i].mods);
+            if (ch == '\r' || ch == '\n') {
+                print("\n");
+                descriptor_close(static_cast<uint32_t>(keyboard));
+                out[length] = '\0';
+                return true;
+            }
+            if (ch == '\b' || ch == 0x7F) {
+                if (length > 0) {
+                    --length;
+                    out[length] = '\0';
+                }
+                continue;
+            }
+            if (ch < 0x20 || ch > 0x7E) {
+                continue;
+            }
+            if (length + 1 >= out_size) {
+                continue;
+            }
+            out[length++] = ch;
+            out[length] = '\0';
+        }
+    }
+}
+
+const LoginUsers* find_login_user(const LoginUsers& users,
+                                  const char* name,
+                                  size_t& out_index) {
+    for (size_t i = 0; i < users.count; ++i) {
+        if (strcmp(users.names[i], name) == 0) {
+            out_index = i;
+            return &users;
+        }
+    }
+    return nullptr;
+}
+
+bool verify_login_password(const LoginUsers& users, size_t index) {
+    if (index >= users.count || !users.password_set[index]) {
+        return true;
+    }
+    print("password: ");
+    char password[96];
+    if (!read_secret_line(password, sizeof(password))) {
+        return false;
+    }
+    uint8_t computed[auth::kPasswordHashSize];
+    auth::pbkdf2_sha256(password,
+                        users.password_salt[index],
+                        auth::kPasswordSaltSize,
+                        users.password_iterations[index],
+                        computed);
+    zero_memory(password, sizeof(password));
+    bool ok = auth::constant_time_equal(computed,
+                                        users.password_hash[index],
+                                        auth::kPasswordHashSize);
+    zero_memory(computed, sizeof(computed));
+    return ok;
+}
+
 void build_shell_args(const char* user_name, char* out, size_t out_size) {
     if (out == nullptr || out_size == 0) {
         return;
     }
-    copy_string(out, out_size, "user=");
-    size_t used = string_length(out);
+    strlcpy(out, "user=", out_size);
+    size_t used = strlen(out);
     if (used + 1 >= out_size) {
         return;
     }
-    copy_string(out + used, out_size - used, user_name);
+    strlcpy(out + used, user_name, out_size - used);
 }
 
 void run_login_loop() {
@@ -474,6 +594,12 @@ void run_login_loop() {
         }
         if (!user_exists(users, name)) {
             print("Unknown user\n");
+            continue;
+        }
+        size_t user_index = 0;
+        if (find_login_user(users, name, user_index) == nullptr ||
+            !verify_login_password(users, user_index)) {
+            print("Login incorrect\n");
             continue;
         }
         if (!activate_user_principal(name)) {
@@ -508,7 +634,7 @@ bool split_spawn_target(char* line, char*& command_out, const char*& user_out) {
     if (command[0] == '@') {
         ++command;
         char* user_end = command;
-        while (*user_end != '\0' && !is_space(*user_end)) {
+        while (*user_end != '\0' && !isspace(*user_end)) {
             ++user_end;
         }
         if (user_end == command) {
@@ -544,7 +670,7 @@ bool spawn_command_line(char* line) {
     }
 
     char* cursor = command;
-    while (*cursor != '\0' && !is_space(*cursor)) {
+    while (*cursor != '\0' && !isspace(*cursor)) {
         ++cursor;
     }
 

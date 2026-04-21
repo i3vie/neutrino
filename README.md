@@ -13,3 +13,17 @@ To get only the raw kernel.elf file, you can run `make all`. This will produce o
 You can use `make debug` to run in EFI mode with QEMU's debug mode enabled, allowing you to attach a debugger with e.g. `gdb -ex "target remote localhost:1234" -ex "symbol-file out/kernel.elf"`. The same considerations apply as with normal `make run.`
 ### Optimized builds
 There's no support right now for optimized builds out of the box, but you can run something like `make clean all EXTRA_CFLAGS="-O3 -DNDEBUG=1"` to pass -O3 -DNDEBUG=1 into CFLAGs.
+
+## Optional userspace dependencies
+Some userspace features may optionally depend on third-party libraries that are not stored in the repository.
+
+### BearSSL
+If you want BearSSL available to userspace programs, provide your own BearSSL checkout at `userspace/deps/BearSSL`.
+
+Once present, you can build the archive with:
+
+```sh
+make -C userspace bearssl
+```
+
+The userspace build is configured such that individual programs can optionally link against that .a, but BearSSL is probably not required for normal kernel or userspace builds unless a program explicitly depends on it.

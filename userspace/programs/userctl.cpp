@@ -1,7 +1,9 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "../crt/syscall.hpp"
+#include "../auth/password_hash.hpp"
 #include "keyboard_scancode.hpp"
 #include "descriptors.hpp"
 
@@ -52,6 +54,87 @@ bool parse_u64(const char* s, uint64_t& out) {
     return true;
 }
 
+void zero_memory(void* ptr, size_t size) {
+    auto* bytes = static_cast<uint8_t*>(ptr);
+    for (size_t i = 0; i < size; ++i) {
+        bytes[i] = 0;
+    }
+}
+
+bool read_secret_line(char* out, size_t out_size) {
+    if (out == nullptr || out_size == 0) {
+        return false;
+    }
+    long keyboard = descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::Keyboard), 0);
+    if (keyboard < 0) {
+        return false;
+    }
+    size_t length = 0;
+    out[0] = '\0';
+    for (;;) {
+        descriptor_defs::KeyboardEvent events[8]{};
+        long result = descriptor_read(static_cast<uint32_t>(keyboard),
+                                      events,
+                                      sizeof(events));
+        if (result <= 0) {
+            yield();
+            continue;
+        }
+        size_t count = static_cast<size_t>(result) / sizeof(events[0]);
+        for (size_t i = 0; i < count; ++i) {
+            if (!keyboard::is_pressed(events[i]) ||
+                keyboard::is_extended(events[i])) {
+                continue;
+            }
+            char ch = keyboard::scancode_to_char(events[i].scancode,
+                                                 events[i].mods);
+            if (ch == '\r' || ch == '\n') {
+                print("\n");
+                descriptor_close(static_cast<uint32_t>(keyboard));
+                out[length] = '\0';
+                return true;
+            }
+            if (ch == '\b' || ch == 0x7F) {
+                if (length > 0) {
+                    --length;
+                    out[length] = '\0';
+                }
+                continue;
+            }
+            if (ch < 0x20 || ch > 0x7E) {
+                continue;
+            }
+            if (length + 1 >= out_size) {
+                continue;
+            }
+            out[length++] = ch;
+            out[length] = '\0';
+        }
+    }
+}
+
+bool read_new_password(char* password, size_t password_size) {
+    char confirm[96];
+    print("new password: ");
+    if (!read_secret_line(password, password_size) || password[0] == '\0') {
+        print("empty password not allowed\n");
+        return false;
+    }
+    print("confirm password: ");
+    if (!read_secret_line(confirm, sizeof(confirm))) {
+        zero_memory(password, password_size);
+        return false;
+    }
+    bool ok = strcmp(password, confirm) == 0;
+    zero_memory(confirm, sizeof(confirm));
+    if (!ok) {
+        zero_memory(password, password_size);
+        print("passwords do not match\n");
+    }
+    return ok;
+}
+
 }  // namespace
 
 extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
@@ -94,7 +177,7 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
     };
 
     if (tok_count < 1) {
-        print("usage: userctl create <name> <capmask>|find <name>|bump <name>\n");
+        print("usage: userctl create <name> <capmask>|find <name>|bump <name>|passwd <name>\n");
         return 1;
     }
 
@@ -153,6 +236,41 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
             return 1;
         }
         print("bumped\n");
+        return 0;
+    }
+
+    if (token_equals(0, "passwd")) {
+        if (tok_count < 2) {
+            print("passwd needs <name>\n");
+            return 1;
+        }
+        char name_buf[33];
+        copy_token(1, name_buf, sizeof(name_buf));
+        void* user = user_find(name_buf);
+        if (!user) {
+            print("not found\n");
+            return 1;
+        }
+        char password[96];
+        if (!read_new_password(password, sizeof(password))) {
+            return 1;
+        }
+        uint8_t salt[auth::kPasswordSaltSize];
+        uint8_t hash[auth::kPasswordHashSize];
+        auth::make_salt(name_buf, salt);
+        auth::pbkdf2_sha256(password,
+                            salt,
+                            auth::kPasswordSaltSize,
+                            auth::kPasswordIterations,
+                            hash);
+        zero_memory(password, sizeof(password));
+        long r = user_set_password(user, salt, hash, auth::kPasswordIterations);
+        zero_memory(hash, sizeof(hash));
+        if (r < 0) {
+            print("passwd failed\n");
+            return 1;
+        }
+        print("password updated\n");
         return 0;
     }
 

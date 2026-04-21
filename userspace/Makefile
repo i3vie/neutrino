@@ -3,22 +3,42 @@
 SHELL := /bin/bash
 
 CXX      ?= g++
+CC       ?= gcc
+AR       ?= ar
 NASM     ?= nasm
 SUDO     ?=
 MOUNT_SUDO ?= sudo
 
 CRT_DIR  := crt
+LIBC_DIR := libc
+DEPS_DIR := deps
+BEARSSL_DIR := $(DEPS_DIR)/BearSSL
 OBJ_DIR  := build
-PROG_DIR := programs
+SRC_PROG_DIR := programs
+OUT_DIR  := out
 BIN_DIR  := binary
 
-PROGRAMS := init shell photon wavelength ion orbital ls cat flux userctl hexedit installer netctl networkd tcpd dhcp ping tcpecho netget
-PROGRAM_OUTPUTS := $(addprefix $(PROG_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
+PROGRAMS := init shell photon wavelength ion orbital ls cat flux userctl hexedit installer netctl networkd tcpd dhcp ping tcpecho netget browse netshell
+PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
 PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
                     -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
-                    -fPIE -pie -Wall -Wextra -I. -I$(CRT_DIR) -I../include
+                    -fPIE -pie -Wall -Wextra -I. -I$(CRT_DIR) -I$(LIBC_DIR)/include -I../shared/include -I$(BEARSSL_DIR)/inc
+PROGRAM_CFLAGS := -std=c99 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
+                  -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
+                  -fPIE -Wall -Wextra -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src \
+                  -DBR_RDRAND=0 -DBR_USE_GETENTROPY=0 -DBR_USE_URANDOM=0 \
+                  -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0 \
+                  -DBR_AES_X86NI=0 -DBR_SSE2=0 -DBR_POWER8=0
+
+BEARSSL_SOURCES := $(shell cd $(BEARSSL_DIR)/src && find . -type f -name '*.c' | sed 's#^\./##' | sort)
+BEARSSL_OBJECTS := $(addprefix $(OBJ_DIR)/bearssl/,$(BEARSSL_SOURCES:.c=.o))
+BEARSSL_LIB := $(OBJ_DIR)/libbearssl.a
+
+# Opt programs into BearSSL with:
+# PROGRAM_LIBS_<program> += $(BEARSSL_LIB)
+PROGRAM_LIBS_browse += $(BEARSSL_LIB)
 
 HDD_IMAGE ?= ../hdd.img
 MOUNT_DIR ?= $(HOME)/MountedImage
@@ -26,9 +46,14 @@ MOUNT_UID ?= $(shell id -u)
 MOUNT_GID ?= $(shell id -g)
 MOUNT_OPTS ?= loop,rw,uid=$(MOUNT_UID),gid=$(MOUNT_GID),umask=022
 
-.PHONY: all clean install install-mount install-mtools
+.PHONY: all bearssl clean install install-mount install-mtools
 
 all: $(PROGRAM_OUTPUTS)
+
+$(BEARSSL_DIR)/inc/bearssl.h:
+	@echo "BearSSL not found at $(BEARSSL_DIR)." >&2
+	@echo "Provide your own BearSSL checkout there if you want BearSSL available in userspace." >&2
+	@false
 
 $(OBJ_DIR)/crt0.o: $(CRT_DIR)/crt0.s $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(NASM) $(ASFLAGS) $< -o $@
@@ -36,8 +61,23 @@ $(OBJ_DIR)/crt0.o: $(CRT_DIR)/crt0.s $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 $(OBJ_DIR)/lattice.o: lattice/lattice.cpp lattice/lattice.hpp $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
 
-$(PROG_DIR)/%.elf: $(PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/lattice.o $(CRT_DIR)/syscall.hpp | $(PROG_DIR)
-	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/lattice.o $< -o $@
+$(OBJ_DIR)/libc_string.o: $(LIBC_DIR)/string.cpp $(LIBC_DIR)/include/string.h | $(OBJ_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/libc_ctype.o: $(LIBC_DIR)/ctype.cpp $(LIBC_DIR)/include/ctype.h | $(OBJ_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/bearssl/%.o: $(BEARSSL_DIR)/src/%.c $(BEARSSL_DIR)/inc/bearssl.h | $(OBJ_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(PROGRAM_CFLAGS) -c $< -o $@
+
+$(BEARSSL_LIB): $(BEARSSL_DIR)/inc/bearssl.h $(BEARSSL_OBJECTS) | $(OBJ_DIR)
+	$(AR) rcs $@ $(BEARSSL_OBJECTS)
+
+bearssl: $(BEARSSL_LIB)
+
+$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/lattice.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(CRT_DIR)/syscall.hpp $(PROGRAM_LIBS_$*) | $(OUT_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/lattice.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $< $(PROGRAM_LIBS_$*) -o $@
 	@mkdir -p $(BIN_DIR)
 	@cp $@ $(BIN_DIR)/$*.elf
 
@@ -54,21 +94,21 @@ install: all
 	$(SUDO) rm -rf "$(MOUNT_DIR)/config"; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/config"; \
 	for prog in $(PROGRAMS); do \
-		$(SUDO) install -m 0644 "$(PROG_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
+		$(SUDO) install -m 0644 "$(OUT_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
 	done; \
 	if [[ -d "config" ]]; then \
 		$(SUDO) cp -a "config/." "$(MOUNT_DIR)/config/"; \
 	fi; \
-	if [[ -f "$(PROG_DIR)/init.elf" ]]; then \
-		$(SUDO) install -m 0644 "$(PROG_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \
+	if [[ -f "$(OUT_DIR)/init.elf" ]]; then \
+		$(SUDO) install -m 0644 "$(OUT_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \
 	fi; \
 	sync
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 
-$(PROG_DIR):
-	mkdir -p $(PROG_DIR)
+$(OUT_DIR):
+	mkdir -p $(OUT_DIR)
 
 clean:
-	rm -rf $(OBJ_DIR) $(PROGRAM_OUTPUTS) $(BIN_DIR)
+	rm -rf $(OBJ_DIR) $(OUT_DIR) $(BIN_DIR)

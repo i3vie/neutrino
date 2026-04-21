@@ -1,0 +1,1 @@
+Place a CA bundle cacert.pem next to this file to use as the trust store
