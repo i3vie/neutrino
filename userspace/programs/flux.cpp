@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <stdio.h>
 
 #include "descriptors.hpp"
@@ -79,19 +80,6 @@ ColorRGB unpack_color(uint32_t pixel, const wm::PixelFormat& fmt) {
     return out;
 }
 
-void copy_string(char* dest, size_t dest_size, const char* src) {
-    if (dest == nullptr || dest_size == 0) {
-        return;
-    }
-    size_t i = 0;
-    if (src != nullptr) {
-        for (; i + 1 < dest_size && src[i] != '\0'; ++i) {
-            dest[i] = src[i];
-        }
-    }
-    dest[i] = '\0';
-}
-
 size_t append_string(char* dest,
                      size_t dest_size,
                      size_t offset,
@@ -111,15 +99,15 @@ size_t append_string(char* dest,
 void init_menu_bar(wm::MenuBar& bar) {
     bar = {};
     bar.menu_count = 1;
-    copy_string(bar.menus[0].label, sizeof(bar.menus[0].label), "File");
+    strlcpy(bar.menus[0].label, "File", sizeof(bar.menus[0].label));
     bar.menus[0].item_count = 2;
-    copy_string(bar.menus[0].items[0].label,
-                sizeof(bar.menus[0].items[0].label),
-                "Save");
+    strlcpy(bar.menus[0].items[0].label,
+            "Save",
+            sizeof(bar.menus[0].items[0].label));
     bar.menus[0].items[0].id = kMenuIdSave;
-    copy_string(bar.menus[0].items[1].label,
-                sizeof(bar.menus[0].items[1].label),
-                "Load");
+    strlcpy(bar.menus[0].items[1].label,
+            "Load",
+            sizeof(bar.menus[0].items[1].label));
     bar.menus[0].items[1].id = kMenuIdLoad;
 }
 
@@ -576,7 +564,7 @@ int main(uint64_t, uint64_t) {
     request.width = kWindowWidth;
     request.height = kWindowHeight;
     request.flags = 0;
-    copy_string(request.title, sizeof(request.title), kProgramTitle);
+    strlcpy(request.title, kProgramTitle, sizeof(request.title));
 
     if (!write_pipe_all(static_cast<uint32_t>(server_pipe),
                         &request,

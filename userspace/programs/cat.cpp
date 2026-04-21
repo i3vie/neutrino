@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "descriptors.hpp"
 #include "../crt/syscall.hpp"
 
@@ -8,24 +9,13 @@ constexpr uint32_t kDescConsole =
 
 namespace {
 
-size_t string_length(const char* str) {
-    if (str == nullptr) {
-        return 0;
-    }
-    size_t len = 0;
-    while (str[len] != '\0') {
-        ++len;
-    }
-    return len;
-}
-
 void write_console(long console, const char* text) {
     if (console < 0 || text == nullptr) {
         return;
     }
     descriptor_write(static_cast<uint32_t>(console),
                      text,
-                     string_length(text));
+                     strlen(text));
 }
 
 void write_line(long console, const char* text) {
@@ -41,7 +31,10 @@ int main(uint64_t arg_ptr, uint64_t /*flags*/) {
         return 1;
     }
 
-    long console = descriptor_open(kDescConsole, 0);
+    long console = process_get_standard_descriptor(1);
+    if (console < 0) {
+        console = descriptor_open(kDescConsole, 0);
+    }
     if (console < 0) {
         return 1;
     }

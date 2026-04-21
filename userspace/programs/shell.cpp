@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <string.h>
 #include "descriptors.hpp"
 #include "keyboard_scancode.hpp"
 #include "../crt/syscall.hpp"
@@ -29,22 +31,13 @@ struct PathSegment {
     size_t length;
 };
 
-size_t string_length(const char* str) {
-    size_t len = 0;
-    if (str == nullptr) return 0;
-    while (str[len] != '\0') {
-        ++len;
-    }
-    return len;
-}
-
 void print(long console, const char* str) {
     if (console < 0 || str == nullptr) {
         return;
     }
     descriptor_write(static_cast<uint32_t>(console),
                      str,
-                     string_length(str));
+                     strlen(str));
 }
 
 void print_line(long console, const char* str) {
@@ -100,48 +93,6 @@ bool has_dot(const char* str) {
     return false;
 }
 
-void copy_string(char* dest, size_t dest_size, const char* src) {
-    if (dest == nullptr || dest_size == 0) {
-        return;
-    }
-    size_t idx = 0;
-    if (src != nullptr) {
-        while (src[idx] != '\0' && idx + 1 < dest_size) {
-            dest[idx] = src[idx];
-            ++idx;
-        }
-    }
-    dest[idx] = '\0';
-}
-
-bool starts_with(const char* text, const char* prefix) {
-    if (text == nullptr || prefix == nullptr) {
-        return false;
-    }
-    size_t idx = 0;
-    while (prefix[idx] != '\0') {
-        if (text[idx] != prefix[idx]) {
-            return false;
-        }
-        ++idx;
-    }
-    return true;
-}
-
-bool strings_equal(const char* a, const char* b) {
-    if (a == nullptr || b == nullptr) {
-        return false;
-    }
-    while (*a != '\0' && *b != '\0') {
-        if (*a != *b) {
-            return false;
-        }
-        ++a;
-        ++b;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
 uint32_t parse_uint32(const char* text) {
     if (text == nullptr) {
         return 0;
@@ -171,10 +122,6 @@ char g_current_cwd[128] = "/";
 char g_boot_mount[64] = {0};
 char g_session_user[32] = "root";
 
-bool is_space(char ch) {
-    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
-}
-
 void strip_control(char* str) {
     if (str == nullptr) {
         return;
@@ -187,20 +134,6 @@ void strip_control(char* str) {
         }
     }
     str[write] = '\0';
-}
-
-bool equals_literal(const char* value, const char* literal) {
-    if (value == nullptr || literal == nullptr) {
-        return false;
-    }
-    size_t idx = 0;
-    while (literal[idx] != '\0') {
-        if (value[idx] != literal[idx]) {
-            return false;
-        }
-        ++idx;
-    }
-    return value[idx] == '\0';
 }
 
 void extract_mount_name(const char* path, char* out, size_t out_size) {
@@ -272,7 +205,7 @@ size_t build_search_directories(const char* cwd,
         if (count >= kMaxSearchDirs) {
             return;
         }
-        copy_string(out[count], sizeof(out[count]), path);
+        strlcpy(out[count], path, sizeof(out[count]));
         ++count;
     };
 
@@ -294,15 +227,15 @@ size_t build_search_directories(const char* cwd,
 
     char mount_name[64];
     extract_mount_name(cwd, mount_name, sizeof(mount_name));
-    if (strings_equal(mount_name, "binary") ||
-        strings_equal(mount_name, "config") ||
-        strings_equal(mount_name, "system") ||
-        strings_equal(mount_name, "user")) {
+    if (strcmp(mount_name, "binary") == 0 ||
+        strcmp(mount_name, "config") == 0 ||
+        strcmp(mount_name, "system") == 0 ||
+        strcmp(mount_name, "user") == 0) {
         mount_name[0] = '\0';
     }
     append_mount_dirs(mount_name);
     if (g_boot_mount[0] != '\0' &&
-        !strings_equal(mount_name, g_boot_mount)) {
+        strcmp(mount_name, g_boot_mount) != 0) {
         append_mount_dirs(g_boot_mount);
     }
 
@@ -311,6 +244,8 @@ size_t build_search_directories(const char* cwd,
 
 bool parse_segments(const char* path,
                     bool path_is_absolute,
+                    size_t floor_count,
+                    const PathSegment* mount_root_segment,
                     PathSegment (&segments)[kMaxSegments],
                     size_t& count) {
     if (path == nullptr) {
@@ -338,11 +273,26 @@ bool parse_segments(const char* path,
             continue;
         }
         if (len == 2 && start[0] == '.' && start[1] == '.') {
-            if (count > 0) {
+            if (count > floor_count) {
                 --count;
             } else if (!path_is_absolute) {
                 // ignore attempts to traverse above the root of the
                 // combined path for relative inputs
+            }
+            continue;
+        }
+        if (!path_is_absolute &&
+            len == 3 &&
+            start[0] == '.' &&
+            start[1] == '.' &&
+            start[2] == '.') {
+            if (mount_root_segment != nullptr &&
+                mount_root_segment->data != nullptr &&
+                mount_root_segment->length != 0) {
+                segments[0] = *mount_root_segment;
+                count = 1;
+            } else if (count > floor_count) {
+                count = floor_count;
             }
             continue;
         }
@@ -397,11 +347,34 @@ bool build_absolute_path_user(const char* base,
                               size_t out_size) {
     PathSegment segments[kMaxSegments];
     size_t segment_count = 0;
+    PathSegment mount_root_segment{nullptr, 0};
 
     const char* effective_base =
         (base != nullptr && base[0] != '\0') ? base : "/";
-    if (!parse_segments(effective_base, true, segments, segment_count)) {
+    size_t floor_count = 0;
+    if (g_boot_mount[0] != '\0') {
+        size_t mount_len = strlen(g_boot_mount);
+        bool mount_matches = true;
+        for (size_t i = 0; i < mount_len; ++i) {
+            if (effective_base[1 + i] != g_boot_mount[i]) {
+                mount_matches = false;
+                break;
+            }
+        }
+        if (effective_base[0] == '/' &&
+            mount_matches &&
+            (effective_base[1 + mount_len] == '\0' ||
+             effective_base[1 + mount_len] == '/')) {
+            floor_count = 1;
+        }
+    }
+    if (!parse_segments(effective_base, true, 0, nullptr, segments, segment_count)) {
         return false;
+    }
+    if (floor_count == 1 && segment_count > 0) {
+        mount_root_segment = segments[0];
+    } else if (g_boot_mount[0] != '\0') {
+        mount_root_segment = PathSegment{g_boot_mount, strlen(g_boot_mount)};
     }
 
     if (input == nullptr || input[0] == '\0') {
@@ -410,13 +383,18 @@ bool build_absolute_path_user(const char* base,
 
     if (input[0] == '/') {
         segment_count = 0;
-        if (!parse_segments(input, true, segments, segment_count)) {
+        if (!parse_segments(input, true, 0, nullptr, segments, segment_count)) {
             return false;
         }
         return write_segments(segments, segment_count, out, out_size);
     }
 
-    if (!parse_segments(input, false, segments, segment_count)) {
+    if (!parse_segments(input,
+                        false,
+                        floor_count,
+                        &mount_root_segment,
+                        segments,
+                        segment_count)) {
         return false;
     }
     return write_segments(segments, segment_count, out, out_size);
@@ -434,12 +412,12 @@ bool resolve_path(const char* base,
         return build_absolute_path_user(base, nullptr, out, out_size);
     }
 
-    if (string_length(input) >= kPathMax) {
+    if (strlen(input) >= kPathMax) {
         return false;
     }
 
     char input_copy[kPathMax];
-    copy_string(input_copy, sizeof(input_copy), input);
+    strlcpy(input_copy, input, sizeof(input_copy));
     return build_absolute_path_user(base, input_copy, out, out_size);
 }
 
@@ -447,8 +425,8 @@ size_t build_prompt(char* buffer, size_t buffer_size) {
     if (buffer == nullptr || buffer_size < 6) {
         return 0;
     }
-    size_t user_len = string_length(g_session_user);
-    size_t cwd_len = string_length(g_current_cwd);
+    size_t user_len = strlen(g_session_user);
+    size_t cwd_len = strlen(g_current_cwd);
     size_t needed = user_len + cwd_len + 6;
     if (needed > buffer_size) {
         if (buffer_size <= 6) {
@@ -492,7 +470,7 @@ bool set_console_color(long console, uint32_t fg, uint32_t bg) {
 }
 
 void write_prompt(long console, const char* prompt, size_t prompt_len) {
-    size_t user_len = string_length(g_session_user);
+    size_t user_len = strlen(g_session_user);
     size_t prefix_len = user_len + 3;
     if (prefix_len > prompt_len) {
         prefix_len = prompt_len;
@@ -516,18 +494,18 @@ void parse_session_user(const char* args) {
     }
     const char* cursor = args;
     while (*cursor != '\0') {
-        while (is_space(*cursor)) {
+        while (isspace(*cursor)) {
             ++cursor;
         }
         if (*cursor == '\0') {
             break;
         }
         const char* token = cursor;
-        while (*cursor != '\0' && !is_space(*cursor)) {
+        while (*cursor != '\0' && !isspace(*cursor)) {
             ++cursor;
         }
         size_t len = static_cast<size_t>(cursor - token);
-        if (len > 5 && starts_with(token, "user=")) {
+        if (len > 5 && strncmp(token, "user=", strlen("user=")) == 0) {
             size_t copy_len = len - 5;
             if (copy_len >= sizeof(g_session_user)) {
                 copy_len = sizeof(g_session_user) - 1;
@@ -562,7 +540,7 @@ void maybe_enter_home_directory() {
         return;
     }
     directory_close(static_cast<uint32_t>(dir));
-    copy_string(g_current_cwd, sizeof(g_current_cwd), home);
+    strlcpy(g_current_cwd, home, sizeof(g_current_cwd));
     (void)setcwd(g_current_cwd);
 }
 
@@ -574,9 +552,9 @@ bool join_path(char* dest,
     if (dest == nullptr || dest_size == 0 || dir == nullptr || cmd == nullptr) {
         return false;
     }
-    size_t dir_len = string_length(dir);
-    size_t cmd_len = string_length(cmd);
-    size_t suffix_len = (suffix != nullptr) ? string_length(suffix) : 0;
+    size_t dir_len = strlen(dir);
+    size_t cmd_len = strlen(cmd);
+    size_t suffix_len = (suffix != nullptr) ? strlen(suffix) : 0;
     bool needs_sep = dir_len > 0 && dir[dir_len - 1] != '/';
     size_t required =
         dir_len + (needs_sep ? 1 : 0) + cmd_len + suffix_len + 1;
@@ -627,7 +605,7 @@ long run_with_search(const char* command,
         }
         long value = invoke_exec(resolved, args, flags);
         if (value >= 0 && resolved_path != nullptr) {
-            copy_string(resolved_path, resolved_path_size, resolved);
+            strlcpy(resolved_path, resolved, resolved_path_size);
         }
         return value;
     }
@@ -648,7 +626,7 @@ long run_with_search(const char* command,
             long value = invoke_exec(candidate, args, flags);
             if (value >= 0) {
                 if (resolved_path != nullptr) {
-                    copy_string(resolved_path, resolved_path_size, candidate);
+                    strlcpy(resolved_path, candidate, resolved_path_size);
                 }
                 return value;
             }
@@ -662,7 +640,7 @@ long run_with_search(const char* command,
             long value = invoke_exec(candidate, args, flags);
             if (value >= 0) {
                 if (resolved_path != nullptr) {
-                    copy_string(resolved_path, resolved_path_size, candidate);
+                    strlcpy(resolved_path, candidate, resolved_path_size);
                 }
                 return value;
             }
@@ -689,7 +667,7 @@ void report_exec_result(long console,
 
     char message[64];
     size_t idx = 0;
-    size_t label_len = string_length(label);
+    size_t label_len = strlen(label);
     if (label_len > 16) {
         label_len = 16;
     }
@@ -700,7 +678,7 @@ void report_exec_result(long console,
     for (size_t i = 0; i < sizeof(suffix) - 1 && idx + 1 < sizeof(message); ++i) {
         message[idx++] = suffix[i];
     }
-    size_t digit_len = string_length(digits);
+    size_t digit_len = strlen(digits);
     for (size_t i = 0; i < digit_len && idx + 1 < sizeof(message); ++i) {
         message[idx++] = digits[i];
     }
@@ -712,7 +690,7 @@ const char* skip_spaces(const char* str) {
     if (str == nullptr) {
         return nullptr;
     }
-    while (is_space(*str)) {
+    while (isspace(*str)) {
         ++str;
     }
     return str;
@@ -760,7 +738,7 @@ void execute_command(long console, const char* line) {
 
     char command[kMaxCommandLength];
    size_t cmd_len = 0;
-    while (*cursor != '\0' && !is_space(*cursor)) {
+    while (*cursor != '\0' && !isspace(*cursor)) {
         if (cmd_len + 1 < sizeof(command)) {
             command[cmd_len++] = *cursor;
         }
@@ -774,13 +752,13 @@ void execute_command(long console, const char* line) {
 
     cursor = skip_spaces(cursor);
 
-    if (equals_literal(command, "cd")) {
+    if (strcmp(command, "cd") == 0) {
         const char* target_start = skip_spaces(cursor);
         char target_buf[128];
         size_t target_len = 0;
         if (target_start != nullptr && *target_start != '\0') {
             while (target_start[target_len] != '\0' &&
-                   !is_space(target_start[target_len])) {
+                   !isspace(target_start[target_len])) {
                 if (target_len + 1 >= sizeof(target_buf)) {
                     break;
                 }
@@ -797,24 +775,18 @@ void execute_command(long console, const char* line) {
         }
         strip_control(target_buf);
 
-        char resolved[128];
-        if (!resolve_path(g_current_cwd, target_buf, resolved, sizeof(resolved))) {
-            print_line(console, "cd: path too long");
-            return;
-        }
-        long dir = directory_open(resolved);
-        if (dir < 0) {
+        if (setcwd(target_buf) < 0) {
             print(console, "cd: no such directory: ");
-            print_line(console, resolved);
+            print_line(console, target_buf);
             return;
         }
-        directory_close(static_cast<uint32_t>(dir));
-        copy_string(g_current_cwd, sizeof(g_current_cwd), resolved);
-        if (setcwd(g_current_cwd) < 0) {
+
+        long cwd_len = getcwd(g_current_cwd, sizeof(g_current_cwd));
+        if (cwd_len < 0 || g_current_cwd[0] == '\0') {
             print_line(console, "cd: failed to update process cwd");
         }
         return;
-    } else if (equals_literal(command, "spawn")) {
+    } else if (strcmp(command, "spawn") == 0) {
         cursor = skip_spaces(cursor);
         if (cursor == nullptr || *cursor == '\0') {
             print_line(console, "usage: spawn <path> [args]");
@@ -823,7 +795,7 @@ void execute_command(long console, const char* line) {
 
         const char* path_start = cursor;
         size_t path_len = 0;
-        while (cursor[path_len] != '\0' && !is_space(cursor[path_len])) {
+        while (cursor[path_len] != '\0' && !isspace(cursor[path_len])) {
             ++path_len;
         }
 
@@ -866,14 +838,14 @@ void execute_command(long console, const char* line) {
                 message[idx] = prefix[idx];
                 ++idx;
             }
-            size_t digit_len = string_length(digits);
+            size_t digit_len = strlen(digits);
             for (size_t i = 0; i < digit_len && idx + 1 < sizeof(message); ++i) {
                 message[idx++] = digits[i];
             }
             if (resolved_path[0] != '\0' && idx + 2 < sizeof(message)) {
                 message[idx++] = ' ';
                 message[idx++] = '(';
-                size_t path_len_out = string_length(resolved_path);
+                size_t path_len_out = strlen(resolved_path);
                 for (size_t i = 0; i < path_len_out && idx + 2 < sizeof(message); ++i) {
                     message[idx++] = resolved_path[i];
                 }
@@ -882,9 +854,9 @@ void execute_command(long console, const char* line) {
             message[idx] = '\0';
             print_line(console, message);
         }
-    } else if (equals_literal(command, "whoami")) {
+    } else if (strcmp(command, "whoami") == 0) {
         print_line(console, g_session_user);
-    } else if (equals_literal(command, "help")) {
+    } else if (strcmp(command, "help") == 0) {
         char path_info[192];
         size_t idx = 0;
         auto append_literal = [&](const char* text) {
@@ -907,7 +879,7 @@ void execute_command(long console, const char* line) {
         path_info[idx] = '\0';
         print_line(console, path_info);
         print_line(console, "builtins: cd, help, whoami, spawn, burst");
-    } else if (equals_literal(command, "burst")) {
+    } else if (strcmp(command, "burst") == 0) {
         // Spawn multiple no-op tasks without waiting.
         int spawned = 0;
         for (int i = 0; i < 5; ++i) {
@@ -963,10 +935,14 @@ int main(uint64_t arg, uint64_t) {
         vty_handle = descriptor_open(kDescVty, vty_id, flags, open_context);
     }
 
-    long console = descriptor_open(kDescConsole, 0);
+    long std_input = process_get_standard_descriptor(0);
+    long console = process_get_standard_descriptor(1);
+    if (console < 0) {
+        console = descriptor_open(kDescConsole, 0);
+    }
     if (console < 0) return 1;
 
-    long input_handle = vty_handle;
+    long input_handle = std_input >= 0 ? std_input : vty_handle;
     if (input_handle < 0) {
         input_handle = descriptor_open(kDescKeyboard, 0);
         if (input_handle < 0) return 1;
@@ -990,11 +966,21 @@ int main(uint64_t arg, uint64_t) {
     input_buffer[0] = '\0';
     size_t rendered_length = prompt_len;
 
-    bool input_is_keyboard = (input_handle != vty_handle);
+    bool input_is_keyboard = (std_input < 0 && input_handle != vty_handle);
+    bool echo_input = std_input < 0;
+    bool suppress_next_lf = false;
     while (1) {
         auto handle_input_byte = [&](uint8_t key) {
+            if (key == '\n' && suppress_next_lf) {
+                suppress_next_lf = false;
+                return;
+            }
+            suppress_next_lf = false;
             if (key == '\r' || key == '\n') {
-                descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+                suppress_next_lf = (key == '\r');
+                if (echo_input) {
+                    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+                }
                 input_buffer[input_length] = '\0';
                 execute_command(console, input_buffer);
                 input_length = 0;
@@ -1008,12 +994,14 @@ int main(uint64_t arg, uint64_t) {
                     input_buffer[input_length] = '\0';
                     prompt_len = build_prompt(prompt_buffer,
                                               sizeof(prompt_buffer));
-                    rendered_length = render_line(console,
-                                                  prompt_buffer,
-                                                  prompt_len,
-                                                  input_buffer,
-                                                  input_length,
-                                                  rendered_length);
+                    if (echo_input) {
+                        rendered_length = render_line(console,
+                                                      prompt_buffer,
+                                                      prompt_len,
+                                                      input_buffer,
+                                                      input_length,
+                                                      rendered_length);
+                    }
                 }
             } else if (key == '\t') {
                 // ignore tabs for now
@@ -1023,12 +1011,14 @@ int main(uint64_t arg, uint64_t) {
                     input_buffer[input_length] = '\0';
                     prompt_len = build_prompt(prompt_buffer,
                                               sizeof(prompt_buffer));
-                    rendered_length = render_line(console,
-                                                  prompt_buffer,
-                                                  prompt_len,
-                                                  input_buffer,
-                                                  input_length,
-                                                  rendered_length);
+                    if (echo_input) {
+                        rendered_length = render_line(console,
+                                                      prompt_buffer,
+                                                      prompt_len,
+                                                      input_buffer,
+                                                      input_length,
+                                                      rendered_length);
+                    }
                 }
             }
         };

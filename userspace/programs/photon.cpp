@@ -1,5 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <string.h>
 
 #include "descriptors.hpp"
 #include "font8x8_basic.hpp"
@@ -67,8 +69,6 @@ struct Window {
     size_t client_pending;
 };
 
-void copy_string(char* dest, size_t dest_size, const char* src);
-
 Window g_windows[kMaxWindows];
 
 void fill_rect_clipped(uint8_t* frame,
@@ -107,17 +107,6 @@ void fill_rect_clipped(uint8_t* frame,
               static_cast<uint32_t>(right - left),
               static_cast<uint32_t>(bottom - top),
               color);
-}
-
-size_t str_len(const char* text) {
-    size_t len = 0;
-    if (text == nullptr) {
-        return 0;
-    }
-    while (text[len] != '\0') {
-        ++len;
-    }
-    return len;
 }
 
 void draw_char(uint8_t* frame,
@@ -423,7 +412,7 @@ void draw_window_decor(uint8_t* frame,
             available = right_limit - kTitleTextPadding;
         }
         size_t max_chars = available / kFontWidth;
-        size_t title_len = str_len(window.title);
+        size_t title_len = strlen(window.title);
         if (max_chars > title_len) {
             max_chars = title_len;
         }
@@ -550,7 +539,7 @@ void draw_window_decor_clipped(uint8_t* frame,
             available = right_limit - kTitleTextPadding;
         }
         size_t max_chars = available / kFontWidth;
-        size_t title_len = str_len(window.title);
+        size_t title_len = strlen(window.title);
         if (max_chars > title_len) {
             max_chars = title_len;
         }
@@ -969,9 +958,9 @@ void send_menu_bar_update(Window* background, const Window* focused) {
     wm::ServerMenuBarMessage msg{};
     msg.type = static_cast<uint8_t>(wm::ServerMessage::MenuBar);
     if (focused != nullptr && focused->title[0] != '\0') {
-        copy_string(msg.title, sizeof(msg.title), focused->title);
+        strlcpy(msg.title, focused->title, sizeof(msg.title));
     } else {
-        copy_string(msg.title, sizeof(msg.title), kDefaultMenuTitle);
+        strlcpy(msg.title, kDefaultMenuTitle, sizeof(msg.title));
     }
     if (focused != nullptr) {
         msg.bar = focused->menu;
@@ -1184,28 +1173,11 @@ bool write_pipe_all(uint32_t handle, const void* data, size_t length) {
     return true;
 }
 
-void copy_string(char* dest, size_t dest_size, const char* src) {
-    if (dest == nullptr || dest_size == 0) {
-        return;
-    }
-    size_t i = 0;
-    if (src != nullptr) {
-        for (; i + 1 < dest_size && src[i] != '\0'; ++i) {
-            dest[i] = src[i];
-        }
-    }
-    dest[i] = '\0';
-}
-
-bool is_space(char ch) {
-    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
-}
-
 char* skip_spaces(char* text) {
     if (text == nullptr) {
         return nullptr;
     }
-    while (*text != '\0' && is_space(*text)) {
+    while (*text != '\0' && isspace(*text)) {
         ++text;
     }
     return text;
@@ -1215,7 +1187,7 @@ void trim_trailing(char* start, char* end) {
     if (start == nullptr || end == nullptr) {
         return;
     }
-    while (end > start && is_space(*(end - 1))) {
+    while (end > start && isspace(*(end - 1))) {
         --end;
     }
     *end = '\0';
@@ -1300,7 +1272,7 @@ bool find_mount_name(char* out, size_t out_size) {
     bool found = false;
     while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
         if (entry.name[0] != '\0') {
-            copy_string(out, out_size, entry.name);
+            strlcpy(out, entry.name, out_size);
             found = true;
             break;
         }

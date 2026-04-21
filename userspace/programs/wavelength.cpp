@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "descriptors.hpp"
 #include "font8x8_basic.hpp"
@@ -58,31 +59,6 @@ struct Icon {
 
 char g_session_user[32] = {0};
 
-void copy_string(char* dest, size_t dest_size, const char* src) {
-    if (dest == nullptr || dest_size == 0) {
-        return;
-    }
-    size_t i = 0;
-    if (src != nullptr) {
-        for (; i + 1 < dest_size && src[i] != '\0'; ++i) {
-            dest[i] = src[i];
-        }
-    }
-    dest[i] = '\0';
-}
-
-bool starts_with(const char* text, const char* prefix) {
-    if (text == nullptr || prefix == nullptr) {
-        return false;
-    }
-    for (size_t i = 0; prefix[i] != '\0'; ++i) {
-        if (text[i] != prefix[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
 void parse_session_user(const char* args) {
     if (args == nullptr) {
         return;
@@ -102,7 +78,7 @@ void parse_session_user(const char* args) {
             ++cursor;
         }
         size_t len = static_cast<size_t>(cursor - token);
-        if (len > 5 && starts_with(token, "user=")) {
+        if (len > 5 && strncmp(token, "user=", strlen("user=")) == 0) {
             size_t copy_len = len - 5;
             if (copy_len >= sizeof(g_session_user)) {
                 copy_len = sizeof(g_session_user) - 1;
@@ -116,21 +92,6 @@ void parse_session_user(const char* args) {
     }
 }
 
-bool string_equal_n(const char* left, const char* right, size_t max_len) {
-    if (left == nullptr || right == nullptr) {
-        return left == right;
-    }
-    for (size_t i = 0; i < max_len; ++i) {
-        if (left[i] != right[i]) {
-            return false;
-        }
-        if (left[i] == '\0') {
-            return true;
-        }
-    }
-    return true;
-}
-
 bool menu_bar_equal(const wm::MenuBar& left, const wm::MenuBar& right) {
     if (left.menu_count != right.menu_count) {
         return false;
@@ -138,9 +99,9 @@ bool menu_bar_equal(const wm::MenuBar& left, const wm::MenuBar& right) {
     for (uint8_t i = 0; i < left.menu_count; ++i) {
         const wm::Menu& left_menu = left.menus[i];
         const wm::Menu& right_menu = right.menus[i];
-        if (!string_equal_n(left_menu.label,
-                            right_menu.label,
-                            wm::kMenuLabelSize)) {
+        if (strncmp(left_menu.label,
+                    right_menu.label,
+                    wm::kMenuLabelSize) != 0) {
             return false;
         }
         if (left_menu.item_count != right_menu.item_count) {
@@ -152,9 +113,9 @@ bool menu_bar_equal(const wm::MenuBar& left, const wm::MenuBar& right) {
             if (left_item.id != right_item.id) {
                 return false;
             }
-            if (!string_equal_n(left_item.label,
-                                right_item.label,
-                                wm::kMenuItemLabelSize)) {
+            if (strncmp(left_item.label,
+                        right_item.label,
+                        wm::kMenuItemLabelSize) != 0) {
                 return false;
             }
         }
@@ -591,7 +552,7 @@ int main(uint64_t arg_ptr, uint64_t) {
     request.width = 0;
     request.height = 0;
     request.flags = wm::kWindowFlagBackground;
-    copy_string(request.title, sizeof(request.title), "Wavelength");
+    strlcpy(request.title, "Wavelength", sizeof(request.title));
 
     if (!write_pipe_all(static_cast<uint32_t>(server_handle),
                         &request,
@@ -689,7 +650,7 @@ int main(uint64_t arg_ptr, uint64_t) {
 
     wm::MenuBar menu_bar{};
     char focused_title[32];
-    copy_string(focused_title, sizeof(focused_title), "Wavelength");
+    strlcpy(focused_title, "Wavelength", sizeof(focused_title));
     int active_menu = -1;
 
     Icon icons[] = {
@@ -988,12 +949,12 @@ int main(uint64_t arg_ptr, uint64_t) {
                                     sizeof(msg));
                 wm::MenuBar incoming = msg.bar;
                 clamp_menu_bar(incoming);
-                bool title_changed = !string_equal_n(focused_title,
-                                                     msg.title,
-                                                     sizeof(msg.title));
+                bool title_changed = strncmp(focused_title,
+                                             msg.title,
+                                             sizeof(msg.title)) != 0;
                 bool menu_changed = !menu_bar_equal(menu_bar, incoming);
                 if (title_changed || menu_changed) {
-                    copy_string(focused_title, sizeof(focused_title), msg.title);
+                    strlcpy(focused_title, msg.title, sizeof(focused_title));
                     menu_bar = incoming;
                     active_menu = -1;
                     needs_redraw = true;

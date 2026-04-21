@@ -1,7 +1,9 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "../crt/syscall.hpp"
+#include "../net/dns.hpp"
 #include "../net/tcpd_protocol.hpp"
 
 namespace {
@@ -14,6 +16,7 @@ struct TargetSpec {
     const char* host_begin;
     const char* host_end;
     const char* path;
+    bool host_is_ipv4;
 };
 
 void print(const char* text) {
@@ -28,10 +31,7 @@ void print(const char* text) {
     if (text == nullptr) {
         return;
     }
-    size_t len = 0;
-    while (text[len] != '\0') {
-        ++len;
-    }
+    size_t len = strlen(text);
     if (len != 0) {
         descriptor_write(static_cast<uint32_t>(console), text, len);
     }
@@ -78,6 +78,31 @@ bool parse_ipv4_component(const char* begin, const char* end, uint8_t& out) {
     return true;
 }
 
+bool parse_ipv4_range(const char* begin, const char* end, uint8_t out[4]) {
+    if (begin == nullptr || end == nullptr || begin == end || out == nullptr) {
+        return false;
+    }
+    const char* component_start = begin;
+    for (size_t i = 0; i < 4; ++i) {
+        const char* cursor = component_start;
+        while (cursor != end && *cursor != '.') {
+            ++cursor;
+        }
+        if (!parse_ipv4_component(component_start, cursor, out[i])) {
+            return false;
+        }
+        if (i != 3) {
+            if (cursor == end || *cursor != '.') {
+                return false;
+            }
+            component_start = cursor + 1;
+            continue;
+        }
+        return cursor == end;
+    }
+    return false;
+}
+
 bool parse_target(const char* text, TargetSpec& out) {
     if (text == nullptr || *text == '\0') {
         return false;
@@ -85,22 +110,14 @@ bool parse_target(const char* text, TargetSpec& out) {
 
     const char* cursor = text;
     out.host_begin = text;
-    const char* component_start = cursor;
-    for (size_t i = 0; i < 4; ++i) {
-        while (*cursor != '\0' && *cursor != '.' && *cursor != ':' && *cursor != '/') {
-            ++cursor;
-        }
-        if (!parse_ipv4_component(component_start, cursor, out.ip[i])) {
-            return false;
-        }
-        if (i != 3) {
-            if (*cursor != '.') {
-                return false;
-            }
-            ++cursor;
-            component_start = cursor;
-        }
+    while (*cursor != '\0' && *cursor != ':' && *cursor != '/') {
+        ++cursor;
     }
+    out.host_end = cursor;
+    if (out.host_begin == out.host_end) {
+        return false;
+    }
+    out.host_is_ipv4 = parse_ipv4_range(out.host_begin, out.host_end, out.ip);
 
     out.port = 80;
     if (*cursor == ':') {
@@ -114,17 +131,8 @@ bool parse_target(const char* text, TargetSpec& out) {
         }
     }
 
-    out.host_end = cursor;
     out.path = (*cursor == '/') ? cursor : "/";
     return true;
-}
-
-size_t string_length(const char* text) {
-    size_t len = 0;
-    while (text != nullptr && text[len] != '\0') {
-        ++len;
-    }
-    return len;
 }
 
 bool open_tcpd_registry(uint32_t& handle, tcpd_protocol::Registry*& registry) {
@@ -164,11 +172,13 @@ bool write_tcpd_message(uint32_t handle, const tcpd_protocol::Message& message) 
 
 bool send_connect_request(uint32_t server_handle,
                           uint32_t reply_pipe_id,
+                          uint32_t endpoint_id,
                           const TargetSpec& target) {
     tcpd_protocol::Message message{};
     tcpd_protocol::init_message(message, tcpd_protocol::kConnectRequest);
     message.connect_request.reply_pipe_id = reply_pipe_id;
     message.connect_request.remote_port = target.port;
+    message.connect_request.endpoint_id = endpoint_id;
     for (size_t i = 0; i < 4; ++i) {
         message.connect_request.remote_ip[i] = target.ip[i];
     }
@@ -195,24 +205,7 @@ bool append_bytes(char* dest,
 }
 
 bool append_string(char* dest, size_t capacity, size_t& length, const char* text) {
-    return append_bytes(dest, capacity, length, text, text + string_length(text));
-}
-
-bool send_payload(uint32_t server_handle,
-                  uint32_t connection_id,
-                  const char* payload,
-                  size_t payload_length) {
-    if (payload_length > tcpd_protocol::kMaxPayload) {
-        return false;
-    }
-    tcpd_protocol::Message message{};
-    tcpd_protocol::init_message(message, tcpd_protocol::kSendRequest);
-    message.send_request.connection_id = connection_id;
-    message.send_request.payload_length = static_cast<uint16_t>(payload_length);
-    for (size_t i = 0; i < payload_length; ++i) {
-        message.send_request.payload[i] = static_cast<uint8_t>(payload[i]);
-    }
-    return write_tcpd_message(server_handle, message);
+    return append_bytes(dest, capacity, length, text, text + strlen(text));
 }
 
 bool write_console(const uint8_t* bytes, size_t length) {
@@ -242,8 +235,26 @@ int main(uint64_t arg_ptr, uint64_t) {
     const char* args = reinterpret_cast<const char*>(arg_ptr);
     TargetSpec target{};
     if (!parse_target(args, target)) {
-        print_line("usage: netget <ip[:port][/path]>");
+        print_line("usage: netget <host[:port][/path]>");
         return 1;
+    }
+
+    if (!target.host_is_ipv4) {
+        char host[256];
+        size_t host_length = static_cast<size_t>(target.host_end - target.host_begin);
+        if (host_length == 0 || host_length >= sizeof(host)) {
+            print_line("netget: host too long");
+            return 1;
+        }
+        for (size_t i = 0; i < host_length; ++i) {
+            host[i] = target.host_begin[i];
+        }
+        host[host_length] = '\0';
+
+        if (!usernet::dns::resolve_a(host, target.ip)) {
+            print_line("netget: dns lookup failed");
+            return 1;
+        }
     }
 
     uint32_t registry_handle = 0;
@@ -280,7 +291,23 @@ int main(uint64_t arg_ptr, uint64_t) {
         return 1;
     }
 
-    if (!send_connect_request(static_cast<uint32_t>(server_pipe), reply_info.id, target)) {
+    long endpoint = net_endpoint_open_new(
+        static_cast<uint64_t>(descriptor_defs::Flag::Async));
+    if (endpoint < 0) {
+        print_line("netget: failed to create endpoint");
+        return 1;
+    }
+    descriptor_defs::NetEndpointInfo endpoint_info{};
+    if (net_endpoint_get_info(static_cast<uint32_t>(endpoint), &endpoint_info) != 0 ||
+        endpoint_info.id == 0) {
+        print_line("netget: failed to query endpoint");
+        return 1;
+    }
+
+    if (!send_connect_request(static_cast<uint32_t>(server_pipe),
+                              reply_info.id,
+                              endpoint_info.id,
+                              target)) {
         print_line("netget: failed to send connect request");
         return 1;
     }
@@ -325,29 +352,44 @@ int main(uint64_t arg_ptr, uint64_t) {
         print_line("netget: request too long");
         return 1;
     }
-    if (!send_payload(static_cast<uint32_t>(server_pipe),
-                      connection_id,
-                      request,
-                      request_length)) {
+    (void)connection_id;
+    size_t sent = 0;
+    while (sent < request_length) {
+        long result = descriptor_write(static_cast<uint32_t>(endpoint),
+                                       request + sent,
+                                       request_length - sent);
+        if (result == kDescriptorWouldBlock) {
+            yield();
+            continue;
+        }
+        if (result <= 0) {
+            break;
+        }
+        sent += static_cast<size_t>(result);
+    }
+    if (sent != request_length) {
         print_line("netget: failed to send request");
         return 1;
     }
 
+    uint8_t response[1024];
     for (;;) {
-        tcpd_protocol::Message message{};
-        if (!tcpd_protocol::read_message(static_cast<uint32_t>(reply_pipe), message)) {
+        long read = descriptor_read(static_cast<uint32_t>(endpoint),
+                                    response,
+                                    sizeof(response));
+        if (read == kDescriptorWouldBlock) {
             yield();
             continue;
         }
-
-        if (message.type == tcpd_protocol::kDataEvent) {
-            if (!write_console(message.data_event.payload, message.data_event.payload_length)) {
-                return 1;
-            }
-            continue;
-        }
-        if (message.type == tcpd_protocol::kClosedEvent) {
+        if (read == 0) {
             return 0;
+        }
+        if (read < 0) {
+            print_line("netget: endpoint read failed");
+            return 1;
+        }
+        if (!write_console(response, static_cast<size_t>(read))) {
+            return 1;
         }
     }
 }

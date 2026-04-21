@@ -1,5 +1,7 @@
 #include "lattice.hpp"
 
+#include <string.h>
+
 #include "font8x8_basic.hpp"
 #include "keyboard_scancode.hpp"
 #include "../crt/syscall.hpp"
@@ -97,9 +99,7 @@ void copy_bytes(uint8_t* dest, const uint8_t* src, size_t count) {
     if (dest == nullptr || src == nullptr || count == 0) {
         return;
     }
-    for (size_t i = 0; i < count; ++i) {
-        dest[i] = src[i];
-    }
+    memcpy(dest, src, count);
 }
 
 void fill_rect(uint8_t* frame,
@@ -212,49 +212,11 @@ constexpr const char kRegistryName[] = "wm.registry";
 constexpr const char kPickerWindowTitle[] = "File Picker";
 constexpr uint32_t kInvalidFileHandle = 0xFFFFFFFFu;
 
-size_t string_length(const char* text) {
-    if (text == nullptr) {
-        return 0;
-    }
-    size_t len = 0;
-    while (text[len] != '\0') {
-        ++len;
-    }
-    return len;
-}
-
-void copy_string(char* dest, size_t dest_size, const char* src) {
-    if (dest == nullptr || dest_size == 0) {
-        return;
-    }
-    size_t i = 0;
-    if (src != nullptr) {
-        for (; i + 1 < dest_size && src[i] != '\0'; ++i) {
-            dest[i] = src[i];
-        }
-    }
-    dest[i] = '\0';
-}
-
-bool strings_equal(const char* a, const char* b) {
-    if (a == nullptr || b == nullptr) {
-        return false;
-    }
-    size_t i = 0;
-    while (a[i] != '\0' && b[i] != '\0') {
-        if (a[i] != b[i]) {
-            return false;
-        }
-        ++i;
-    }
-    return a[i] == '\0' && b[i] == '\0';
-}
-
 void append_text(char* dest, size_t dest_size, const char* src) {
     if (dest == nullptr || dest_size == 0) {
         return;
     }
-    size_t len = string_length(dest);
+    size_t len = strlen(dest);
     if (len + 1 >= dest_size) {
         return;
     }
@@ -424,7 +386,7 @@ bool read_entries(PickerState& state) {
         if (entry.name[0] == '\0') {
             continue;
         }
-        if (strings_equal(entry.name, ".") || strings_equal(entry.name, "..")) {
+        if (strcmp(entry.name, ".") == 0 || strcmp(entry.name, "..") == 0) {
             continue;
         }
         state.entries[state.entry_count++] = entry;
@@ -588,7 +550,7 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
     request.width = kPickerWindowWidth;
     request.height = kPickerWindowHeight;
     request.flags = 0;
-    copy_string(request.title, sizeof(request.title), kPickerWindowTitle);
+    strlcpy(request.title, kPickerWindowTitle, sizeof(request.title));
 
     if (!write_pipe_all(static_cast<uint32_t>(server_pipe),
                         &request,
@@ -779,7 +741,7 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                   parent.height);
 
         char location[128];
-        copy_string(location, sizeof(location), "/");
+        strlcpy(location, "/", sizeof(location));
         for (uint8_t i = 0; i < state.path_depth; ++i) {
             if (location[1] != '\0') {
                 append_text(location, sizeof(location), "/");
@@ -849,7 +811,7 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                                  highlight);
             }
             char label[68];
-            copy_string(label, sizeof(label), entry.name);
+            strlcpy(label, entry.name, sizeof(label));
             if (is_dir_entry(entry)) {
                 append_text(label, sizeof(label), "/");
             }
@@ -1211,9 +1173,9 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                             const auto& entry = state.entries[idx];
                             if (is_dir_entry(entry)) {
                                 if (state.path_depth < kPickerMaxDepth) {
-                                    copy_string(state.path_segments[state.path_depth],
-                                                sizeof(state.path_segments[state.path_depth]),
-                                                entry.name);
+                                    strlcpy(state.path_segments[state.path_depth],
+                                            entry.name,
+                                            sizeof(state.path_segments[state.path_depth]));
                                     ++state.path_depth;
                                     open_current_directory(state);
                                     needs_redraw = true;
@@ -1222,9 +1184,9 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                                 state.selected = static_cast<int>(idx);
                                 update_scroll(state, visible_rows);
                                 if (mode == FilePickerMode::Save) {
-                                    copy_string(state.filename,
-                                                sizeof(state.filename),
-                                                entry.name);
+                                    strlcpy(state.filename,
+                                            entry.name,
+                                            sizeof(state.filename));
                                 }
                                 needs_redraw = true;
                             }
@@ -1347,13 +1309,13 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                     char ch = keyboard::scancode_to_char(event.scancode,
                                                          event.mods);
                     if (ch == '\b') {
-                        size_t len = string_length(state.filename);
+                        size_t len = strlen(state.filename);
                         if (len > 0) {
                             state.filename[len - 1] = '\0';
                             needs_redraw = true;
                         }
                     } else if (ch >= 32 && ch <= 126 && ch != '/') {
-                        size_t len = string_length(state.filename);
+                        size_t len = strlen(state.filename);
                         if (len + 1 < sizeof(state.filename)) {
                             state.filename[len] = ch;
                             state.filename[len + 1] = '\0';
@@ -1384,9 +1346,9 @@ FilePickerResult FilePicker::open(FilePickerParent parent,
                             state.entries[static_cast<size_t>(state.selected)];
                         if (is_dir_entry(entry)) {
                             if (state.path_depth < kPickerMaxDepth) {
-                                copy_string(state.path_segments[state.path_depth],
-                                            sizeof(state.path_segments[state.path_depth]),
-                                            entry.name);
+                                strlcpy(state.path_segments[state.path_depth],
+                                        entry.name,
+                                        sizeof(state.path_segments[state.path_depth]));
                                 ++state.path_depth;
                                 open_current_directory(state);
                                 needs_redraw = true;

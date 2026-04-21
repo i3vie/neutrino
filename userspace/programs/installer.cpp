@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "descriptors.hpp"
 #include "keyboard_scancode.hpp"
@@ -51,43 +52,18 @@ bool set_console_color(long console, uint32_t fg, uint32_t bg) {
     return res == 0;
 }
 
-size_t string_length(const char* text) {
-    if (text == nullptr) {
-        return 0;
-    }
-    size_t len = 0;
-    while (text[len] != '\0') {
-        ++len;
-    }
-    return len;
-}
-
 void print(long console, const char* text) {
     if (console < 0 || text == nullptr) {
         return;
     }
     descriptor_write(static_cast<uint32_t>(console),
                      text,
-                     string_length(text));
+                     strlen(text));
 }
 
 void print_line(long console, const char* text) {
     print(console, text);
     descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-}
-
-bool starts_with(const char* text, const char* prefix) {
-    if (text == nullptr || prefix == nullptr) {
-        return false;
-    }
-    size_t idx = 0;
-    while (prefix[idx] != '\0') {
-        if (text[idx] != prefix[idx]) {
-            return false;
-        }
-        ++idx;
-    }
-    return true;
 }
 
 char read_char_blocking(uint32_t keyboard) {
@@ -211,7 +187,7 @@ void format_size(uint64_t bytes, char* out, size_t out_cap) {
             buf[0] = '\0';
         }
         // copy to out
-        size_t copy_len = string_length(buf);
+        size_t copy_len = strlen(buf);
         if (copy_len >= out_cap) {
             copy_len = out_cap - 1;
         }
@@ -243,7 +219,7 @@ void format_size(uint64_t bytes, char* out, size_t out_cap) {
     } else {
         buf[0] = '\0';
     }
-    size_t copy_len = string_length(buf);
+    size_t copy_len = strlen(buf);
     if (copy_len >= out_cap) {
         copy_len = out_cap - 1;
     }
@@ -283,7 +259,7 @@ bool fetch_devices(Device* devices, size_t capacity, size_t& count) {
             static_cast<uint32_t>(handle),
             static_cast<uint64_t>(descriptor_defs::Flag::Writable)) == 1;
 
-        dev.is_memdisk = starts_with(dev.name, "MEMDISK_");
+        dev.is_memdisk = strncmp(dev.name, "MEMDISK_", strlen("MEMDISK_")) == 0;
 
         descriptor_close(static_cast<uint32_t>(handle));
         ++count;

@@ -6,6 +6,14 @@
 
 namespace {
 
+constexpr size_t kMaxEchoConnections = 16;
+
+struct EchoConnection {
+    bool in_use;
+    uint32_t id;
+    uint32_t endpoint;
+};
+
 void print(const char* text) {
     static int32_t console = -1;
     if (console < 0) {
@@ -116,6 +124,71 @@ bool send_echo(uint32_t server_handle,
     return tcpd_protocol::write_message(server_handle, message);
 }
 
+EchoConnection* find_connection(EchoConnection* connections, uint32_t id) {
+    for (size_t i = 0; i < kMaxEchoConnections; ++i) {
+        if (connections[i].in_use && connections[i].id == id) {
+            return &connections[i];
+        }
+    }
+    return nullptr;
+}
+
+EchoConnection* allocate_connection(EchoConnection* connections) {
+    for (size_t i = 0; i < kMaxEchoConnections; ++i) {
+        if (!connections[i].in_use) {
+            return &connections[i];
+        }
+    }
+    return nullptr;
+}
+
+void close_echo_connection(EchoConnection& connection) {
+    if (connection.endpoint != 0) {
+        descriptor_close(connection.endpoint);
+    }
+    connection.in_use = false;
+    connection.id = 0;
+    connection.endpoint = 0;
+}
+
+void poll_echo_endpoints(EchoConnection* connections) {
+    uint8_t buffer[tcpd_protocol::kMaxPayload];
+    for (size_t i = 0; i < kMaxEchoConnections; ++i) {
+        EchoConnection& connection = connections[i];
+        if (!connection.in_use || connection.endpoint == 0) {
+            continue;
+        }
+        for (;;) {
+            long read = descriptor_read(connection.endpoint, buffer, sizeof(buffer));
+            if (read == kDescriptorWouldBlock) {
+                break;
+            }
+            if (read <= 0) {
+                close_echo_connection(connection);
+                break;
+            }
+            size_t written = 0;
+            while (written < static_cast<size_t>(read)) {
+                long result = descriptor_write(connection.endpoint,
+                                               buffer + written,
+                                               static_cast<size_t>(read) - written);
+                if (result == kDescriptorWouldBlock) {
+                    yield();
+                    continue;
+                }
+                if (result <= 0) {
+                    close_echo_connection(connection);
+                    break;
+                }
+                written += static_cast<size_t>(result);
+            }
+            if (!connection.in_use) {
+                break;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main(uint64_t arg_ptr, uint64_t) {
@@ -177,7 +250,9 @@ int main(uint64_t arg_ptr, uint64_t) {
     print_u32(port);
     print("\n");
 
+    EchoConnection connections[kMaxEchoConnections]{};
     for (;;) {
+        poll_echo_endpoints(connections);
         tcpd_protocol::Message event{};
         if (!tcpd_protocol::read_message(static_cast<uint32_t>(reply_pipe), event)) {
             yield();
@@ -187,9 +262,23 @@ int main(uint64_t arg_ptr, uint64_t) {
             print("tcpecho: accept ");
             print_u32(event.accept_event.connection_id);
             print("\n");
+            EchoConnection* connection = allocate_connection(connections);
+            if (connection != nullptr && event.accept_event.endpoint_id != 0) {
+                long endpoint = net_endpoint_open_existing(
+                    static_cast<uint64_t>(descriptor_defs::Flag::Async),
+                    event.accept_event.endpoint_id);
+                if (endpoint >= 0) {
+                    connection->in_use = true;
+                    connection->id = event.accept_event.connection_id;
+                    connection->endpoint = static_cast<uint32_t>(endpoint);
+                }
+            }
             continue;
         }
         if (event.type == tcpd_protocol::kDataEvent) {
+            if (find_connection(connections, event.data_event.connection_id) != nullptr) {
+                continue;
+            }
             (void)send_echo(static_cast<uint32_t>(server_pipe),
                             event.data_event.connection_id,
                             event.data_event.payload,
@@ -200,6 +289,11 @@ int main(uint64_t arg_ptr, uint64_t) {
             print("tcpecho: closed ");
             print_u32(event.closed_event.connection_id);
             print("\n");
+            EchoConnection* connection =
+                find_connection(connections, event.closed_event.connection_id);
+            if (connection != nullptr) {
+                close_echo_connection(*connection);
+            }
         }
     }
 }

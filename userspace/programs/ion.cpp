@@ -1,5 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <string.h>
 
 #include "descriptors.hpp"
 #include "font8x8_basic.hpp"
@@ -43,30 +45,6 @@ struct Terminal {
 };
 
 uint32_t pack_from_argb(const wm::PixelFormat& fmt, uint32_t argb);
-
-size_t str_len(const char* text) {
-    size_t len = 0;
-    if (text == nullptr) {
-        return 0;
-    }
-    while (text[len] != '\0') {
-        ++len;
-    }
-    return len;
-}
-
-void copy_string(char* dest, size_t dest_size, const char* src) {
-    if (dest == nullptr || dest_size == 0) {
-        return;
-    }
-    size_t i = 0;
-    if (src != nullptr) {
-        for (; i + 1 < dest_size && src[i] != '\0'; ++i) {
-            dest[i] = src[i];
-        }
-    }
-    dest[i] = '\0';
-}
 
 void extract_mount_name(const char* path, char* out, size_t out_size) {
     if (out == nullptr || out_size == 0) {
@@ -126,15 +104,11 @@ bool build_mount_subpath(const char* mount,
     return true;
 }
 
-bool is_space(char ch) {
-    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
-}
-
 const char* skip_spaces(const char* text) {
     if (text == nullptr) {
         return nullptr;
     }
-    while (*text != '\0' && is_space(*text)) {
+    while (*text != '\0' && isspace(*text)) {
         ++text;
     }
     return text;
@@ -178,7 +152,7 @@ void parse_terminal_args(const char* args, uint32_t& scale, uint32_t& line_gap) 
             break;
         }
         const char* token = cursor;
-        while (*cursor != '\0' && !is_space(*cursor)) {
+        while (*cursor != '\0' && !isspace(*cursor)) {
             ++cursor;
         }
         size_t token_len = static_cast<size_t>(cursor - token);
@@ -627,7 +601,7 @@ int main(uint64_t arg, uint64_t) {
     request.width = request_width;
     request.height = request_height;
     request.flags = 0;
-    copy_string(request.title, sizeof(request.title), "Ion");
+    strlcpy(request.title, "Ion", sizeof(request.title));
 
     if (!write_pipe_all(static_cast<uint32_t>(server_handle),
                         &request,
@@ -731,11 +705,11 @@ int main(uint64_t arg, uint64_t) {
     uint32_t prev_cursor_y = term.rows;
 
     char args_buffer[32];
-    copy_string(args_buffer, sizeof(args_buffer), "vty=");
+    strlcpy(args_buffer, "vty=", sizeof(args_buffer));
     char id_buffer[16];
     uint32_to_string(vty_info.id, id_buffer, sizeof(id_buffer));
-    size_t prefix_len = str_len(args_buffer);
-    size_t id_len = str_len(id_buffer);
+    size_t prefix_len = strlen(args_buffer);
+    size_t id_len = strlen(id_buffer);
     if (prefix_len + id_len + 1 < sizeof(args_buffer)) {
         for (size_t i = 0; i < id_len; ++i) {
             args_buffer[prefix_len + i] = id_buffer[i];

@@ -22,6 +22,8 @@ constexpr size_t kConfigPathSize = 160;
 constexpr size_t kDhcpPollSpins = 20000;
 constexpr size_t kDhcpRetryBackoffYields = 50000;
 
+networkd_protocol::Message* g_message_buffer = nullptr;
+
 struct DhcpReply {
     bool valid;
     uint8_t message_type;
@@ -29,6 +31,7 @@ struct DhcpReply {
     uint8_t server_id[4];
     uint8_t subnet_mask[4];
     uint8_t router[4];
+    uint8_t dns[4];
 };
 
 uint32_t ipv4_to_u32(const uint8_t ip[4]) {
@@ -64,6 +67,61 @@ void print_line(const char* text) {
     print("\n");
 }
 
+void print_u32(uint32_t value) {
+    char buffer[16];
+    size_t length = 0;
+    if (value == 0) {
+        buffer[length++] = '0';
+    } else {
+        while (value != 0 && length < sizeof(buffer)) {
+            buffer[length++] = static_cast<char>('0' + (value % 10));
+            value /= 10;
+        }
+    }
+    for (size_t i = 0; i < length / 2; ++i) {
+        char tmp = buffer[i];
+        buffer[i] = buffer[length - 1 - i];
+        buffer[length - 1 - i] = tmp;
+    }
+    buffer[length] = '\0';
+    print(buffer);
+}
+
+descriptor_defs::SharedMemoryInfo* allocate_shm_info_buffer() {
+    auto* info = static_cast<descriptor_defs::SharedMemoryInfo*>(
+        map_anonymous(sizeof(descriptor_defs::SharedMemoryInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->base = 0;
+        info->length = 0;
+    }
+    return info;
+}
+
+descriptor_defs::PipeInfo* allocate_pipe_info_buffer() {
+    auto* info = static_cast<descriptor_defs::PipeInfo*>(
+        map_anonymous(sizeof(descriptor_defs::PipeInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->id = 0;
+        info->flags = 0;
+    }
+    return info;
+}
+
+networkd_protocol::Message* allocate_message_buffer() {
+    if (g_message_buffer == nullptr) {
+        g_message_buffer = static_cast<networkd_protocol::Message*>(
+            map_anonymous(sizeof(networkd_protocol::Message), MAP_WRITE));
+    }
+    if (g_message_buffer != nullptr) {
+        for (size_t i = 0; i < sizeof(*g_message_buffer); ++i) {
+            reinterpret_cast<uint8_t*>(g_message_buffer)[i] = 0;
+        }
+    }
+    return g_message_buffer;
+}
+
+int g_registry_fail_reason = 0;
+
 void print_decimal(uint32_t value) {
     char buffer[16];
     size_t length = 0;
@@ -95,20 +153,42 @@ void print_ipv4(const uint8_t ip[4]) {
 }
 
 bool open_registry(uint32_t& handle, networkd_protocol::Registry*& registry) {
+    g_registry_fail_reason = 0;
     long shm = shared_memory_open(networkd_protocol::kRegistryName,
                                   sizeof(networkd_protocol::Registry));
     if (shm < 0) {
+        g_registry_fail_reason = 1;
         return false;
     }
-    descriptor_defs::SharedMemoryInfo info{};
-    if (shared_memory_get_info(static_cast<uint32_t>(shm), &info) != 0 ||
-        info.base == 0 ||
-        info.length < sizeof(networkd_protocol::Registry)) {
+    auto* info = allocate_shm_info_buffer();
+    if (info == nullptr) {
+        g_registry_fail_reason = 5;
+        descriptor_close(static_cast<uint32_t>(shm));
+        return false;
+    }
+    long info_result =
+        shared_memory_get_info(static_cast<uint32_t>(shm), info);
+    if (info_result != 0) {
+        g_registry_fail_reason = 2;
+        unmap(info, sizeof(*info));
+        descriptor_close(static_cast<uint32_t>(shm));
+        return false;
+    }
+    uint64_t info_base = info->base;
+    uint64_t info_length = info->length;
+    unmap(info, sizeof(*info));
+    if (info_base == 0) {
+        g_registry_fail_reason = 3;
+        descriptor_close(static_cast<uint32_t>(shm));
+        return false;
+    }
+    if (info_length < sizeof(networkd_protocol::Registry)) {
+        g_registry_fail_reason = 4;
         descriptor_close(static_cast<uint32_t>(shm));
         return false;
     }
     handle = static_cast<uint32_t>(shm);
-    registry = reinterpret_cast<networkd_protocol::Registry*>(info.base);
+    registry = reinterpret_cast<networkd_protocol::Registry*>(info_base);
     return true;
 }
 
@@ -256,12 +336,15 @@ bool interface_uses_static_ipv4(const uint8_t mac[6]) {
 }
 
 bool bind_udp(uint32_t server_handle, uint32_t reply_pipe_id, uint16_t port) {
-    networkd_protocol::Message request{};
-    networkd_protocol::init_message(request,
+    auto* request = allocate_message_buffer();
+    if (request == nullptr) {
+        return false;
+    }
+    networkd_protocol::init_message(*request,
                                     networkd_protocol::kBindUdpRequest);
-    request.bind_request.reply_pipe_id = reply_pipe_id;
-    request.bind_request.port = port;
-    return networkd_protocol::write_message(server_handle, request);
+    request->bind_request.reply_pipe_id = reply_pipe_id;
+    request->bind_request.port = port;
+    return networkd_protocol::write_message(server_handle, *request);
 }
 
 bool send_udp(uint32_t server_handle,
@@ -275,22 +358,25 @@ bool send_udp(uint32_t server_handle,
     if (payload_length > networkd_protocol::kMaxUdpPayload) {
         return false;
     }
-    networkd_protocol::Message request{};
-    networkd_protocol::init_message(request,
+    auto* request = allocate_message_buffer();
+    if (request == nullptr) {
+        return false;
+    }
+    networkd_protocol::init_message(*request,
                                     networkd_protocol::kSendUdpRequest);
-    request.send_request.source_port = source_port;
-    request.send_request.destination_port = destination_port;
-    request.send_request.flags = flags;
-    request.send_request.payload_length = static_cast<uint16_t>(payload_length);
+    request->send_request.source_port = source_port;
+    request->send_request.destination_port = destination_port;
+    request->send_request.flags = flags;
+    request->send_request.payload_length = static_cast<uint16_t>(payload_length);
     for (size_t i = 0; i < 4; ++i) {
-        request.send_request.source_ip[i] = source_ip[i];
-        request.send_request.destination_ip[i] = destination_ip[i];
+        request->send_request.source_ip[i] = source_ip[i];
+        request->send_request.destination_ip[i] = destination_ip[i];
     }
     const uint8_t* bytes = static_cast<const uint8_t*>(payload);
     for (size_t i = 0; i < payload_length; ++i) {
-        request.send_request.payload[i] = bytes[i];
+        request->send_request.payload[i] = bytes[i];
     }
-    return networkd_protocol::write_message(server_handle, request);
+    return networkd_protocol::write_message(server_handle, *request);
 }
 
 size_t append_option(uint8_t* options,
@@ -411,6 +497,10 @@ bool parse_dhcp_reply(const networkd_protocol::UdpPacketEvent& event,
             for (size_t i = 0; i < 4; ++i) {
                 out.router[i] = payload[offset + i];
             }
+        } else if (code == 6 && length >= 4) {
+            for (size_t i = 0; i < 4; ++i) {
+                out.dns[i] = payload[offset + i];
+            }
         }
         offset += length;
     }
@@ -426,15 +516,18 @@ bool wait_for_reply(uint32_t reply_handle,
                     uint8_t expected_type,
                     DhcpReply& out_reply) {
     for (size_t spins = 0; spins < kDhcpPollSpins; ++spins) {
-        networkd_protocol::Message message{};
-        if (!networkd_protocol::read_message(reply_handle, message)) {
+        auto* message = allocate_message_buffer();
+        if (message == nullptr) {
+            return false;
+        }
+        if (!networkd_protocol::read_message(reply_handle, *message)) {
             yield();
             continue;
         }
-        if (message.type != networkd_protocol::kUdpPacketEvent) {
+        if (message->type != networkd_protocol::kUdpPacketEvent) {
             continue;
         }
-        if (!parse_dhcp_reply(message.udp_event, xid, mac, out_reply)) {
+        if (!parse_dhcp_reply(message->udp_event, xid, mac, out_reply)) {
             continue;
         }
         if (out_reply.message_type == expected_type) {
@@ -568,6 +661,7 @@ bool attempt_dhcp(uint32_t server_pipe,
         config.address[i] = ack.yiaddr[i];
         config.netmask[i] = ack.subnet_mask[i];
         config.gateway[i] = ack.router[i];
+        config.dns[i] = ack.dns[i];
     }
     if (config.netmask[0] == 0 && config.netmask[1] == 0 &&
         config.netmask[2] == 0 && config.netmask[3] == 0) {
@@ -597,7 +691,7 @@ int main(uint64_t, uint64_t) {
     usernet::Device device{};
     if (!usernet::open_device(device, 0)) {
         print_line("dhcp: failed to open net device 0");
-        return 1;
+        return 31;
     }
 
     if (interface_uses_static_ipv4(device.info.mac)) {
@@ -617,7 +711,7 @@ int main(uint64_t, uint64_t) {
     networkd_protocol::Registry* registry = nullptr;
     if (!open_registry(registry_handle, registry)) {
         print_line("dhcp: failed to open network registry");
-        return 1;
+        return 320 + g_registry_fail_reason;
     }
     while (registry->magic != networkd_protocol::kRegistryMagic ||
            registry->version != networkd_protocol::kRegistryVersion ||
@@ -637,17 +731,29 @@ int main(uint64_t, uint64_t) {
         registry->dhcp_state = networkd_protocol::kStateError;
         registry->dhcp_last_error = networkd_protocol::kErrorCreateReplyPipe;
         print_line("dhcp: failed to create reply pipe");
-        return 1;
+        return 33;
     }
-    descriptor_defs::PipeInfo reply_info{};
-    if (pipe_get_info(static_cast<uint32_t>(reply_pipe), &reply_info) != 0 ||
-        reply_info.id == 0) {
+    auto* reply_info = allocate_pipe_info_buffer();
+    if (reply_info == nullptr) {
+        registry->dhcp_state = networkd_protocol::kStateError;
+        registry->dhcp_last_error = networkd_protocol::kErrorReplyPipeInfo;
+        print_line("dhcp: failed to allocate reply pipe info buffer");
+        return 34;
+    }
+    long reply_info_result =
+        pipe_get_info(static_cast<uint32_t>(reply_pipe), reply_info);
+    uint32_t reply_pipe_id = reply_info->id;
+    unmap(reply_info, sizeof(*reply_info));
+    if (reply_info_result != 0 || reply_pipe_id == 0) {
         registry->dhcp_state = networkd_protocol::kStateError;
         registry->dhcp_last_error = networkd_protocol::kErrorReplyPipeInfo;
         print_line("dhcp: failed to query reply pipe");
-        return 1;
+        return 34;
     }
     registry->dhcp_state = networkd_protocol::kStateReplyPipeReady;
+    print("dhcp: reply pipe id=");
+    print_u32(reply_pipe_id);
+    print("\n");
 
     uint64_t server_flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
                             static_cast<uint64_t>(descriptor_defs::Flag::Async);
@@ -657,29 +763,40 @@ int main(uint64_t, uint64_t) {
         registry->dhcp_state = networkd_protocol::kStateError;
         registry->dhcp_last_error = networkd_protocol::kErrorOpenServerPipe;
         print_line("dhcp: failed to open networkd pipe");
-        return 1;
+        return 35;
     }
     registry->dhcp_state = networkd_protocol::kStateServerPipeOpen;
+    print("dhcp: server pipe id=");
+    print_u32(registry->server_pipe_id);
+    print("\n");
 
-    if (!bind_udp(static_cast<uint32_t>(server_pipe), reply_info.id, kDhcpClientPort)) {
+    if (!bind_udp(static_cast<uint32_t>(server_pipe), reply_pipe_id, kDhcpClientPort)) {
         registry->dhcp_state = networkd_protocol::kStateError;
         registry->dhcp_last_error = networkd_protocol::kErrorBindSend;
         print_line("dhcp: failed to send bind request");
-        return 1;
+        return 36;
     }
     registry->dhcp_state = networkd_protocol::kStateBindSent;
+    print_line("dhcp: bind request sent");
 
-    networkd_protocol::Message bind_response{};
+    auto* bind_response = allocate_message_buffer();
+    if (bind_response == nullptr) {
+        registry->dhcp_state = networkd_protocol::kStateError;
+        registry->dhcp_last_error = networkd_protocol::kErrorBindResponse;
+        print_line("dhcp: failed to allocate bind response buffer");
+        return 37;
+    }
+    print_line("dhcp: waiting for bind response");
     while (!networkd_protocol::read_message(static_cast<uint32_t>(reply_pipe),
-                                            bind_response)) {
+                                            *bind_response)) {
         yield();
     }
-    if (bind_response.type != networkd_protocol::kBindUdpResponse ||
-        bind_response.bind_response.status != networkd_protocol::kStatusOk) {
+    if (bind_response->type != networkd_protocol::kBindUdpResponse ||
+        bind_response->bind_response.status != networkd_protocol::kStatusOk) {
         registry->dhcp_state = networkd_protocol::kStateError;
         registry->dhcp_last_error = networkd_protocol::kErrorBindResponse;
         print_line("dhcp: bind failed");
-        return 1;
+        return 37;
     }
     registry->dhcp_state = networkd_protocol::kStateBound;
 

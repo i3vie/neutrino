@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "descriptors.hpp"
 #include "keyboard_scancode.hpp"
@@ -57,24 +58,13 @@ struct Buffer {
     size_t capacity;
 };
 
-size_t string_length(const char* str) {
-    if (str == nullptr) {
-        return 0;
-    }
-    size_t len = 0;
-    while (str[len] != '\0') {
-        ++len;
-    }
-    return len;
-}
-
 void print(long console, const char* text) {
     if (console < 0 || text == nullptr) {
         return;
     }
     descriptor_write(static_cast<uint32_t>(console),
                      text,
-                     string_length(text));
+                     strlen(text));
 }
 
 void print_line(long console, const char* text) {
@@ -108,9 +98,7 @@ bool buffer_reserve(Buffer& buf, size_t new_cap) {
     if (fresh == nullptr) {
         return false;
     }
-    for (size_t i = 0; i < buf.size; ++i) {
-        fresh[i] = buf.data[i];
-    }
+    memcpy(fresh, buf.data, buf.size);
     if (buf.data != nullptr && buf.capacity > 0) {
         unmap(buf.data, buf.capacity);
     }
@@ -334,7 +322,7 @@ void render_view(long console,
         head[idx] = prefix[idx];
         ++idx;
     }
-    size_t path_len = string_length(path);
+    size_t path_len = strlen(path);
     for (size_t i = 0; i < path_len && idx + 1 < sizeof(head); ++i) {
         head[idx++] = path[i];
     }
@@ -371,8 +359,8 @@ void render_view(long console,
     }
     head[idx] = '\0';
     set_cursor(console, 0, 0);
-    descriptor_write(static_cast<uint32_t>(console), head, string_length(head));
-    size_t head_len = string_length(head);
+    descriptor_write(static_cast<uint32_t>(console), head, strlen(head));
+    size_t head_len = strlen(head);
     if (head_len < cols) {
         size_t pad = cols - head_len;
         for (size_t i = 0; i < pad; ++i) {
@@ -446,7 +434,7 @@ void render_view(long console,
         line[p++] = '|';
         line[p] = '\0';
         set_cursor(console, 0, 1 + row);
-        size_t len = string_length(line);
+        size_t len = strlen(line);
         if (len > cols) {
             len = cols;
         }
@@ -482,7 +470,7 @@ void render_view(long console,
     const char* help =
         "q quit | s save | g goto | e hex edit | a ascii | arrows/hjkl move";
     set_cursor(console, 0, static_cast<uint32_t>(1 + view_rows));
-    size_t help_len = string_length(help);
+    size_t help_len = strlen(help);
     if (help_len > cols) help_len = cols;
     descriptor_write(static_cast<uint32_t>(console),
                      help,

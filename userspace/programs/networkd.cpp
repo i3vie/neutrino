@@ -47,6 +47,10 @@ struct ServerContext {
 constexpr uint8_t kBindingProtocolUdp = 17;
 constexpr uint8_t kBindingProtocolTcp = 6;
 
+networkd_protocol::Message* g_control_message_buffer = nullptr;
+networkd_protocol::Message* g_tx_message_buffer = nullptr;
+uint8_t* g_frame_buffer = nullptr;
+
 void poll_network(ServerContext& ctx);
 
 void print(const char* text) {
@@ -73,6 +77,81 @@ void print(const char* text) {
 void print_line(const char* text) {
     print(text);
     print("\n");
+}
+
+void print_u32(uint32_t value) {
+    char buffer[16];
+    size_t length = 0;
+    if (value == 0) {
+        buffer[length++] = '0';
+    } else {
+        while (value != 0 && length < sizeof(buffer)) {
+            buffer[length++] = static_cast<char>('0' + (value % 10));
+            value /= 10;
+        }
+    }
+    for (size_t i = 0; i < length / 2; ++i) {
+        char tmp = buffer[i];
+        buffer[i] = buffer[length - 1 - i];
+        buffer[length - 1 - i] = tmp;
+    }
+    buffer[length] = '\0';
+    print(buffer);
+}
+
+descriptor_defs::SharedMemoryInfo* allocate_shm_info_buffer() {
+    auto* info = static_cast<descriptor_defs::SharedMemoryInfo*>(
+        map_anonymous(sizeof(descriptor_defs::SharedMemoryInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->base = 0;
+        info->length = 0;
+    }
+    return info;
+}
+
+descriptor_defs::PipeInfo* allocate_pipe_info_buffer() {
+    auto* info = static_cast<descriptor_defs::PipeInfo*>(
+        map_anonymous(sizeof(descriptor_defs::PipeInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->id = 0;
+        info->flags = 0;
+    }
+    return info;
+}
+
+networkd_protocol::Message* reset_message_buffer(
+    networkd_protocol::Message*& slot) {
+    if (slot == nullptr) {
+        slot = static_cast<networkd_protocol::Message*>(
+            map_anonymous(sizeof(networkd_protocol::Message), MAP_WRITE));
+    }
+    if (slot != nullptr) {
+        for (size_t i = 0; i < sizeof(*slot); ++i) {
+            reinterpret_cast<uint8_t*>(slot)[i] = 0;
+        }
+    }
+    return slot;
+}
+
+networkd_protocol::Message* allocate_control_message_buffer() {
+    return reset_message_buffer(g_control_message_buffer);
+}
+
+networkd_protocol::Message* allocate_tx_message_buffer() {
+    return reset_message_buffer(g_tx_message_buffer);
+}
+
+uint8_t* allocate_frame_buffer() {
+    if (g_frame_buffer == nullptr) {
+        g_frame_buffer = static_cast<uint8_t*>(
+            map_anonymous(usernet::kMaxFrameSize, MAP_WRITE));
+    }
+    if (g_frame_buffer != nullptr) {
+        for (size_t i = 0; i < usernet::kMaxFrameSize; ++i) {
+            g_frame_buffer[i] = 0;
+        }
+    }
+    return g_frame_buffer;
 }
 
 Binding* find_binding(ServerContext& ctx, uint8_t protocol, uint16_t port) {
@@ -187,39 +266,67 @@ bool send_arp_request(ServerContext& ctx, const uint8_t target_ip[4]) {
     if (!load_ipv4_config(ctx, cfg)) {
         return false;
     }
-    uint8_t frame[usernet::kMaxFrameSize];
+    auto* frame = allocate_frame_buffer();
+    if (frame == nullptr) {
+        return false;
+    }
     size_t frame_length = 0;
     if (!usernet::build_arp_request_frame(frame,
-                                          sizeof(frame),
+                                          usernet::kMaxFrameSize,
                                           frame_length,
                                           ctx.device.info.mac,
                                           cfg.address,
                                           target_ip)) {
         return false;
     }
-    return descriptor_write(ctx.device.handle, frame, frame_length) > 0;
+    bool ok = descriptor_write(ctx.device.handle, frame, frame_length) > 0;
+    return ok;
 }
 
 bool lookup_or_resolve_mac(ServerContext& ctx,
                            const uint8_t destination_ip[4],
                            uint8_t out_mac[6]);
 
+int g_registry_fail_reason = 0;
+
 bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
+    g_registry_fail_reason = 0;
     long handle =
         shared_memory_open(networkd_protocol::kRegistryName,
                            sizeof(networkd_protocol::Registry));
     if (handle < 0) {
+        g_registry_fail_reason = 1;
         return false;
     }
-    descriptor_defs::SharedMemoryInfo info{};
-    if (shared_memory_get_info(static_cast<uint32_t>(handle), &info) != 0 ||
-        info.base == 0 ||
-        info.length < sizeof(networkd_protocol::Registry)) {
+    auto* info = allocate_shm_info_buffer();
+    if (info == nullptr) {
+        g_registry_fail_reason = 5;
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+    long info_result =
+        shared_memory_get_info(static_cast<uint32_t>(handle), info);
+    if (info_result != 0) {
+        g_registry_fail_reason = 2;
+        unmap(info, sizeof(*info));
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+    uint64_t info_base = info->base;
+    uint64_t info_length = info->length;
+    unmap(info, sizeof(*info));
+    if (info_base == 0) {
+        g_registry_fail_reason = 3;
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+    if (info_length < sizeof(networkd_protocol::Registry)) {
+        g_registry_fail_reason = 4;
         descriptor_close(static_cast<uint32_t>(handle));
         return false;
     }
 
-    auto* registry = reinterpret_cast<networkd_protocol::Registry*>(info.base);
+    auto* registry = reinterpret_cast<networkd_protocol::Registry*>(info_base);
     registry->magic = networkd_protocol::kRegistryMagic;
     registry->version = networkd_protocol::kRegistryVersion;
     registry->server_pipe_id = server_pipe_id;
@@ -244,16 +351,19 @@ void send_bind_response(uint32_t handle,
                         uint16_t type,
                         uint16_t port,
                         int32_t status) {
-    networkd_protocol::Message message{};
-    networkd_protocol::init_message(message, type);
-    if (type == networkd_protocol::kBindTcpResponse) {
-        message.bind_tcp_response.status = status;
-        message.bind_tcp_response.port = port;
-    } else {
-        message.bind_response.status = status;
-        message.bind_response.port = port;
+    auto* message = allocate_tx_message_buffer();
+    if (message == nullptr) {
+        return;
     }
-    (void)networkd_protocol::write_message(handle, message);
+    networkd_protocol::init_message(*message, type);
+    if (type == networkd_protocol::kBindTcpResponse) {
+        message->bind_tcp_response.status = status;
+        message->bind_tcp_response.port = port;
+    } else {
+        message->bind_response.status = status;
+        message->bind_response.port = port;
+    }
+    (void)networkd_protocol::write_message(handle, *message);
 }
 
 void send_udp_packet(Binding& binding, const usernet::UdpPacketView& packet) {
@@ -262,21 +372,24 @@ void send_udp_packet(Binding& binding, const usernet::UdpPacketView& packet) {
         return;
     }
 
-    networkd_protocol::Message message{};
-    networkd_protocol::init_message(message,
+    auto* message = allocate_tx_message_buffer();
+    if (message == nullptr) {
+        return;
+    }
+    networkd_protocol::init_message(*message,
                                     networkd_protocol::kUdpPacketEvent);
-    message.udp_event.source_port = packet.source_port;
-    message.udp_event.destination_port = packet.destination_port;
-    message.udp_event.payload_length =
+    message->udp_event.source_port = packet.source_port;
+    message->udp_event.destination_port = packet.destination_port;
+    message->udp_event.payload_length =
         static_cast<uint16_t>(packet.payload_length);
     for (size_t i = 0; i < 4; ++i) {
-        message.udp_event.source_ip[i] = packet.source_ip[i];
-        message.udp_event.destination_ip[i] = packet.destination_ip[i];
+        message->udp_event.source_ip[i] = packet.source_ip[i];
+        message->udp_event.destination_ip[i] = packet.destination_ip[i];
     }
     for (size_t i = 0; i < packet.payload_length; ++i) {
-        message.udp_event.payload[i] = packet.payload[i];
+        message->udp_event.payload[i] = packet.payload[i];
     }
-    (void)networkd_protocol::write_message(binding.pipe_handle, message);
+    (void)networkd_protocol::write_message(binding.pipe_handle, *message);
 }
 
 void send_tcp_segment(Binding& binding, const usernet::TcpSegmentView& segment) {
@@ -286,27 +399,30 @@ void send_tcp_segment(Binding& binding, const usernet::TcpSegmentView& segment) 
         return;
     }
 
-    networkd_protocol::Message message{};
-    networkd_protocol::init_message(message, networkd_protocol::kTcpSegmentEvent);
-    message.tcp_event.source_port = segment.source_port;
-    message.tcp_event.destination_port = segment.destination_port;
-    message.tcp_event.flags = segment.flags;
-    message.tcp_event.options_length = static_cast<uint16_t>(segment.options_length);
-    message.tcp_event.payload_length = static_cast<uint16_t>(segment.payload_length);
-    message.tcp_event.window_size = segment.window_size;
-    message.tcp_event.sequence_number = segment.sequence_number;
-    message.tcp_event.acknowledgment_number = segment.acknowledgment_number;
+    auto* message = allocate_tx_message_buffer();
+    if (message == nullptr) {
+        return;
+    }
+    networkd_protocol::init_message(*message, networkd_protocol::kTcpSegmentEvent);
+    message->tcp_event.source_port = segment.source_port;
+    message->tcp_event.destination_port = segment.destination_port;
+    message->tcp_event.flags = segment.flags;
+    message->tcp_event.options_length = static_cast<uint16_t>(segment.options_length);
+    message->tcp_event.payload_length = static_cast<uint16_t>(segment.payload_length);
+    message->tcp_event.window_size = segment.window_size;
+    message->tcp_event.sequence_number = segment.sequence_number;
+    message->tcp_event.acknowledgment_number = segment.acknowledgment_number;
     for (size_t i = 0; i < 4; ++i) {
-        message.tcp_event.source_ip[i] = segment.source_ip[i];
-        message.tcp_event.destination_ip[i] = segment.destination_ip[i];
+        message->tcp_event.source_ip[i] = segment.source_ip[i];
+        message->tcp_event.destination_ip[i] = segment.destination_ip[i];
     }
     for (size_t i = 0; i < segment.options_length; ++i) {
-        message.tcp_event.options[i] = segment.options[i];
+        message->tcp_event.options[i] = segment.options[i];
     }
     for (size_t i = 0; i < segment.payload_length; ++i) {
-        message.tcp_event.payload[i] = segment.payload[i];
+        message->tcp_event.payload[i] = segment.payload[i];
     }
-    (void)networkd_protocol::write_message(binding.pipe_handle, message);
+    (void)networkd_protocol::write_message(binding.pipe_handle, *message);
 }
 
 void send_icmp_reply(PendingPing& ping, const usernet::IcmpEchoReplyView& reply) {
@@ -314,20 +430,23 @@ void send_icmp_reply(PendingPing& ping, const usernet::IcmpEchoReplyView& reply)
         reply.payload_length > networkd_protocol::kMaxUdpPayload) {
         return;
     }
-    networkd_protocol::Message message{};
-    networkd_protocol::init_message(message, networkd_protocol::kIcmpEchoReplyEvent);
-    message.icmp_event.identifier = reply.identifier;
-    message.icmp_event.sequence = reply.sequence;
-    message.icmp_event.payload_length = static_cast<uint16_t>(reply.payload_length);
-    message.icmp_event.ttl = reply.ttl;
+    auto* message = allocate_tx_message_buffer();
+    if (message == nullptr) {
+        return;
+    }
+    networkd_protocol::init_message(*message, networkd_protocol::kIcmpEchoReplyEvent);
+    message->icmp_event.identifier = reply.identifier;
+    message->icmp_event.sequence = reply.sequence;
+    message->icmp_event.payload_length = static_cast<uint16_t>(reply.payload_length);
+    message->icmp_event.ttl = reply.ttl;
     for (size_t i = 0; i < 4; ++i) {
-        message.icmp_event.source_ip[i] = reply.source_ip[i];
-        message.icmp_event.destination_ip[i] = reply.destination_ip[i];
+        message->icmp_event.source_ip[i] = reply.source_ip[i];
+        message->icmp_event.destination_ip[i] = reply.destination_ip[i];
     }
     for (size_t i = 0; i < reply.payload_length; ++i) {
-        message.icmp_event.payload[i] = reply.payload[i];
+        message->icmp_event.payload[i] = reply.payload[i];
     }
-    (void)networkd_protocol::write_message(ping.pipe_handle, message);
+    (void)networkd_protocol::write_message(ping.pipe_handle, *message);
 }
 
 void handle_bind_request(ServerContext& ctx,
@@ -335,10 +454,18 @@ void handle_bind_request(ServerContext& ctx,
                          uint32_t reply_pipe_id,
                          uint16_t port,
                          uint16_t response_type) {
+    print("networkd: bind request proto=");
+    print_u32(protocol);
+    print(" reply_pipe=");
+    print_u32(reply_pipe_id);
+    print(" port=");
+    print_u32(port);
+    print("\n");
     if (ctx.registry != nullptr) {
         ctx.registry->dhcp_state = networkd_protocol::kStateBindSeen;
     }
     if (reply_pipe_id == 0 || port == 0) {
+        print_line("networkd: bind request rejected (zero reply pipe or port)");
         return;
     }
 
@@ -356,12 +483,16 @@ void handle_bind_request(ServerContext& ctx,
                 ctx.registry->dhcp_state = networkd_protocol::kStateBindReplySent;
             }
             descriptor_close(static_cast<uint32_t>(handle));
+            print_line("networkd: bind reply sent (in use)");
+        } else {
+            print_line("networkd: failed to open bind reply pipe (in use)");
         }
         return;
     }
 
     Binding* binding = allocate_binding(ctx);
     if (binding == nullptr) {
+        print_line("networkd: no binding slots available");
         return;
     }
 
@@ -369,6 +500,7 @@ void handle_bind_request(ServerContext& ctx,
                      static_cast<uint64_t>(descriptor_defs::Flag::Async);
     long handle = pipe_open_existing(flags, reply_pipe_id);
     if (handle < 0) {
+        print_line("networkd: failed to open bind reply pipe");
         return;
     }
 
@@ -384,6 +516,7 @@ void handle_bind_request(ServerContext& ctx,
     if (ctx.registry != nullptr) {
         ctx.registry->dhcp_state = networkd_protocol::kStateBindReplySent;
     }
+    print_line("networkd: bind reply sent");
 }
 
 void handle_udp_bind_request(ServerContext& ctx,
@@ -423,10 +556,13 @@ void handle_send_request(ServerContext& ctx,
         return;
     }
 
-    uint8_t frame[usernet::kMaxFrameSize];
+    auto* frame = allocate_frame_buffer();
+    if (frame == nullptr) {
+        return;
+    }
     size_t frame_length = 0;
     if (!usernet::build_udp_ipv4_frame(frame,
-                                       sizeof(frame),
+                                       usernet::kMaxFrameSize,
                                        frame_length,
                                        ctx.device.info.mac,
                                        destination_mac,
@@ -466,10 +602,13 @@ void handle_tcp_send_request(ServerContext& ctx,
         return;
     }
 
-    uint8_t frame[usernet::kMaxFrameSize];
+    auto* frame = allocate_frame_buffer();
+    if (frame == nullptr) {
+        return;
+    }
     size_t frame_length = 0;
     if (!usernet::build_tcp_ipv4_frame(frame,
-                                       sizeof(frame),
+                                       usernet::kMaxFrameSize,
                                        frame_length,
                                        ctx.device.info.mac,
                                        destination_mac,
@@ -520,10 +659,14 @@ void handle_icmp_request(ServerContext& ctx,
         descriptor_close(static_cast<uint32_t>(handle));
         return;
     }
-    uint8_t frame[usernet::kMaxFrameSize];
+    auto* frame = allocate_frame_buffer();
+    if (frame == nullptr) {
+        descriptor_close(static_cast<uint32_t>(handle));
+        return;
+    }
     size_t frame_length = 0;
     if (!usernet::build_icmp_echo_frame(frame,
-                                        sizeof(frame),
+                                        usernet::kMaxFrameSize,
                                         frame_length,
                                         ctx.device.info.mac,
                                         destination_mac,
@@ -545,20 +688,26 @@ void handle_icmp_request(ServerContext& ctx,
 
 void poll_control(ServerContext& ctx) {
     for (;;) {
-        networkd_protocol::Message message{};
-        if (!networkd_protocol::read_message(ctx.server_pipe, message)) {
+        auto* message = allocate_control_message_buffer();
+        if (message == nullptr) {
             break;
         }
-        if (message.type == networkd_protocol::kBindUdpRequest) {
-            handle_udp_bind_request(ctx, message.bind_request);
-        } else if (message.type == networkd_protocol::kBindTcpRequest) {
-            handle_tcp_bind_request(ctx, message.bind_tcp_request);
-        } else if (message.type == networkd_protocol::kSendUdpRequest) {
-            handle_send_request(ctx, message.send_request);
-        } else if (message.type == networkd_protocol::kSendTcpRequest) {
-            handle_tcp_send_request(ctx, message.send_tcp_request);
-        } else if (message.type == networkd_protocol::kSendIcmpEchoRequest) {
-            handle_icmp_request(ctx, message.icmp_request);
+        if (!networkd_protocol::read_message(ctx.server_pipe, *message)) {
+            break;
+        }
+        print("networkd: control message type=");
+        print_u32(message->type);
+        print("\n");
+        if (message->type == networkd_protocol::kBindUdpRequest) {
+            handle_udp_bind_request(ctx, message->bind_request);
+        } else if (message->type == networkd_protocol::kBindTcpRequest) {
+            handle_tcp_bind_request(ctx, message->bind_tcp_request);
+        } else if (message->type == networkd_protocol::kSendUdpRequest) {
+            handle_send_request(ctx, message->send_request);
+        } else if (message->type == networkd_protocol::kSendTcpRequest) {
+            handle_tcp_send_request(ctx, message->send_tcp_request);
+        } else if (message->type == networkd_protocol::kSendIcmpEchoRequest) {
+            handle_icmp_request(ctx, message->icmp_request);
         }
     }
 }
@@ -595,9 +744,13 @@ bool lookup_or_resolve_mac(ServerContext& ctx,
 }
 
 void poll_network(ServerContext& ctx) {
-    uint8_t frame[usernet::kMaxFrameSize];
+    auto* frame = allocate_frame_buffer();
+    if (frame == nullptr) {
+        return;
+    }
     for (;;) {
-        long result = descriptor_read(ctx.device.handle, frame, sizeof(frame));
+        long result =
+            descriptor_read(ctx.device.handle, frame, usernet::kMaxFrameSize);
         if (result == kDescriptorWouldBlock || result <= 0) {
             break;
         }
@@ -671,31 +824,43 @@ void poll_network(ServerContext& ctx) {
 
 int main(uint64_t, uint64_t) {
     ServerContext ctx{};
+    print_line("networkd: start");
 
     uint64_t net_flags = static_cast<uint64_t>(descriptor_defs::Flag::Async);
     if (!usernet::open_device(ctx.device, 0, net_flags)) {
         print_line("networkd: failed to open net device 0");
-        return 1;
+        return 11;
     }
+    print_line("networkd: device open ok");
 
     uint64_t server_flags = static_cast<uint64_t>(descriptor_defs::Flag::Readable) |
                             static_cast<uint64_t>(descriptor_defs::Flag::Async);
     long server_pipe = pipe_open_new(server_flags);
     if (server_pipe < 0) {
         print_line("networkd: failed to create server pipe");
-        return 1;
+        return 12;
     }
     ctx.server_pipe = static_cast<uint32_t>(server_pipe);
+    print_line("networkd: server pipe created");
 
-    descriptor_defs::PipeInfo info{};
-    if (pipe_get_info(ctx.server_pipe, &info) != 0 || info.id == 0) {
+    auto* info = allocate_pipe_info_buffer();
+    if (info == nullptr) {
+        print_line("networkd: failed to allocate pipe info buffer");
+        return 13;
+    }
+    long info_result = pipe_get_info(ctx.server_pipe, info);
+    uint32_t server_pipe_id = info->id;
+    unmap(info, sizeof(*info));
+    if (info_result != 0 || server_pipe_id == 0) {
         print_line("networkd: failed to query server pipe");
-        return 1;
+        return 13;
     }
-    if (!populate_registry(ctx, info.id)) {
+    print_line("networkd: server pipe info ok");
+    if (!populate_registry(ctx, server_pipe_id)) {
         print_line("networkd: failed to publish registry");
-        return 1;
+        return 140 + g_registry_fail_reason;
     }
+    print_line("networkd: registry published");
     ctx.registry->networkd_state = networkd_protocol::kStateReady;
 
     print_line("networkd: ready");

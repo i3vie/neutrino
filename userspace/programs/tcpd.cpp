@@ -43,6 +43,8 @@ struct Connection {
     uint32_t remote_next_seq;
     uint32_t local_next_seq;
     uint32_t app_pipe_handle;
+    uint32_t endpoint_handle;
+    uint32_t endpoint_id;
     Listener* listener;
 };
 
@@ -53,9 +55,32 @@ struct ClientPort {
     uint16_t port;
 };
 
+descriptor_defs::SharedMemoryInfo* allocate_shm_info_buffer() {
+    auto* info = static_cast<descriptor_defs::SharedMemoryInfo*>(
+        map_anonymous(sizeof(descriptor_defs::SharedMemoryInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->base = 0;
+        info->length = 0;
+    }
+    return info;
+}
+
+descriptor_defs::PipeInfo* allocate_pipe_info_buffer() {
+    auto* info = static_cast<descriptor_defs::PipeInfo*>(
+        map_anonymous(sizeof(descriptor_defs::PipeInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->id = 0;
+        info->flags = 0;
+    }
+    return info;
+}
+
+int g_registry_fail_reason = 0;
+
 struct PendingConnect {
     bool in_use;
     uint32_t app_pipe_handle;
+    uint32_t endpoint_id;
     uint16_t local_port;
     uint16_t remote_port;
     uint8_t remote_ip[4];
@@ -99,6 +124,36 @@ void print(const char* text) {
 void print_line(const char* text) {
     print(text);
     print("\n");
+}
+
+void print_u32(uint32_t value) {
+    char buf[16];
+    size_t pos = 0;
+    if (value == 0) {
+        buf[pos++] = '0';
+    } else {
+        char tmp[16];
+        size_t count = 0;
+        while (value != 0 && count < sizeof(tmp)) {
+            tmp[count++] = static_cast<char>('0' + (value % 10));
+            value /= 10;
+        }
+        while (count != 0) {
+            buf[pos++] = tmp[--count];
+        }
+    }
+    buf[pos] = '\0';
+    print(buf);
+}
+
+void print_ip(const uint8_t ip[4]) {
+    print_u32(ip[0]);
+    print(".");
+    print_u32(ip[1]);
+    print(".");
+    print_u32(ip[2]);
+    print(".");
+    print_u32(ip[3]);
 }
 
 bool load_ipv4_config(ServerContext& ctx, descriptor_defs::NetIpv4Config& out) {
@@ -225,21 +280,43 @@ void recount_registry(ServerContext& ctx) {
 }
 
 bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
+    g_registry_fail_reason = 0;
     long handle =
         shared_memory_open(tcpd_protocol::kRegistryName,
                            sizeof(tcpd_protocol::Registry));
     if (handle < 0) {
+        g_registry_fail_reason = 1;
         return false;
     }
-    descriptor_defs::SharedMemoryInfo info{};
-    if (shared_memory_get_info(static_cast<uint32_t>(handle), &info) != 0 ||
-        info.base == 0 ||
-        info.length < sizeof(tcpd_protocol::Registry)) {
+    auto* info = allocate_shm_info_buffer();
+    if (info == nullptr) {
+        g_registry_fail_reason = 5;
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+    long info_result =
+        shared_memory_get_info(static_cast<uint32_t>(handle), info);
+    if (info_result != 0) {
+        g_registry_fail_reason = 2;
+        unmap(info, sizeof(*info));
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+    uint64_t info_base = info->base;
+    uint64_t info_length = info->length;
+    unmap(info, sizeof(*info));
+    if (info_base == 0) {
+        g_registry_fail_reason = 3;
+        descriptor_close(static_cast<uint32_t>(handle));
+        return false;
+    }
+    if (info_length < sizeof(tcpd_protocol::Registry)) {
+        g_registry_fail_reason = 4;
         descriptor_close(static_cast<uint32_t>(handle));
         return false;
     }
 
-    auto* registry = reinterpret_cast<tcpd_protocol::Registry*>(info.base);
+    auto* registry = reinterpret_cast<tcpd_protocol::Registry*>(info_base);
     registry->magic = tcpd_protocol::kRegistryMagic;
     registry->version = tcpd_protocol::kRegistryVersion;
     registry->server_pipe_id = server_pipe_id;
@@ -248,6 +325,17 @@ bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
     registry->connections = 0;
     registry->rx_segments = 0;
     registry->tx_segments = 0;
+    registry->inbound_syns = 0;
+    registry->syn_ack_retransmits = 0;
+    registry->established = 0;
+    registry->wait_ack_mismatch = 0;
+    registry->remote_resets = 0;
+    registry->remote_fins = 0;
+    registry->last_flags = 0;
+    registry->last_seq = 0;
+    registry->last_ack = 0;
+    registry->expected_seq = 0;
+    registry->expected_ack = 0;
     ctx.registry = registry;
     return true;
 }
@@ -302,16 +390,27 @@ void send_listen_response(Listener& listener, int32_t status) {
 void send_connect_response(uint32_t handle,
                            int32_t status,
                            uint32_t connection_id,
-                           uint16_t local_port) {
+                           uint16_t local_port,
+                           uint32_t endpoint_id) {
     tcpd_protocol::Message message{};
     tcpd_protocol::init_message(message, tcpd_protocol::kConnectResponse);
     message.connect_response.status = status;
     message.connect_response.connection_id = connection_id;
     message.connect_response.local_port = local_port;
+    message.connect_response.endpoint_id = endpoint_id;
     (void)tcpd_protocol::write_message(handle, message);
 }
 
 void send_accept_event(Connection& conn) {
+    print("tcpd: send accept conn=");
+    print_u32(conn.id);
+    print(" local=");
+    print_u32(conn.local_port);
+    print(" remote=");
+    print_ip(conn.remote_ip);
+    print(":");
+    print_u32(conn.remote_port);
+    print("\n");
     tcpd_protocol::Message message{};
     tcpd_protocol::init_message(message, tcpd_protocol::kAcceptEvent);
     message.accept_event.connection_id = conn.id;
@@ -320,6 +419,7 @@ void send_accept_event(Connection& conn) {
     for (size_t i = 0; i < 4; ++i) {
         message.accept_event.remote_ip[i] = conn.remote_ip[i];
     }
+    message.accept_event.endpoint_id = conn.endpoint_id;
     (void)tcpd_protocol::write_message(conn.app_pipe_handle, message);
 }
 
@@ -327,12 +427,33 @@ void send_data_event(Connection& conn, const uint8_t* payload, size_t payload_le
     if (payload_length > tcpd_protocol::kMaxPayload) {
         return;
     }
+    print("tcpd: deliver data conn=");
+    print_u32(conn.id);
+    print(" bytes=");
+    print_u32(static_cast<uint32_t>(payload_length));
+    print("\n");
     tcpd_protocol::Message message{};
     tcpd_protocol::init_message(message, tcpd_protocol::kDataEvent);
     message.data_event.connection_id = conn.id;
     message.data_event.payload_length = static_cast<uint16_t>(payload_length);
     for (size_t i = 0; i < payload_length; ++i) {
         message.data_event.payload[i] = payload[i];
+    }
+    if (conn.endpoint_handle != 0) {
+        size_t written = 0;
+        while (written < payload_length) {
+            long result = descriptor_write(conn.endpoint_handle,
+                                           payload + written,
+                                           payload_length - written);
+            if (result == kDescriptorWouldBlock) {
+                yield();
+                continue;
+            }
+            if (result <= 0) {
+                break;
+            }
+            written += static_cast<size_t>(result);
+        }
     }
     (void)tcpd_protocol::write_message(conn.app_pipe_handle, message);
 }
@@ -355,16 +476,35 @@ void reset_connection(Connection& conn) {
     conn.remote_next_seq = 0;
     conn.local_next_seq = 0;
     conn.app_pipe_handle = 0;
+    conn.endpoint_handle = 0;
+    conn.endpoint_id = 0;
     conn.listener = nullptr;
 }
 
 void close_connection(ServerContext& ctx, Connection& conn, uint32_t reason) {
     send_closed_event(conn, reason);
+    if (conn.endpoint_handle != 0) {
+        descriptor_close(conn.endpoint_handle);
+    }
     if (conn.own_app_pipe_handle && conn.app_pipe_handle != 0) {
         descriptor_close(conn.app_pipe_handle);
     }
     reset_connection(conn);
     recount_registry(ctx);
+}
+
+void record_tcp_observation(ServerContext& ctx,
+                            const networkd_protocol::TcpSegmentEvent& segment,
+                            uint32_t expected_seq,
+                            uint32_t expected_ack) {
+    if (ctx.registry == nullptr) {
+        return;
+    }
+    ctx.registry->last_flags = segment.flags;
+    ctx.registry->last_seq = segment.sequence_number;
+    ctx.registry->last_ack = segment.acknowledgment_number;
+    ctx.registry->expected_seq = expected_seq;
+    ctx.registry->expected_ack = expected_ack;
 }
 
 bool is_outbound_port_busy(ServerContext& ctx, uint16_t port) {
@@ -407,7 +547,8 @@ bool begin_outbound_connection(ServerContext& ctx,
                                uint32_t app_pipe_handle,
                                uint16_t local_port,
                                const uint8_t remote_ip[4],
-                               uint16_t remote_port) {
+                               uint16_t remote_port,
+                               uint32_t endpoint_id) {
     Connection* conn = allocate_connection(ctx);
     if (conn == nullptr) {
         return false;
@@ -426,9 +567,23 @@ bool begin_outbound_connection(ServerContext& ctx,
     conn->remote_port = remote_port;
     conn->remote_next_seq = 0;
     conn->app_pipe_handle = app_pipe_handle;
+    conn->endpoint_handle = 0;
+    conn->endpoint_id = endpoint_id;
     conn->listener = nullptr;
     for (size_t i = 0; i < 4; ++i) {
         conn->remote_ip[i] = remote_ip[i];
+    }
+
+    if (endpoint_id != 0) {
+        long endpoint =
+            net_endpoint_open_existing(static_cast<uint64_t>(descriptor_defs::Flag::Async),
+                                       endpoint_id,
+                                       descriptor_defs::kNetEndpointOpenService);
+        if (endpoint < 0) {
+            reset_connection(*conn);
+            return false;
+        }
+        conn->endpoint_handle = static_cast<uint32_t>(endpoint);
     }
 
     uint32_t initial_seq =
@@ -441,9 +596,12 @@ bool begin_outbound_connection(ServerContext& ctx,
                               conn->remote_port,
                               initial_seq,
                               0,
-                              usernet::kTcpFlagSyn,
-                              nullptr,
-                              0)) {
+                             usernet::kTcpFlagSyn,
+                             nullptr,
+                             0)) {
+        if (conn->endpoint_handle != 0) {
+            descriptor_close(conn->endpoint_handle);
+        }
         reset_connection(*conn);
         return false;
     }
@@ -528,6 +686,33 @@ void handle_send_request(ServerContext& ctx, const tcpd_protocol::SendRequest& r
     }
 }
 
+void send_connection_payload(ServerContext& ctx,
+                             Connection& conn,
+                             const uint8_t* payload,
+                             size_t payload_length) {
+    if (payload_length > tcpd_protocol::kMaxPayload ||
+        conn.state != kConnStateEstablished) {
+        return;
+    }
+    descriptor_defs::NetIpv4Config cfg{};
+    if (!load_ipv4_config(ctx, cfg)) {
+        return;
+    }
+    if (send_network_segment(ctx,
+                             cfg.address,
+                             conn.remote_ip,
+                             conn.local_port,
+                             conn.remote_port,
+                             conn.local_next_seq,
+                             conn.remote_next_seq,
+                             usernet::kTcpFlagAck |
+                                 (payload_length != 0 ? usernet::kTcpFlagPsh : 0),
+                             payload,
+                             payload_length)) {
+        conn.local_next_seq += payload_length;
+    }
+}
+
 void handle_close_request(ServerContext& ctx, const tcpd_protocol::CloseRequest& request) {
     Connection* conn = find_connection(ctx, request.connection_id);
     if (conn == nullptr || conn->state != kConnStateEstablished) {
@@ -567,7 +752,7 @@ void handle_connect_request(ServerContext& ctx,
 
     uint16_t local_port = choose_client_port(ctx);
     if (local_port == 0) {
-        send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, 0);
+        send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, 0, 0);
         descriptor_close(app_pipe_handle);
         return;
     }
@@ -578,8 +763,13 @@ void handle_connect_request(ServerContext& ctx,
                                        app_pipe_handle,
                                        local_port,
                                        request.remote_ip,
-                                       request.remote_port)) {
-            send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, local_port);
+                                       request.remote_port,
+                                       request.endpoint_id)) {
+            send_connect_response(app_pipe_handle,
+                                  tcpd_protocol::kStatusIo,
+                                  0,
+                                  local_port,
+                                  0);
             descriptor_close(app_pipe_handle);
         }
         return;
@@ -590,7 +780,7 @@ void handle_connect_request(ServerContext& ctx,
     }
     PendingConnect* pending = allocate_pending_connect(ctx);
     if (client_port == nullptr || pending == nullptr) {
-        send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, 0);
+        send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, 0, 0);
         descriptor_close(app_pipe_handle);
         return;
     }
@@ -602,6 +792,7 @@ void handle_connect_request(ServerContext& ctx,
 
     pending->in_use = true;
     pending->app_pipe_handle = app_pipe_handle;
+    pending->endpoint_id = request.endpoint_id;
     pending->local_port = local_port;
     pending->remote_port = request.remote_port;
     for (size_t i = 0; i < 4; ++i) {
@@ -615,7 +806,11 @@ void handle_connect_request(ServerContext& ctx,
     if (!networkd_protocol::write_message(ctx.networkd_server_pipe, message)) {
         pending->in_use = false;
         client_port->binding_in_progress = false;
-        send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, local_port);
+        send_connect_response(app_pipe_handle,
+                              tcpd_protocol::kStatusIo,
+                              0,
+                              local_port,
+                              0);
         descriptor_close(app_pipe_handle);
     }
 }
@@ -634,6 +829,39 @@ void poll_control(ServerContext& ctx) {
             handle_close_request(ctx, message.close_request);
         } else if (message.type == tcpd_protocol::kConnectRequest) {
             handle_connect_request(ctx, message.connect_request);
+        }
+    }
+}
+
+void poll_connection_endpoints(ServerContext& ctx) {
+    uint8_t buffer[tcpd_protocol::kMaxPayload];
+    for (size_t i = 0; i < kMaxConnections; ++i) {
+        Connection& conn = ctx.connections[i];
+        if (!conn.in_use ||
+            conn.state != kConnStateEstablished ||
+            conn.endpoint_handle == 0) {
+            continue;
+        }
+        for (;;) {
+            long result = descriptor_read(conn.endpoint_handle,
+                                          buffer,
+                                          sizeof(buffer));
+            if (result == kDescriptorWouldBlock) {
+                break;
+            }
+            if (result == 0) {
+                tcpd_protocol::CloseRequest request{};
+                request.connection_id = conn.id;
+                handle_close_request(ctx, request);
+                break;
+            }
+            if (result < 0) {
+                break;
+            }
+            send_connection_payload(ctx,
+                                    conn,
+                                    buffer,
+                                    static_cast<size_t>(result));
         }
     }
 }
@@ -662,7 +890,11 @@ void handle_bind_response(ServerContext& ctx,
     client_port->binding_in_progress = false;
     client_port->bound = (response.status == networkd_protocol::kStatusOk);
     if (!client_port->bound) {
-        send_connect_response(pending->app_pipe_handle, tcpd_protocol::kStatusInUse, 0, 0);
+        send_connect_response(pending->app_pipe_handle,
+                              tcpd_protocol::kStatusInUse,
+                              0,
+                              0,
+                              0);
         descriptor_close(pending->app_pipe_handle);
         pending->in_use = false;
         client_port->in_use = false;
@@ -674,11 +906,13 @@ void handle_bind_response(ServerContext& ctx,
                                    pending->app_pipe_handle,
                                    pending->local_port,
                                    pending->remote_ip,
-                                   pending->remote_port)) {
+                                   pending->remote_port,
+                                   pending->endpoint_id)) {
         send_connect_response(pending->app_pipe_handle,
                               tcpd_protocol::kStatusIo,
                               0,
-                              pending->local_port);
+                              pending->local_port,
+                              0);
         descriptor_close(pending->app_pipe_handle);
     }
     pending->in_use = false;
@@ -703,6 +937,24 @@ void send_ack_only(ServerContext& ctx,
                                0);
 }
 
+void resend_syn_ack(ServerContext& ctx, Connection& conn) {
+    descriptor_defs::NetIpv4Config cfg{};
+    if (!load_ipv4_config(ctx, cfg)) {
+        return;
+    }
+    const uint32_t initial_seq = conn.local_next_seq - 1;
+    (void)send_network_segment(ctx,
+                               cfg.address,
+                               conn.remote_ip,
+                               conn.local_port,
+                               conn.remote_port,
+                               initial_seq,
+                               conn.remote_next_seq,
+                               usernet::kTcpFlagSyn | usernet::kTcpFlagAck,
+                               nullptr,
+                               0);
+}
+
 void handle_new_connection(ServerContext& ctx,
                            Listener& listener,
                            const networkd_protocol::TcpSegmentEvent& segment) {
@@ -710,11 +962,23 @@ void handle_new_connection(ServerContext& ctx,
         (segment.flags & usernet::kTcpFlagAck) != 0) {
         return;
     }
+    print("tcpd: inbound syn port=");
+    print_u32(listener.port);
+    print(" from ");
+    print_ip(segment.source_ip);
+    print(":");
+    print_u32(segment.source_port);
+    print("\n");
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->inbound_syns;
+    }
     Connection* conn = allocate_connection(ctx);
     if (conn == nullptr) {
+        print_line("tcpd: no free connection slots");
         return;
     }
     conn->in_use = true;
+    conn->own_app_pipe_handle = false;
     conn->id = ++ctx.next_connection_id;
     conn->state = kConnStateSynReceived;
     for (size_t i = 0; i < 4; ++i) {
@@ -726,10 +990,31 @@ void handle_new_connection(ServerContext& ctx,
     uint32_t initial_seq =
         0x4E540000u + (static_cast<uint32_t>(listener.port) << 4) + conn->id;
     conn->local_next_seq = initial_seq + 1;
+    conn->app_pipe_handle = listener.app_pipe_handle;
+    conn->endpoint_handle = 0;
+    conn->endpoint_id = 0;
     conn->listener = &listener;
+    long endpoint =
+        net_endpoint_open_new(static_cast<uint64_t>(descriptor_defs::Flag::Async),
+                              descriptor_defs::kNetEndpointOpenService);
+    if (endpoint >= 0) {
+        descriptor_defs::NetEndpointInfo endpoint_info{};
+        if (net_endpoint_get_info(static_cast<uint32_t>(endpoint),
+                                  &endpoint_info) == 0 &&
+            endpoint_info.id != 0) {
+            conn->endpoint_handle = static_cast<uint32_t>(endpoint);
+            conn->endpoint_id = endpoint_info.id;
+        } else {
+            descriptor_close(static_cast<uint32_t>(endpoint));
+        }
+    }
+    record_tcp_observation(ctx, segment, conn->remote_next_seq, conn->local_next_seq);
 
     descriptor_defs::NetIpv4Config cfg{};
     if (!load_ipv4_config(ctx, cfg)) {
+        if (conn->endpoint_handle != 0) {
+            descriptor_close(conn->endpoint_handle);
+        }
         reset_connection(*conn);
         return;
     }
@@ -743,9 +1028,16 @@ void handle_new_connection(ServerContext& ctx,
                               usernet::kTcpFlagSyn | usernet::kTcpFlagAck,
                               nullptr,
                               0)) {
+        print_line("tcpd: failed to send syn-ack");
+        if (conn->endpoint_handle != 0) {
+            descriptor_close(conn->endpoint_handle);
+        }
         reset_connection(*conn);
         return;
     }
+    print("tcpd: syn-ack sent conn=");
+    print_u32(conn->id);
+    print("\n");
     recount_registry(ctx);
 }
 
@@ -753,6 +1045,10 @@ void handle_existing_connection(ServerContext& ctx,
                                 Connection& conn,
                                 const networkd_protocol::TcpSegmentEvent& segment) {
     if ((segment.flags & usernet::kTcpFlagRst) != 0) {
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->remote_resets;
+        }
+        record_tcp_observation(ctx, segment, conn.remote_next_seq, conn.local_next_seq);
         close_connection(ctx, conn, tcpd_protocol::kCloseRemoteRst);
         return;
     }
@@ -761,11 +1057,55 @@ void handle_existing_connection(ServerContext& ctx,
     uint32_t seq = segment.sequence_number;
 
     if (conn.state == kConnStateSynReceived) {
+        if ((segment.flags & usernet::kTcpFlagSyn) != 0 &&
+            (segment.flags & usernet::kTcpFlagAck) == 0 &&
+            seq + 1 == conn.remote_next_seq) {
+            print("tcpd: retransmit syn-ack conn=");
+            print_u32(conn.id);
+            print("\n");
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->syn_ack_retransmits;
+            }
+            record_tcp_observation(ctx, segment, conn.remote_next_seq, conn.local_next_seq);
+            resend_syn_ack(ctx, conn);
+            return;
+        }
         if ((segment.flags & usernet::kTcpFlagAck) != 0 &&
             segment.acknowledgment_number == conn.local_next_seq &&
             seq == conn.remote_next_seq) {
+            print("tcpd: established conn=");
+            print_u32(conn.id);
+            print("\n");
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->established;
+            }
+            record_tcp_observation(ctx, segment, conn.remote_next_seq, conn.local_next_seq);
             conn.state = kConnStateEstablished;
             send_accept_event(conn);
+            if (payload_length != 0) {
+                conn.remote_next_seq += static_cast<uint32_t>(payload_length);
+                send_data_event(conn, segment.payload, payload_length);
+                send_ack_only(ctx, conn);
+            }
+            if ((segment.flags & usernet::kTcpFlagFin) != 0) {
+                conn.remote_next_seq += 1;
+                send_ack_only(ctx, conn);
+                close_connection(ctx, conn, tcpd_protocol::kCloseRemoteFin);
+            }
+        } else {
+            print("tcpd: waiting ack conn=");
+            print_u32(conn.id);
+            print(" flags=");
+            print_u32(segment.flags);
+            print(" seq=");
+            print_u32(seq);
+            print(" ack=");
+            print_u32(segment.acknowledgment_number);
+            print("\n");
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->wait_ack_mismatch;
+            }
+            record_tcp_observation(ctx, segment, conn.remote_next_seq, conn.local_next_seq);
         }
         return;
     }
@@ -775,7 +1115,8 @@ void handle_existing_connection(ServerContext& ctx,
             send_connect_response(conn.app_pipe_handle,
                                   tcpd_protocol::kStatusNotFound,
                                   0,
-                                  conn.local_port);
+                                  conn.local_port,
+                                  0);
             descriptor_close(conn.app_pipe_handle);
             reset_connection(conn);
             recount_registry(ctx);
@@ -790,7 +1131,8 @@ void handle_existing_connection(ServerContext& ctx,
             send_connect_response(conn.app_pipe_handle,
                                   tcpd_protocol::kStatusOk,
                                   conn.id,
-                                  conn.local_port);
+                                  conn.local_port,
+                                  conn.endpoint_id);
         }
         return;
     }
@@ -810,6 +1152,9 @@ void handle_existing_connection(ServerContext& ctx,
     }
 
     if ((segment.flags & usernet::kTcpFlagFin) != 0) {
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->remote_fins;
+        }
         conn.remote_next_seq += 1;
         send_ack_only(ctx, conn);
         close_connection(ctx, conn, tcpd_protocol::kCloseRemoteFin);
@@ -863,15 +1208,24 @@ bool wait_for_networkd(uint32_t& server_pipe_id) {
     if (shm < 0) {
         return false;
     }
-    descriptor_defs::SharedMemoryInfo info{};
-    if (shared_memory_get_info(static_cast<uint32_t>(shm), &info) != 0 ||
-        info.base == 0 ||
-        info.length < sizeof(networkd_protocol::Registry)) {
+    auto* info = allocate_shm_info_buffer();
+    if (info == nullptr) {
+        descriptor_close(static_cast<uint32_t>(shm));
+        return false;
+    }
+    long info_result =
+        shared_memory_get_info(static_cast<uint32_t>(shm), info);
+    uint64_t info_base = info->base;
+    uint64_t info_length = info->length;
+    unmap(info, sizeof(*info));
+    if (info_result != 0 ||
+        info_base == 0 ||
+        info_length < sizeof(networkd_protocol::Registry)) {
         descriptor_close(static_cast<uint32_t>(shm));
         return false;
     }
     registry_handle = static_cast<uint32_t>(shm);
-    registry = reinterpret_cast<networkd_protocol::Registry*>(info.base);
+    registry = reinterpret_cast<networkd_protocol::Registry*>(info_base);
     while (registry->magic != networkd_protocol::kRegistryMagic ||
            registry->version != networkd_protocol::kRegistryVersion ||
            registry->server_pipe_id == 0) {
@@ -886,10 +1240,11 @@ bool wait_for_networkd(uint32_t& server_pipe_id) {
 
 int main(uint64_t, uint64_t) {
     ServerContext ctx{};
+    print_line("tcpd: build dbg-2026-04-11b");
 
     if (!usernet::open_device(ctx.device, 0, static_cast<uint64_t>(descriptor_defs::Flag::Async))) {
         print_line("tcpd: failed to open net device 0");
-        return 1;
+        return 21;
     }
 
     uint64_t server_flags = static_cast<uint64_t>(descriptor_defs::Flag::Readable) |
@@ -897,36 +1252,51 @@ int main(uint64_t, uint64_t) {
     long tcpd_server_pipe = pipe_open_new(server_flags);
     if (tcpd_server_pipe < 0) {
         print_line("tcpd: failed to create server pipe");
-        return 1;
+        return 22;
     }
     ctx.tcpd_server_pipe = static_cast<uint32_t>(tcpd_server_pipe);
 
-    descriptor_defs::PipeInfo info{};
-    if (pipe_get_info(ctx.tcpd_server_pipe, &info) != 0 || info.id == 0) {
-        print_line("tcpd: failed to query server pipe");
-        return 1;
+    auto* info = allocate_pipe_info_buffer();
+    if (info == nullptr) {
+        print_line("tcpd: failed to allocate server pipe info buffer");
+        return 23;
     }
-    if (!populate_registry(ctx, info.id)) {
+    long info_result = pipe_get_info(ctx.tcpd_server_pipe, info);
+    uint32_t tcpd_server_pipe_id = info->id;
+    unmap(info, sizeof(*info));
+    if (info_result != 0 || tcpd_server_pipe_id == 0) {
+        print_line("tcpd: failed to query server pipe");
+        return 23;
+    }
+    g_registry_fail_reason = 0;
+    if (!populate_registry(ctx, tcpd_server_pipe_id)) {
         print_line("tcpd: failed to publish registry");
-        return 1;
+        return 240 + g_registry_fail_reason;
     }
 
     long network_reply_pipe = pipe_open_new(server_flags);
     if (network_reply_pipe < 0) {
         print_line("tcpd: failed to create network reply pipe");
-        return 1;
+        return 25;
     }
     ctx.network_reply_pipe = static_cast<uint32_t>(network_reply_pipe);
-    if (pipe_get_info(ctx.network_reply_pipe, &info) != 0 || info.id == 0) {
-        print_line("tcpd: failed to query network reply pipe");
-        return 1;
+    info = allocate_pipe_info_buffer();
+    if (info == nullptr) {
+        print_line("tcpd: failed to allocate network reply pipe info buffer");
+        return 26;
     }
-    ctx.network_reply_pipe_id = info.id;
+    info_result = pipe_get_info(ctx.network_reply_pipe, info);
+    ctx.network_reply_pipe_id = info->id;
+    unmap(info, sizeof(*info));
+    if (info_result != 0 || ctx.network_reply_pipe_id == 0) {
+        print_line("tcpd: failed to query network reply pipe");
+        return 26;
+    }
 
     uint32_t networkd_server_pipe_id = 0;
     if (!wait_for_networkd(networkd_server_pipe_id)) {
         print_line("tcpd: failed to locate networkd");
-        return 1;
+        return 27;
     }
 
     uint64_t networkd_flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
@@ -935,7 +1305,7 @@ int main(uint64_t, uint64_t) {
         pipe_open_existing(networkd_flags, networkd_server_pipe_id);
     if (networkd_server < 0) {
         print_line("tcpd: failed to open networkd pipe");
-        return 1;
+        return 28;
     }
     ctx.networkd_server_pipe = static_cast<uint32_t>(networkd_server);
     if (ctx.registry != nullptr) {
@@ -946,6 +1316,7 @@ int main(uint64_t, uint64_t) {
 
     for (;;) {
         poll_control(ctx);
+        poll_connection_endpoints(ctx);
         poll_network(ctx);
         yield();
     }

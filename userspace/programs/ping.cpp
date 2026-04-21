@@ -10,6 +10,8 @@ constexpr size_t kPayloadSize = 32;
 constexpr size_t kAttemptsDefault = 4;
 constexpr size_t kReplyPollSpins = 20000;
 
+int g_registry_fail_reason = 0;
+
 void print(const char* text) {
     static int32_t console = -1;
     if (console < 0) {
@@ -155,21 +157,52 @@ void copy_token(const Tokens& tokens, size_t index, char* out, size_t out_size) 
     out[n] = '\0';
 }
 
+descriptor_defs::SharedMemoryInfo* allocate_shm_info_buffer() {
+    auto* info = static_cast<descriptor_defs::SharedMemoryInfo*>(
+        map_anonymous(sizeof(descriptor_defs::SharedMemoryInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->base = 0;
+        info->length = 0;
+    }
+    return info;
+}
+
+descriptor_defs::PipeInfo* allocate_pipe_info_buffer() {
+    auto* info = static_cast<descriptor_defs::PipeInfo*>(
+        map_anonymous(sizeof(descriptor_defs::PipeInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->id = 0;
+        info->flags = 0;
+    }
+    return info;
+}
+
 bool open_registry(uint32_t& handle, networkd_protocol::Registry*& registry) {
+    g_registry_fail_reason = 0;
     long shm = shared_memory_open(networkd_protocol::kRegistryName,
                                   sizeof(networkd_protocol::Registry));
     if (shm < 0) {
+        g_registry_fail_reason = 1;
         return false;
     }
-    descriptor_defs::SharedMemoryInfo info{};
-    if (shared_memory_get_info(static_cast<uint32_t>(shm), &info) != 0 ||
-        info.base == 0 ||
-        info.length < sizeof(networkd_protocol::Registry)) {
+    auto* info = allocate_shm_info_buffer();
+    if (info == nullptr) {
+        g_registry_fail_reason = 2;
+        descriptor_close(static_cast<uint32_t>(shm));
+        return false;
+    }
+    long info_result = shared_memory_get_info(static_cast<uint32_t>(shm), info);
+    uint64_t base = info->base;
+    uint64_t length = info->length;
+    unmap(info, sizeof(*info));
+    if (info_result != 0 || base == 0 ||
+        length < sizeof(networkd_protocol::Registry)) {
+        g_registry_fail_reason = 3;
         descriptor_close(static_cast<uint32_t>(shm));
         return false;
     }
     handle = static_cast<uint32_t>(shm);
-    registry = reinterpret_cast<networkd_protocol::Registry*>(info.base);
+    registry = reinterpret_cast<networkd_protocol::Registry*>(base);
     return true;
 }
 
@@ -254,7 +287,9 @@ extern "C" int main(uint64_t arg_ptr, uint64_t) {
     uint32_t registry_handle = 0;
     networkd_protocol::Registry* registry = nullptr;
     if (!open_registry(registry_handle, registry)) {
-        print_line("ping: failed to open network registry");
+        print("ping: failed to open network registry reason=");
+        print_u32(static_cast<uint32_t>(g_registry_fail_reason));
+        print("\n");
         return 1;
     }
     while (registry->magic != networkd_protocol::kRegistryMagic ||
@@ -270,12 +305,19 @@ extern "C" int main(uint64_t arg_ptr, uint64_t) {
         print_line("ping: failed to create reply pipe");
         return 1;
     }
-    descriptor_defs::PipeInfo reply_info{};
-    if (pipe_get_info(static_cast<uint32_t>(reply_pipe), &reply_info) != 0 ||
-        reply_info.id == 0) {
-        print_line("ping: failed to query reply pipe");
+    auto* reply_info = allocate_pipe_info_buffer();
+    if (reply_info == nullptr) {
+        print_line("ping: failed to allocate reply pipe info buffer");
         return 1;
     }
+    if (pipe_get_info(static_cast<uint32_t>(reply_pipe), reply_info) != 0 ||
+        reply_info->id == 0) {
+        print_line("ping: failed to query reply pipe");
+        unmap(reply_info, sizeof(*reply_info));
+        return 1;
+    }
+    uint32_t reply_pipe_id = reply_info->id;
+    unmap(reply_info, sizeof(*reply_info));
 
     uint64_t server_flags = static_cast<uint64_t>(descriptor_defs::Flag::Writable) |
                             static_cast<uint64_t>(descriptor_defs::Flag::Async);
@@ -295,7 +337,7 @@ extern "C" int main(uint64_t arg_ptr, uint64_t) {
     for (size_t i = 0; i < attempt_count; ++i) {
         uint16_t sequence = static_cast<uint16_t>(i);
         if (!send_ping_request(static_cast<uint32_t>(server_pipe),
-                               reply_info.id,
+                               reply_pipe_id,
                                destination_ip,
                                identifier,
                                sequence,

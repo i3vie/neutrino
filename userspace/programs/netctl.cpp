@@ -28,6 +28,16 @@ void print(const char* s) {
     }
 }
 
+descriptor_defs::SharedMemoryInfo* allocate_shm_info_buffer() {
+    auto* info = static_cast<descriptor_defs::SharedMemoryInfo*>(
+        map_anonymous(sizeof(descriptor_defs::SharedMemoryInfo), MAP_WRITE));
+    if (info != nullptr) {
+        info->base = 0;
+        info->length = 0;
+    }
+    return info;
+}
+
 void print_u32(uint32_t value) {
     char buf[16];
     size_t pos = 0;
@@ -197,7 +207,73 @@ long open_device_from_token(const Tokens& tokens, size_t index_token) {
 }
 
 void print_usage() {
-    print("usage: netctl info [index] | read [index] | set-ip <index> <ip> [mask] [gw] | status | debug [index]\n");
+    print("usage: netctl info [index] | read [index] | set-ip <index> <ip> [mask] [gw] [dns] | status | debug [index]\n");
+}
+
+void append_char(char* buffer, size_t buffer_size, size_t& length, char ch) {
+    if (buffer == nullptr || buffer_size == 0 || length + 1 >= buffer_size) {
+        return;
+    }
+    buffer[length++] = ch;
+    buffer[length] = '\0';
+}
+
+void append_text(char* buffer, size_t buffer_size, size_t& length, const char* text) {
+    if (buffer == nullptr || buffer_size == 0 || text == nullptr) {
+        return;
+    }
+    while (*text != '\0' && length + 1 < buffer_size) {
+        buffer[length++] = *text++;
+    }
+    buffer[length] = '\0';
+}
+
+void append_u32(char* buffer, size_t buffer_size, size_t& length, uint32_t value) {
+    char tmp[16];
+    size_t pos = 0;
+    if (value == 0) {
+        tmp[pos++] = '0';
+    } else {
+        char rev[16];
+        size_t count = 0;
+        while (value != 0 && count < sizeof(rev)) {
+            rev[count++] = static_cast<char>('0' + (value % 10));
+            value /= 10;
+        }
+        while (count != 0) {
+            tmp[pos++] = rev[--count];
+        }
+    }
+    tmp[pos] = '\0';
+    append_text(buffer, buffer_size, length, tmp);
+}
+
+void append_ipv4(char* buffer, size_t buffer_size, size_t& length, uint32_t value) {
+    uint8_t bytes[4] = {
+        static_cast<uint8_t>((value >> 24) & 0xFFu),
+        static_cast<uint8_t>((value >> 16) & 0xFFu),
+        static_cast<uint8_t>((value >> 8) & 0xFFu),
+        static_cast<uint8_t>(value & 0xFFu),
+    };
+    append_u32(buffer, buffer_size, length, bytes[0]);
+    append_char(buffer, buffer_size, length, '.');
+    append_u32(buffer, buffer_size, length, bytes[1]);
+    append_char(buffer, buffer_size, length, '.');
+    append_u32(buffer, buffer_size, length, bytes[2]);
+    append_char(buffer, buffer_size, length, '.');
+    append_u32(buffer, buffer_size, length, bytes[3]);
+}
+
+void append_hex64(char* buffer, size_t buffer_size, size_t& length, uint64_t value) {
+    append_text(buffer, buffer_size, length, "0x");
+    for (int i = 15; i >= 0; --i) {
+        uint8_t nibble = static_cast<uint8_t>((value >> (i * 4)) & 0xFu);
+        append_char(buffer,
+                    buffer_size,
+                    length,
+                    static_cast<char>(nibble < 10 ? ('0' + nibble)
+                                                  : ('a' + (nibble - 10))));
+    }
 }
 
 const char* state_name(uint32_t state) {
@@ -280,6 +356,8 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
             print_ipv4(cfg.netmask);
             print("\ngateway: ");
             print_ipv4(cfg.gateway);
+            print("\ndns: ");
+            print_ipv4(cfg.dns);
             print("\n");
         }
         descriptor_close(static_cast<uint32_t>(handle));
@@ -325,6 +403,14 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
                 return 1;
             }
         }
+        if (tokens.count >= 6) {
+            char dns_buf[32];
+            copy_token(tokens, 5, dns_buf, sizeof(dns_buf));
+            if (!parse_ipv4(dns_buf, cfg.dns)) {
+                print("netctl: invalid dns\n");
+                return 1;
+            }
+        }
         if (net_device_set_ipv4_config(static_cast<uint32_t>(handle), &cfg) != 0) {
             print("netctl: set-ip failed\n");
             return 1;
@@ -342,40 +428,64 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
             print("netctl: network registry not found\n");
             return 1;
         }
-        descriptor_defs::SharedMemoryInfo info{};
-        if (shared_memory_get_info(static_cast<uint32_t>(handle), &info) != 0 ||
-            info.base == 0 ||
-            info.length < sizeof(networkd_protocol::Registry)) {
-            print("netctl: network registry unavailable\n");
+        auto* info = allocate_shm_info_buffer();
+        if (info == nullptr) {
+            print("netctl: failed to allocate shm info buffer\n");
+            return 1;
+        }
+        long info_result =
+            shared_memory_get_info(static_cast<uint32_t>(handle), info);
+        uint64_t info_base = info->base;
+        uint64_t info_length = info->length;
+        unmap(info, sizeof(*info));
+        if (info_result != 0 ||
+            info_base == 0 ||
+            info_length < sizeof(networkd_protocol::Registry)) {
+            char buffer[192];
+            size_t length = 0;
+            buffer[0] = '\0';
+            append_text(buffer, sizeof(buffer), length, "netctl: network registry unavailable");
+            append_text(buffer, sizeof(buffer), length, " result=");
+            append_u32(buffer, sizeof(buffer), length, static_cast<uint32_t>(info_result));
+            append_text(buffer, sizeof(buffer), length, " base=");
+            append_hex64(buffer, sizeof(buffer), length, info_base);
+            append_text(buffer, sizeof(buffer), length, " length=");
+            append_u32(buffer, sizeof(buffer), length, static_cast<uint32_t>(info_length));
+            append_char(buffer, sizeof(buffer), length, '\n');
+            print(buffer);
             return 1;
         }
         auto* registry =
-            reinterpret_cast<networkd_protocol::Registry*>(info.base);
-        print("networkd: ");
-        print(state_name(registry->networkd_state));
-        print("\ndhcp: ");
-        print(state_name(registry->dhcp_state));
-        print("\nattempts: ");
-        print_u32(registry->dhcp_attempts);
-        print("\nlast offer: ");
-        print_ipv4_u32(registry->dhcp_last_offer);
-        print("\nlast ack: ");
-        print_ipv4_u32(registry->dhcp_last_ack);
-        print("\nlast error: ");
-        print_u32(registry->dhcp_last_error);
-        print("\nrx frames: ");
-        print_u32(registry->net_rx_frames);
-        print("\nrx udp: ");
-        print_u32(registry->net_rx_udp);
-        print("\nrx tcp: ");
-        print_u32(registry->net_rx_tcp);
-        print("\nrx delivered: ");
-        print_u32(registry->net_rx_delivered);
-        print("\ntx udp: ");
-        print_u32(registry->net_tx_udp);
-        print("\ntx tcp: ");
-        print_u32(registry->net_tx_tcp);
-        print("\n");
+            reinterpret_cast<networkd_protocol::Registry*>(info_base);
+        char buffer[512];
+        size_t length = 0;
+        buffer[0] = '\0';
+        append_text(buffer, sizeof(buffer), length, "networkd: ");
+        append_text(buffer, sizeof(buffer), length, state_name(registry->networkd_state));
+        append_text(buffer, sizeof(buffer), length, "\ndhcp: ");
+        append_text(buffer, sizeof(buffer), length, state_name(registry->dhcp_state));
+        append_text(buffer, sizeof(buffer), length, "\nattempts: ");
+        append_u32(buffer, sizeof(buffer), length, registry->dhcp_attempts);
+        append_text(buffer, sizeof(buffer), length, "\nlast offer: ");
+        append_ipv4(buffer, sizeof(buffer), length, registry->dhcp_last_offer);
+        append_text(buffer, sizeof(buffer), length, "\nlast ack: ");
+        append_ipv4(buffer, sizeof(buffer), length, registry->dhcp_last_ack);
+        append_text(buffer, sizeof(buffer), length, "\nlast error: ");
+        append_u32(buffer, sizeof(buffer), length, registry->dhcp_last_error);
+        append_text(buffer, sizeof(buffer), length, "\nrx frames: ");
+        append_u32(buffer, sizeof(buffer), length, registry->net_rx_frames);
+        append_text(buffer, sizeof(buffer), length, "\nrx udp: ");
+        append_u32(buffer, sizeof(buffer), length, registry->net_rx_udp);
+        append_text(buffer, sizeof(buffer), length, "\nrx tcp: ");
+        append_u32(buffer, sizeof(buffer), length, registry->net_rx_tcp);
+        append_text(buffer, sizeof(buffer), length, "\nrx delivered: ");
+        append_u32(buffer, sizeof(buffer), length, registry->net_rx_delivered);
+        append_text(buffer, sizeof(buffer), length, "\ntx udp: ");
+        append_u32(buffer, sizeof(buffer), length, registry->net_tx_udp);
+        append_text(buffer, sizeof(buffer), length, "\ntx tcp: ");
+        append_u32(buffer, sizeof(buffer), length, registry->net_tx_tcp);
+        append_char(buffer, sizeof(buffer), length, '\n');
+        print(buffer);
         descriptor_close(static_cast<uint32_t>(handle));
         return 0;
     }
