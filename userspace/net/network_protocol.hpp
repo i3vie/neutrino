@@ -230,11 +230,23 @@ inline void init_message(Message& message, uint16_t type) {
 }
 
 inline bool write_message(uint32_t handle, const Message& message) {
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&message);
+    static Message* bounce = nullptr;
+    if (bounce == nullptr) {
+        bounce = static_cast<Message*>(
+            map_anonymous(sizeof(Message), MAP_WRITE));
+    }
+    if (bounce == nullptr) {
+        return false;
+    }
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(&message);
+    uint8_t* bounce_bytes = reinterpret_cast<uint8_t*>(bounce);
+    for (size_t i = 0; i < sizeof(Message); ++i) {
+        bounce_bytes[i] = src[i];
+    }
     size_t written = 0;
     while (written < sizeof(Message)) {
         long result = descriptor_write(handle,
-                                       bytes + written,
+                                       bounce_bytes + written,
                                        sizeof(Message) - written);
         if (result <= 0) {
             return false;
@@ -245,10 +257,20 @@ inline bool write_message(uint32_t handle, const Message& message) {
 }
 
 inline bool read_message(uint32_t handle, Message& message) {
-    uint8_t* bytes = reinterpret_cast<uint8_t*>(&message);
+    static Message* bounce = nullptr;
+    if (bounce == nullptr) {
+        bounce = static_cast<Message*>(
+            map_anonymous(sizeof(Message), MAP_WRITE));
+    }
+    if (bounce == nullptr) {
+        return false;
+    }
+    uint8_t* bounce_bytes = reinterpret_cast<uint8_t*>(bounce);
     size_t total = 0;
     while (total < sizeof(Message)) {
-        long result = descriptor_read(handle, bytes + total, sizeof(Message) - total);
+        long result = descriptor_read(handle,
+                                      bounce_bytes + total,
+                                      sizeof(Message) - total);
         if (result == kDescriptorWouldBlock) {
             if (total == 0) {
                 return false;
@@ -261,8 +283,13 @@ inline bool read_message(uint32_t handle, Message& message) {
         }
         total += static_cast<size_t>(result);
     }
-    return message.magic == kMessageMagic &&
-           message.version == kMessageVersion;
+    uint8_t* dest = reinterpret_cast<uint8_t*>(&message);
+    for (size_t i = 0; i < sizeof(Message); ++i) {
+        dest[i] = bounce_bytes[i];
+    }
+    bool ok = message.magic == kMessageMagic &&
+              message.version == kMessageVersion;
+    return ok;
 }
 
 }  // namespace networkd_protocol

@@ -102,6 +102,30 @@ const DescriptorEntry* lookup_entry(const Table& table, uint32_t handle) {
     return &entry;
 }
 
+void populate_entry(DescriptorEntry& entry, const Allocation& alloc) {
+    uint16_t generation = entry.generation;
+    if (generation == 0) {
+        generation = 1;
+    }
+    reset_entry(entry, false);
+    entry.type = alloc.type;
+    entry.flags = alloc.flags;
+    entry.extended_flags = alloc.extended_flags;
+    entry.has_extended_flags = alloc.has_extended_flags;
+    entry.object = alloc.object;
+    entry.subsystem_data = alloc.subsystem_data;
+    entry.name = alloc.name;
+    entry.ops = alloc.ops;
+    entry.ext = alloc.ext;
+    entry.close = alloc.close;
+    entry.refcount = 1;
+    entry.created_tick = 0;
+    entry.last_access_tick = 0;
+    entry.lock_word = 0;
+    entry.in_use = true;
+    entry.generation = generation;
+}
+
 }  // namespace
 
 bool register_type(uint32_t type, OpenFn open, const Ops* ops) {
@@ -168,30 +192,33 @@ uint32_t install(process::Process& proc,
         if (entry.in_use) {
             continue;
         }
-        uint16_t generation = entry.generation;
-        if (generation == 0) {
-            generation = 1;
-        }
-        reset_entry(entry, false);
-        entry.type = alloc.type;
-        entry.flags = alloc.flags;
-        entry.extended_flags = alloc.extended_flags;
-        entry.has_extended_flags = alloc.has_extended_flags;
-        entry.object = alloc.object;
-        entry.subsystem_data = alloc.subsystem_data;
-        entry.name = alloc.name;
-        entry.ops = alloc.ops;
-        entry.ext = alloc.ext;
-        entry.close = alloc.close;
-        entry.refcount = 1;
-        entry.created_tick = 0;
-        entry.last_access_tick = 0;
-        entry.lock_word = 0;
-        entry.in_use = true;
-        entry.generation = generation;
-        return make_handle(static_cast<uint16_t>(i), generation);
+        populate_entry(entry, alloc);
+        return make_handle(static_cast<uint16_t>(i), entry.generation);
     }
     return kInvalidHandle;
+}
+
+uint32_t install_at(process::Process& proc,
+                    Table& table,
+                    uint16_t index,
+                    const Allocation& alloc) {
+    (void)proc;
+    if (index >= kMaxDescriptors) {
+        return kInvalidHandle;
+    }
+    DescriptorEntry& entry = table.entries[index];
+    if (entry.in_use) {
+        if (entry.close != nullptr) {
+            entry.close(entry);
+        }
+        reset_entry(entry, false);
+    }
+    uint16_t generation = entry.generation;
+    if (generation == 0) {
+        generation = 1;
+    }
+    populate_entry(entry, alloc);
+    return make_handle(index, generation);
 }
 
 uint32_t open(process::Process& proc,
@@ -239,6 +266,69 @@ uint32_t open(process::Process& proc,
         alloc.ops = reg->ops;
     }
     uint32_t handle = install(proc, table, alloc);
+    if (handle == kInvalidHandle && alloc.close != nullptr) {
+        DescriptorEntry temp{};
+        temp.type = alloc.type;
+        temp.flags = alloc.flags;
+        temp.extended_flags = alloc.extended_flags;
+        temp.has_extended_flags = alloc.has_extended_flags;
+        temp.object = alloc.object;
+        temp.subsystem_data = alloc.subsystem_data;
+        temp.name = alloc.name;
+        temp.ops = alloc.ops;
+        temp.close = alloc.close;
+        temp.in_use = true;
+        alloc.close(temp);
+    }
+    return handle;
+}
+
+uint32_t open_at(process::Process& proc,
+                 Table& table,
+                 uint16_t index,
+                 uint32_t type,
+                 uint64_t arg0,
+                 uint64_t arg1,
+                 uint64_t arg2) {
+    uint16_t type_id = static_cast<uint16_t>(type & 0xFFFFu);
+    TypeRegistration* reg = find_registration(type_id);
+    if (reg == nullptr || reg->open == nullptr) {
+        return kInvalidHandle;
+    }
+    Allocation alloc{
+        .type = type_id,
+        .flags = 0,
+        .extended_flags = 0,
+        .has_extended_flags = false,
+        .object = nullptr,
+        .subsystem_data = nullptr,
+        .name = nullptr,
+        .ops = reg->ops,
+        .ext = nullptr,
+        .close = nullptr,
+    };
+    if (!reg->open(proc, arg0, arg1, arg2, alloc)) {
+        if (alloc.close != nullptr) {
+            DescriptorEntry temp{};
+            temp.type = alloc.type;
+            temp.flags = alloc.flags;
+            temp.extended_flags = alloc.extended_flags;
+            temp.has_extended_flags = alloc.has_extended_flags;
+            temp.object = alloc.object;
+            temp.subsystem_data = alloc.subsystem_data;
+            temp.name = alloc.name;
+            temp.ops = alloc.ops;
+            temp.close = alloc.close;
+            temp.in_use = true;
+            alloc.close(temp);
+        }
+        return kInvalidHandle;
+    }
+    alloc.type = (alloc.type == 0) ? type_id : alloc.type;
+    if (alloc.ops == nullptr) {
+        alloc.ops = reg->ops;
+    }
+    uint32_t handle = install_at(proc, table, index, alloc);
     if (handle == kInvalidHandle && alloc.close != nullptr) {
         DescriptorEntry temp{};
         temp.type = alloc.type;

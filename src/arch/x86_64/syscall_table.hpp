@@ -47,6 +47,7 @@ enum class SystemCall : uint64_t {
     UserCreate            = 37,
     UserFind              = 38,
     UserBumpGeneration    = 39,
+    UserSetPassword       = 40,
 };
 
 Result handle_syscall(SyscallFrame& frame);

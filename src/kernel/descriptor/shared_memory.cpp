@@ -20,13 +20,14 @@ constexpr size_t kMaxSegmentPages = 4096;  // Allow larger shared buffers (e.g.,
 
 struct SegmentMapping {
     process::Process* proc;
+    vm::Region region;
     uint32_t refcount;
 };
 
 struct SharedSegment {
     bool in_use;
     char name[kMaxNameLength];
-    vm::Region region;
+    size_t length;
     size_t page_count;
     uint64_t pages[kMaxSegmentPages];
     SegmentMapping mappings[process::kMaxProcesses];
@@ -55,10 +56,11 @@ public:
 void reset_segment(SharedSegment& segment) {
     segment.in_use = false;
     segment.name[0] = '\0';
-    segment.region = vm::Region{0, 0};
+    segment.length = 0;
     segment.page_count = 0;
     for (auto& mapping : segment.mappings) {
         mapping.proc = nullptr;
+        mapping.region = vm::Region{0, 0};
         mapping.refcount = 0;
     }
     segment.refcount = 0;
@@ -93,6 +95,7 @@ SegmentMapping* allocate_mapping(SharedSegment& segment,
     for (auto& mapping : segment.mappings) {
         if (mapping.proc == nullptr) {
             mapping.proc = &proc;
+            mapping.region = vm::Region{0, 0};
             mapping.refcount = 0;
             return &mapping;
         }
@@ -101,15 +104,23 @@ SegmentMapping* allocate_mapping(SharedSegment& segment,
 }
 
 bool map_segment_into_process(SharedSegment& segment,
-                              process::Process& proc) {
-    if (segment.region.base == 0 || segment.page_count == 0) {
+                              process::Process& proc,
+                              SegmentMapping& mapping) {
+    if (segment.length == 0 || segment.page_count == 0) {
         return false;
     }
     if (proc.cr3 == 0) {
         return false;
     }
+    if (mapping.region.base == 0 || mapping.region.length == 0) {
+        mapping.region = vm::reserve_user_region(proc.cr3, segment.length);
+        if (mapping.region.base == 0 || mapping.region.length < segment.length) {
+            mapping.region = vm::Region{0, 0};
+            return false;
+        }
+    }
     for (size_t i = 0; i < segment.page_count; ++i) {
-        uint64_t virt = segment.region.base + (i * kPageSize);
+        uint64_t virt = mapping.region.base + (i * kPageSize);
         uint64_t phys = segment.pages[i];
         if (!paging_map_page_cr3(proc.cr3,
                                  virt,
@@ -127,12 +138,13 @@ bool map_segment_into_process(SharedSegment& segment,
 }
 
 void unmap_segment_from_process(SharedSegment& segment,
-                                process::Process& proc) {
-    if (segment.region.base == 0 || segment.page_count == 0 || proc.cr3 == 0) {
+                                process::Process& proc,
+                                SegmentMapping& mapping) {
+    if (mapping.region.base == 0 || segment.page_count == 0 || proc.cr3 == 0) {
         return;
     }
     for (size_t i = 0; i < segment.page_count; ++i) {
-        uint64_t virt = segment.region.base + (i * kPageSize);
+        uint64_t virt = mapping.region.base + (i * kPageSize);
         uint64_t phys = 0;
         paging_unmap_page_cr3(proc.cr3, virt, phys);
     }
@@ -173,22 +185,9 @@ SharedSegment* allocate_segment_locked(const char* name,
         return nullptr;
     }
 
-    vm::Region region = vm::reserve_user_region(padded);
-    if (region.base == 0 || region.length == 0) {
-        log_message(LogLevel::Warn,
-                    "SharedMemory: reserve_user_region failed for %zu bytes",
-                    padded);
-        return nullptr;
-    }
-    if (!vm::is_user_range(region.base, region.length)) {
-        log_message(LogLevel::Warn,
-                    "SharedMemory: reserved range not user-accessible");
-        return nullptr;
-    }
-
     reset_segment(*slot);
     slot->in_use = true;
-    slot->region = region;
+    slot->length = padded;
     slot->page_count = pages;
     for (size_t i = 0; i < pages; ++i) {
         uint64_t phys = memory::alloc_user_page();
@@ -220,28 +219,34 @@ int64_t shared_memory_read(process::Process&,
     if (segment == nullptr || !segment->in_use) {
         return -1;
     }
-    if (segment->region.length == 0 || user_address == 0) {
+    auto* mapping = static_cast<SegmentMapping*>(entry.subsystem_data);
+    if (mapping == nullptr || mapping->region.base == 0 ||
+        segment->length == 0 || user_address == 0) {
         return -1;
     }
-    if (offset >= segment->region.length) {
+    if (offset >= segment->length) {
         return 0;
     }
-    uint64_t remaining = segment->region.length - offset;
+    uint64_t remaining = segment->length - offset;
     uint64_t to_copy = (length > remaining) ? remaining : length;
     if (to_copy == 0) {
         return 0;
     }
-    if (!vm::is_user_range(user_address, to_copy)) {
+    process::Process* proc = process::current();
+    if (proc == nullptr || proc->cr3 == 0 ||
+        !vm::is_user_range(user_address, to_copy)) {
         return -1;
     }
-    auto* dest = reinterpret_cast<uint8_t*>(user_address);
-    auto* src =
-        reinterpret_cast<const uint8_t*>(segment->region.base + offset);
-    memcpy(dest, src, static_cast<size_t>(to_copy));
+    if (!vm::copy_to_user(proc->cr3,
+                          user_address,
+                          reinterpret_cast<const void*>(mapping->region.base + offset),
+                          static_cast<size_t>(to_copy))) {
+        return -1;
+    }
     return static_cast<int64_t>(to_copy);
 }
 
-int64_t shared_memory_write(process::Process&,
+int64_t shared_memory_write(process::Process& proc,
                             DescriptorEntry& entry,
                             uint64_t user_address,
                             uint64_t length,
@@ -250,24 +255,28 @@ int64_t shared_memory_write(process::Process&,
     if (segment == nullptr || !segment->in_use) {
         return -1;
     }
-    if (segment->region.length == 0 || user_address == 0) {
+    auto* mapping = static_cast<SegmentMapping*>(entry.subsystem_data);
+    if (mapping == nullptr || mapping->region.base == 0 ||
+        segment->length == 0 || user_address == 0) {
         return -1;
     }
-    if (offset >= segment->region.length) {
+    if (offset >= segment->length) {
         return 0;
     }
-    uint64_t remaining = segment->region.length - offset;
+    uint64_t remaining = segment->length - offset;
     uint64_t to_copy = (length > remaining) ? remaining : length;
     if (to_copy == 0) {
         return 0;
     }
-    if (!vm::is_user_range(user_address, to_copy)) {
+    if (proc.cr3 == 0 || !vm::is_user_range(user_address, to_copy)) {
         return -1;
     }
-    const auto* src = reinterpret_cast<const uint8_t*>(user_address);
-    auto* dest =
-        reinterpret_cast<uint8_t*>(segment->region.base + offset);
-    memcpy(dest, src, static_cast<size_t>(to_copy));
+    if (!vm::copy_from_user(proc.cr3,
+                            reinterpret_cast<void*>(mapping->region.base + offset),
+                            user_address,
+                            static_cast<size_t>(to_copy))) {
+        return -1;
+    }
     return static_cast<int64_t>(to_copy);
 }
 
@@ -292,9 +301,13 @@ int shared_memory_get_property(DescriptorEntry& entry,
         if (proc == nullptr || proc->cr3 == 0) {
             return -1;
         }
+        auto* mapping = static_cast<SegmentMapping*>(entry.subsystem_data);
+        if (mapping == nullptr || mapping->region.base == 0) {
+            return -1;
+        }
         descriptor_defs::SharedMemoryInfo info{};
-        info.base = segment->region.base;
-        info.length = segment->region.length;
+        info.base = mapping->region.base;
+        info.length = segment->length;
         if (!vm::copy_to_user(proc->cr3,
                               reinterpret_cast<uint64_t>(out),
                               &info,
@@ -318,8 +331,9 @@ void shared_memory_close(DescriptorEntry& entry) {
             --mapping->refcount;
         }
         if (mapping->refcount == 0) {
-            unmap_segment_from_process(*segment, *mapping->proc);
+            unmap_segment_from_process(*segment, *mapping->proc, *mapping);
             mapping->proc = nullptr;
+            mapping->region = vm::Region{0, 0};
         }
     }
     if (segment->refcount > 0) {
@@ -371,11 +385,11 @@ bool open_shared_memory(process::Process& proc,
                 return false;
             }
             created = true;
-        } else if (requested != 0 && segment->region.length < requested) {
+        } else if (requested != 0 && segment->length < requested) {
             log_message(LogLevel::Warn,
                         "SharedMemory: '%s' existing size %zu < requested %zu",
                         name_buffer,
-                        static_cast<size_t>(segment->region.length),
+                        static_cast<size_t>(segment->length),
                         requested);
             return false;
         }
@@ -387,8 +401,9 @@ bool open_shared_memory(process::Process& proc,
             }
         }
         if (mapping->refcount == 0) {
-            if (!map_segment_into_process(*segment, proc)) {
+            if (!map_segment_into_process(*segment, proc, *mapping)) {
                 mapping->proc = nullptr;
+                mapping->region = vm::Region{0, 0};
                 mapping->refcount = 0;
                 if (created) {
                     release_segment_pages(*segment);

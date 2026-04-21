@@ -46,6 +46,8 @@ constexpr uint32_t kTypeCpuStats =
     static_cast<uint32_t>(descriptor_defs::Type::CpuStats);
 constexpr uint32_t kTypeNetDevice =
     static_cast<uint32_t>(descriptor_defs::Type::NetDevice);
+constexpr uint32_t kTypeNetEndpoint =
+    static_cast<uint32_t>(descriptor_defs::Type::NetEndpoint);
 
 constexpr int64_t kWouldBlock = -2;
 
@@ -58,6 +60,7 @@ enum class Flag : uint64_t {
     EventSource = 1ull << 9,
     Device     = 1ull << 10,
     Block      = 1ull << 11,
+    CapStream  = 1ull << 12,
 };
 
 struct DescriptorEntry;
@@ -146,12 +149,23 @@ void destroy_table(process::Process& proc, Table& table);
 uint32_t install(process::Process& proc,
                  Table& table,
                  const Allocation& alloc);
+uint32_t install_at(process::Process& proc,
+                    Table& table,
+                    uint16_t index,
+                    const Allocation& alloc);
 uint32_t open(process::Process& proc,
               Table& table,
               uint32_t type,
               uint64_t arg0,
               uint64_t arg1,
               uint64_t arg2);
+uint32_t open_at(process::Process& proc,
+                 Table& table,
+                 uint16_t index,
+                 uint32_t type,
+                 uint64_t arg0,
+                 uint64_t arg1,
+                 uint64_t arg2);
 int64_t read(process::Process& proc,
              Table& table,
              uint32_t handle,

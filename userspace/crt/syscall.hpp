@@ -46,6 +46,7 @@ enum class SystemCall : long {
     UserCreate           = 37,
     UserFind             = 38,
     UserBumpGeneration   = 39,
+    UserSetPassword      = 40,
 };
 
 enum : uint32_t {
@@ -58,6 +59,22 @@ enum : uint64_t {
 
 constexpr uint32_t kInvalidDescriptor = 0xFFFFFFFFu;
 constexpr long kDescriptorWouldBlock = -2;
+constexpr uint64_t kProcessChildFlagStdioConfig = 1ull << 0;
+constexpr uint32_t kStandardInputDescriptor = 0x00010000u;
+constexpr uint32_t kStandardOutputDescriptor = 0x00010001u;
+constexpr uint32_t kStandardErrorDescriptor = 0x00010002u;
+
+struct ProcessStdioConfig {
+    uint32_t stdin_handle;
+    uint32_t stdout_handle;
+    uint32_t stderr_handle;
+    uint32_t reserved;
+};
+
+struct ProcessSpawnConfig {
+    uint64_t cwd_ptr;
+    ProcessStdioConfig stdio;
+};
 
 struct DirEntry {
     char name[64];
@@ -185,6 +202,24 @@ static inline long child(const char* path,
                         static_cast<long>(reinterpret_cast<uintptr_t>(cwd)));
 }
 
+static inline long child_with_stdio(const char* path,
+                                    const char* args,
+                                    uint64_t flags,
+                                    const char* cwd,
+                                    const ProcessStdioConfig* stdio) {
+    if (stdio == nullptr) {
+        return -1;
+    }
+    ProcessSpawnConfig config{};
+    config.cwd_ptr = reinterpret_cast<uint64_t>(cwd);
+    config.stdio = *stdio;
+    return raw_syscall4(SystemCall::Child,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(args)),
+                        static_cast<long>(flags | kProcessChildFlagStdioConfig),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(&config)));
+}
+
 // requests a descriptor of the given type. the optional parameters allow
 // callers to select a specific resource instance, request particular
 // flag bits, or pass type-specific context understood by the kernel
@@ -205,6 +240,20 @@ static inline long descriptor_get_type(uint32_t handle) {
                         static_cast<long>(handle));
 }
 
+static inline long process_get_standard_descriptor(uint32_t index) {
+    uint32_t handle = kInvalidDescriptor;
+    if (index == 0) {
+        handle = kStandardInputDescriptor;
+    } else if (index == 1) {
+        handle = kStandardOutputDescriptor;
+    } else if (index == 2) {
+        handle = kStandardErrorDescriptor;
+    } else {
+        return -1;
+    }
+    return descriptor_get_type(handle) >= 0 ? static_cast<long>(handle) : -1;
+}
+
 static inline long descriptor_test_flag(uint32_t handle, uint64_t flag) {
     return raw_syscall2(SystemCall::DescriptorTestFlag,
                         static_cast<long>(handle),
@@ -217,26 +266,95 @@ static inline long descriptor_get_flags(uint32_t handle, bool extended) {
                         static_cast<long>(extended ? 1 : 0));
 }
 
+static inline void* ensure_reusable_mapping(size_t size,
+                                            void*& buffer,
+                                            size_t& capacity) {
+    if (size == 0) {
+        return nullptr;
+    }
+    if (buffer != nullptr && capacity >= size) {
+        return buffer;
+    }
+    if (buffer != nullptr) {
+        unmap(buffer, capacity);
+        buffer = nullptr;
+        capacity = 0;
+    }
+    void* mapped = map_anonymous(size, MAP_WRITE);
+    if (mapped == nullptr) {
+        return nullptr;
+    }
+    buffer = mapped;
+    capacity = size;
+    return buffer;
+}
+
 static inline long descriptor_get_property(uint32_t handle,
                                            uint32_t property,
                                            void* out,
                                            size_t size) {
-    return raw_syscall4(SystemCall::DescriptorGetProperty,
-                        static_cast<long>(handle),
-                        static_cast<long>(property),
-                        static_cast<long>(reinterpret_cast<uintptr_t>(out)),
-                        static_cast<long>(size));
+    if (size == 0) {
+        return raw_syscall4(SystemCall::DescriptorGetProperty,
+                            static_cast<long>(handle),
+                            static_cast<long>(property),
+                            static_cast<long>(reinterpret_cast<uintptr_t>(out)),
+                            static_cast<long>(size));
+    }
+    if (out == nullptr) {
+        return -1;
+    }
+    static void* bounce = nullptr;
+    static size_t bounce_capacity = 0;
+    bounce = ensure_reusable_mapping(size, bounce, bounce_capacity);
+    if (bounce == nullptr) {
+        return -1;
+    }
+    long result = raw_syscall4(SystemCall::DescriptorGetProperty,
+                               static_cast<long>(handle),
+                               static_cast<long>(property),
+                               static_cast<long>(reinterpret_cast<uintptr_t>(bounce)),
+                               static_cast<long>(size));
+    if (result == 0) {
+        auto* src = static_cast<const uint8_t*>(bounce);
+        auto* dest = static_cast<uint8_t*>(out);
+        for (size_t i = 0; i < size; ++i) {
+            dest[i] = src[i];
+        }
+    }
+    return result;
 }
 
 static inline long descriptor_set_property(uint32_t handle,
                                            uint32_t property,
                                            const void* in,
                                            size_t size) {
-    return raw_syscall4(SystemCall::DescriptorSetProperty,
-                        static_cast<long>(handle),
-                        static_cast<long>(property),
-                        static_cast<long>(reinterpret_cast<uintptr_t>(in)),
-                        static_cast<long>(size));
+    if (size == 0) {
+        return raw_syscall4(SystemCall::DescriptorSetProperty,
+                            static_cast<long>(handle),
+                            static_cast<long>(property),
+                            static_cast<long>(reinterpret_cast<uintptr_t>(in)),
+                            static_cast<long>(size));
+    }
+    if (in == nullptr) {
+        return -1;
+    }
+    static void* bounce = nullptr;
+    static size_t bounce_capacity = 0;
+    bounce = ensure_reusable_mapping(size, bounce, bounce_capacity);
+    if (bounce == nullptr) {
+        return -1;
+    }
+    auto* src = static_cast<const uint8_t*>(in);
+    auto* dest = static_cast<uint8_t*>(bounce);
+    for (size_t i = 0; i < size; ++i) {
+        dest[i] = src[i];
+    }
+    long result = raw_syscall4(SystemCall::DescriptorSetProperty,
+                               static_cast<long>(handle),
+                               static_cast<long>(property),
+                               static_cast<long>(reinterpret_cast<uintptr_t>(bounce)),
+                               static_cast<long>(size));
+    return result;
 }
 
 static inline long shared_memory_open(const char* name, size_t length) {
@@ -331,6 +449,38 @@ static inline long pipe_get_info(uint32_t handle,
     return descriptor_get_property(
         handle,
         static_cast<uint32_t>(descriptor_defs::Property::PipeInfo),
+        info,
+        sizeof(*info));
+}
+
+static inline long net_endpoint_open_new(uint64_t flags,
+                                         uint64_t open_context = 0) {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::NetEndpoint),
+        flags,
+        0,
+        open_context);
+}
+
+static inline long net_endpoint_open_existing(uint64_t flags,
+                                              uint64_t endpoint_id,
+                                              uint64_t open_context = 0) {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::NetEndpoint),
+        flags,
+        endpoint_id,
+        open_context);
+}
+
+static inline long net_endpoint_get_info(
+    uint32_t handle,
+    descriptor_defs::NetEndpointInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::NetEndpointInfo),
         info,
         sizeof(*info));
 }
@@ -517,6 +667,17 @@ static inline void* user_find(const char* name) {
 static inline long user_bump_generation(void* user) {
     return raw_syscall1(SystemCall::UserBumpGeneration,
                         reinterpret_cast<long>(user));
+}
+
+static inline long user_set_password(void* user,
+                                     const uint8_t* salt,
+                                     const uint8_t* hash,
+                                     uint32_t iterations) {
+    return raw_syscall4(SystemCall::UserSetPassword,
+                        reinterpret_cast<long>(user),
+                        reinterpret_cast<long>(salt),
+                        reinterpret_cast<long>(hash),
+                        static_cast<long>(iterations));
 }
 
 static inline void* principal_create(void* backing_user, uint64_t allowed_caps) {

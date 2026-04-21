@@ -270,11 +270,13 @@ void assign_ipv4(LinkDevice& device,
                  uint32_t address,
                  uint32_t netmask,
                  uint32_t gateway,
+                 uint32_t dns,
                  bool dhcp,
                  const char* source) {
     device.ipv4_address = address;
     device.ipv4_netmask = netmask;
     device.ipv4_gateway = gateway;
+    device.ipv4_dns = dns;
     device.ipv4_dhcp = dhcp;
     device.ipv4_configured = address != 0;
 
@@ -520,6 +522,7 @@ void load_config(const char* root_mount_path) {
 
         uint32_t netmask = kDefaultIpv4Netmask;
         uint32_t gateway = 0;
+        uint32_t dns = 0;
         const char* mask_value = config::get(table, "IPV4.NETMASK");
         if (mask_value != nullptr) {
             uint32_t parsed_mask = 0;
@@ -537,7 +540,14 @@ void load_config(const char* root_mount_path) {
                                      gateway);
         }
 
-        assign_ipv4(*device, ipv4, netmask, gateway, false, path);
+        const char* dns_value = config::get(table, "IPV4.DNS");
+        if (dns_value != nullptr) {
+            (void)parse_ipv4_literal(dns_value,
+                                     string_util::length(dns_value),
+                                     dns);
+        }
+
+        assign_ipv4(*device, ipv4, netmask, gateway, dns, false, path);
         any_loaded = true;
     }
 
@@ -569,6 +579,7 @@ bool register_link(LinkDevice& device,
     device.ipv4_address = 0;
     device.ipv4_netmask = kDefaultIpv4Netmask;
     device.ipv4_gateway = 0;
+    device.ipv4_dns = 0;
     device.rx_head = 0;
     device.rx_tail = 0;
     device.rx_lock = 0;
@@ -578,6 +589,7 @@ bool register_link(LinkDevice& device,
         assign_ipv4(device,
                     g_default_ipv4_address,
                     kDefaultIpv4Netmask,
+                    0,
                     0,
                     false,
                     "cmdline");
@@ -657,12 +669,14 @@ void get_ipv4_config(const LinkDevice& device,
                      bool& dhcp,
                      uint32_t& address,
                      uint32_t& netmask,
-                     uint32_t& gateway) {
+                     uint32_t& gateway,
+                     uint32_t& dns) {
     enabled = device.ipv4_configured;
     dhcp = device.ipv4_dhcp;
     address = device.ipv4_address;
     netmask = device.ipv4_netmask;
     gateway = device.ipv4_gateway;
+    dns = device.ipv4_dns;
 }
 
 void set_ipv4_config(LinkDevice& device,
@@ -670,12 +684,14 @@ void set_ipv4_config(LinkDevice& device,
                      bool dhcp,
                      uint32_t address,
                      uint32_t netmask,
-                     uint32_t gateway) {
+                     uint32_t gateway,
+                     uint32_t dns) {
     device.ipv4_configured = enabled && address != 0;
     device.ipv4_dhcp = dhcp;
     device.ipv4_address = device.ipv4_configured ? address : 0;
     device.ipv4_netmask = (netmask != 0) ? netmask : kDefaultIpv4Netmask;
     device.ipv4_gateway = gateway;
+    device.ipv4_dns = dns;
 }
 
 void receive_frame(LinkDevice* device, const void* frame, size_t length) {

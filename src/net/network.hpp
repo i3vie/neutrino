@@ -23,6 +23,7 @@ struct LinkDevice {
     uint32_t ipv4_address;
     uint32_t ipv4_netmask;
     uint32_t ipv4_gateway;
+    uint32_t ipv4_dns;
     uint16_t rx_head;
     uint16_t rx_tail;
     uint16_t rx_lengths[kMaxQueuedFrames];
@@ -52,13 +53,15 @@ void get_ipv4_config(const LinkDevice& device,
                      bool& dhcp,
                      uint32_t& address,
                      uint32_t& netmask,
-                     uint32_t& gateway);
+                     uint32_t& gateway,
+                     uint32_t& dns);
 void set_ipv4_config(LinkDevice& device,
                      bool enabled,
                      bool dhcp,
                      uint32_t address,
                      uint32_t netmask,
-                     uint32_t gateway);
+                     uint32_t gateway,
+                     uint32_t dns);
 
 void receive_frame(LinkDevice* device, const void* frame, size_t length);
 

@@ -30,7 +30,7 @@ int64_t net_device_read(process::Process&,
                                  out_size);
     if (result == 0) {
         if (has_flag(entry.flags, Flag::Async)) {
-            return 0;
+            return kWouldBlock;
         }
         return kWouldBlock;
     }
@@ -105,7 +105,8 @@ int get_property(DescriptorEntry& entry,
             uint32_t address = 0;
             uint32_t netmask = 0;
             uint32_t gateway = 0;
-            net::get_ipv4_config(*device, enabled, dhcp, address, netmask, gateway);
+            uint32_t dns = 0;
+            net::get_ipv4_config(*device, enabled, dhcp, address, netmask, gateway, dns);
             cfg->address[0] = static_cast<uint8_t>((address >> 24) & 0xFFu);
             cfg->address[1] = static_cast<uint8_t>((address >> 16) & 0xFFu);
             cfg->address[2] = static_cast<uint8_t>((address >> 8) & 0xFFu);
@@ -118,10 +119,10 @@ int get_property(DescriptorEntry& entry,
             cfg->gateway[1] = static_cast<uint8_t>((gateway >> 16) & 0xFFu);
             cfg->gateway[2] = static_cast<uint8_t>((gateway >> 8) & 0xFFu);
             cfg->gateway[3] = static_cast<uint8_t>(gateway & 0xFFu);
-            cfg->reserved[0] = 0;
-            cfg->reserved[1] = 0;
-            cfg->reserved[2] = 0;
-            cfg->reserved[3] = 0;
+            cfg->dns[0] = static_cast<uint8_t>((dns >> 24) & 0xFFu);
+            cfg->dns[1] = static_cast<uint8_t>((dns >> 16) & 0xFFu);
+            cfg->dns[2] = static_cast<uint8_t>((dns >> 8) & 0xFFu);
+            cfg->dns[3] = static_cast<uint8_t>(dns & 0xFFu);
             cfg->flags = enabled ? descriptor_defs::kNetIpv4FlagEnabled : 0u;
             if (dhcp) {
                 cfg->flags |= descriptor_defs::kNetIpv4FlagDhcp;
@@ -175,10 +176,14 @@ int set_property(DescriptorEntry& entry,
                        (static_cast<uint32_t>(cfg->gateway[1]) << 16) |
                        (static_cast<uint32_t>(cfg->gateway[2]) << 8) |
                        static_cast<uint32_t>(cfg->gateway[3]);
+    uint32_t dns = (static_cast<uint32_t>(cfg->dns[0]) << 24) |
+                   (static_cast<uint32_t>(cfg->dns[1]) << 16) |
+                   (static_cast<uint32_t>(cfg->dns[2]) << 8) |
+                   static_cast<uint32_t>(cfg->dns[3]);
     bool enabled =
         (cfg->flags & descriptor_defs::kNetIpv4FlagEnabled) != 0;
     bool dhcp = (cfg->flags & descriptor_defs::kNetIpv4FlagDhcp) != 0;
-    net::set_ipv4_config(*device, enabled, dhcp, address, netmask, gateway);
+    net::set_ipv4_config(*device, enabled, dhcp, address, netmask, gateway, dns);
     return 0;
 }
 

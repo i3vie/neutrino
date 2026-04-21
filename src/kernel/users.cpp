@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "capabilities.hpp"
 #include "string_util.hpp"
 #include "../fs/vfs.hpp"
 #include "../lib/mem.hpp"
@@ -18,15 +19,33 @@ bool g_has_storage_path = false;
 bool g_loading_from_disk = false;
 
 constexpr uint32_t kMagic = 0x4E544455;  // 'NTDU'
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 2;
+constexpr uint16_t kLegacyVersion = 1;
+constexpr uint64_t kLegacyAllCapabilities = (1ull << 3) - 1;
 
-struct PackedUser {
+struct PackedUserV1 {
     char name[32];
     uint64_t allowed_caps;
     uint64_t generation;
     uint8_t active;
     uint8_t reserved[7];
 };
+
+struct PackedUser {
+    char name[32];
+    uint64_t allowed_caps;
+    uint64_t generation;
+    uint8_t active;
+    uint8_t password_set;
+    uint16_t password_algorithm;
+    uint32_t password_iterations;
+    uint8_t password_salt[16];
+    uint8_t password_hash[32];
+    uint8_t reserved[24];
+};
+
+static_assert(sizeof(PackedUserV1) == 56, "PackedUserV1 size changed");
+static_assert(sizeof(PackedUser) == 128, "PackedUser size changed");
 
 struct Header {
     uint32_t magic;
@@ -145,6 +164,21 @@ void ensure_home_directory(const char* name) {
     ensure_directory(user_home);
 }
 
+uint64_t upgrade_legacy_caps(uint64_t stored_caps, bool& upgraded) {
+    if (stored_caps == capabilities::kFullPermissions) {
+        return stored_caps;
+    }
+    if (stored_caps == kLegacyAllCapabilities) {
+        upgraded = true;
+        return capabilities::kFullPermissions;
+    }
+    uint64_t normalized = capabilities::normalize_mask(stored_caps);
+    if (normalized != stored_caps) {
+        upgraded = true;
+    }
+    return normalized;
+}
+
 }  // namespace
 
 namespace users {
@@ -154,6 +188,10 @@ void init() {
         g_users[i].active = false;
         g_users[i].allowed_caps = 0;
         g_users[i].generation = 0;
+        g_users[i].password_iterations = 0;
+        g_users[i].password_set = false;
+        memset(g_users[i].password_salt, 0, sizeof(g_users[i].password_salt));
+        memset(g_users[i].password_hash, 0, sizeof(g_users[i].password_hash));
         g_users[i].name[0] = '\0';
     }
 }
@@ -166,6 +204,7 @@ User* create(const char* name, uint64_t allowed_caps) {
     if (len == 0 || len >= sizeof(g_users[0].name)) {
         return nullptr;
     }
+    allowed_caps = capabilities::normalize_mask(allowed_caps);
     if (find(name) != nullptr) {
         return nullptr;  // already exists
     }
@@ -177,6 +216,10 @@ User* create(const char* name, uint64_t allowed_caps) {
         string_util::copy(u.name, sizeof(u.name), name);
         u.allowed_caps = allowed_caps;
         u.generation = 1;
+        u.password_iterations = 0;
+        u.password_set = false;
+        memset(u.password_salt, 0, sizeof(u.password_salt));
+        memset(u.password_hash, 0, sizeof(u.password_hash));
         u.active = true;
         User* out = &u;
         ensure_home_directory(u.name);
@@ -218,7 +261,21 @@ bool allows(const User& user, uint64_t cap_bitmask) {
     if (!user.active) {
         return false;
     }
-    return (user.allowed_caps & cap_bitmask) == cap_bitmask;
+    return capabilities::mask_allows(user.allowed_caps, cap_bitmask);
+}
+
+bool set_password(User& user,
+                  const uint8_t* salt,
+                  const uint8_t* hash,
+                  uint32_t iterations) {
+    if (!user.active || salt == nullptr || hash == nullptr || iterations == 0) {
+        return false;
+    }
+    memcpy(user.password_salt, salt, sizeof(user.password_salt));
+    memcpy(user.password_hash, hash, sizeof(user.password_hash));
+    user.password_iterations = iterations;
+    user.password_set = true;
+    return persist();
 }
 
 void set_storage_path(const char* path) {
@@ -285,6 +342,11 @@ bool persist() {
         p.allowed_caps = u.allowed_caps;
         p.generation = u.generation;
         p.active = 1;
+        p.password_set = u.password_set ? 1 : 0;
+        p.password_algorithm = u.password_set ? 1 : 0;
+        p.password_iterations = u.password_iterations;
+        memcpy(p.password_salt, u.password_salt, sizeof(p.password_salt));
+        memcpy(p.password_hash, u.password_hash, sizeof(p.password_hash));
     }
 
     uint8_t buffer[sizeof(Header) + sizeof(PackedUser) * kMaxUsers];
@@ -350,12 +412,18 @@ bool load_from_disk() {
             return false;
         }
         memcpy(&hdr, buffer, sizeof(Header));
-        if (hdr.magic != kMagic || hdr.version != kVersion ||
-            hdr.entry_size != sizeof(PackedUser)) {
+        if (hdr.magic != kMagic) {
+            return false;
+        }
+        bool current = hdr.version == kVersion &&
+                       hdr.entry_size == sizeof(PackedUser);
+        bool legacy = hdr.version == kLegacyVersion &&
+                      hdr.entry_size == sizeof(PackedUserV1);
+        if (!current && !legacy) {
             return false;
         }
         size_t expected = sizeof(Header) +
-                          static_cast<size_t>(hdr.count) * sizeof(PackedUser);
+                          static_cast<size_t>(hdr.count) * hdr.entry_size;
         if (local_read_size < expected) {
             return false;
         }
@@ -386,14 +454,46 @@ bool load_from_disk() {
     memcpy(&hdr, buffer, sizeof(Header));
     init();
     size_t limit = (hdr.count > kMaxUsers) ? kMaxUsers : hdr.count;
-    const PackedUser* entries = reinterpret_cast<const PackedUser*>(buffer + sizeof(Header));
-    for (size_t i = 0; i < limit; ++i) {
-        const PackedUser& p = entries[i];
-        User* u = create(p.name, p.allowed_caps);
-        if (u != nullptr) {
-            u->generation = p.generation;
-            u->active = p.active != 0;
-            ensure_home_directory(u->name);
+    bool upgraded_legacy_entries = false;
+    if (hdr.version == kLegacyVersion) {
+        const PackedUserV1* entries =
+            reinterpret_cast<const PackedUserV1*>(buffer + sizeof(Header));
+        for (size_t i = 0; i < limit; ++i) {
+            const PackedUserV1& p = entries[i];
+            uint64_t allowed_caps = upgrade_legacy_caps(p.allowed_caps,
+                                                        upgraded_legacy_entries);
+            User* u = create(p.name, allowed_caps);
+            if (u != nullptr) {
+                u->generation = p.generation;
+                u->active = p.active != 0;
+                ensure_home_directory(u->name);
+            }
+        }
+        upgraded_legacy_entries = true;
+    } else {
+        const PackedUser* entries =
+            reinterpret_cast<const PackedUser*>(buffer + sizeof(Header));
+        for (size_t i = 0; i < limit; ++i) {
+            const PackedUser& p = entries[i];
+            uint64_t allowed_caps = upgrade_legacy_caps(p.allowed_caps,
+                                                        upgraded_legacy_entries);
+            User* u = create(p.name, allowed_caps);
+            if (u != nullptr) {
+                u->generation = p.generation;
+                u->active = p.active != 0;
+                if (p.password_set != 0 && p.password_algorithm == 1 &&
+                    p.password_iterations != 0) {
+                    u->password_set = true;
+                    u->password_iterations = p.password_iterations;
+                    memcpy(u->password_salt,
+                           p.password_salt,
+                           sizeof(u->password_salt));
+                    memcpy(u->password_hash,
+                           p.password_hash,
+                           sizeof(u->password_hash));
+                }
+                ensure_home_directory(u->name);
+            }
         }
     }
     log_message(LogLevel::Info,
@@ -401,7 +501,14 @@ bool load_from_disk() {
                 static_cast<unsigned int>(limit),
                 (limit == 1) ? "y" : "ies",
                 (loaded_path != nullptr) ? loaded_path : "(unknown)");
+    if (upgraded_legacy_entries) {
+        log_message(LogLevel::Info,
+                    "Users: upgraded legacy full-capability entries to current mask");
+    }
     g_loading_from_disk = false;
+    if (upgraded_legacy_entries) {
+        persist();
+    }
     return true;
 }
 

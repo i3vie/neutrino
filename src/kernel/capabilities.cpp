@@ -34,6 +34,7 @@ void init() {
 }
 
 Principal* create_principal(void* backing_user, CapabilityMask allowed_caps) {
+    allowed_caps = normalize_mask(allowed_caps);
     for (size_t i = 0; i < kMaxPrincipals; ++i) {
         Principal& p = g_principals[i];
         if (!p.active) {
@@ -82,7 +83,7 @@ bool principal_allows(const Principal& principal, CapabilityKind kind) {
         return false;
     }
     uint64_t bit = capability_bit(kind);
-    if ((principal.allowed_caps & bit) == 0) {
+    if (!mask_allows(principal.allowed_caps, bit)) {
         return false;
     }
     if (principal.backing_user != nullptr) {

@@ -60,6 +60,17 @@ struct Registry {
     uint32_t connections;
     uint32_t rx_segments;
     uint32_t tx_segments;
+    uint32_t inbound_syns;
+    uint32_t syn_ack_retransmits;
+    uint32_t established;
+    uint32_t wait_ack_mismatch;
+    uint32_t remote_resets;
+    uint32_t remote_fins;
+    uint32_t last_flags;
+    uint32_t last_seq;
+    uint32_t last_ack;
+    uint32_t expected_seq;
+    uint32_t expected_ack;
 };
 
 struct ListenRequest {
@@ -91,7 +102,7 @@ struct ConnectRequest {
     uint16_t remote_port;
     uint16_t reserved;
     uint8_t remote_ip[4];
-    uint8_t reserved2[4];
+    uint32_t endpoint_id;
 };
 
 struct ConnectResponse {
@@ -99,6 +110,7 @@ struct ConnectResponse {
     uint32_t connection_id;
     uint16_t local_port;
     uint16_t reserved;
+    uint32_t endpoint_id;
 };
 
 struct AcceptEvent {
@@ -106,7 +118,7 @@ struct AcceptEvent {
     uint16_t local_port;
     uint16_t remote_port;
     uint8_t remote_ip[4];
-    uint8_t reserved[4];
+    uint32_t endpoint_id;
 };
 
 struct DataEvent {
@@ -148,37 +160,65 @@ inline void init_message(Message& message, uint16_t type) {
 }
 
 inline bool write_message(uint32_t handle, const Message& message) {
-    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&message);
+    auto* bounce = static_cast<Message*>(
+        map_anonymous(sizeof(Message), MAP_WRITE));
+    if (bounce == nullptr) {
+        return false;
+    }
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(&message);
+    uint8_t* bounce_bytes = reinterpret_cast<uint8_t*>(bounce);
+    for (size_t i = 0; i < sizeof(Message); ++i) {
+        bounce_bytes[i] = src[i];
+    }
     size_t written = 0;
     while (written < sizeof(Message)) {
-        long result = descriptor_write(handle, bytes + written, sizeof(Message) - written);
+        long result = descriptor_write(handle,
+                                       bounce_bytes + written,
+                                       sizeof(Message) - written);
         if (result <= 0) {
+            unmap(bounce, sizeof(Message));
             return false;
         }
         written += static_cast<size_t>(result);
     }
+    unmap(bounce, sizeof(Message));
     return true;
 }
 
 inline bool read_message(uint32_t handle, Message& message) {
-    uint8_t* bytes = reinterpret_cast<uint8_t*>(&message);
+    auto* bounce = static_cast<Message*>(
+        map_anonymous(sizeof(Message), MAP_WRITE));
+    if (bounce == nullptr) {
+        return false;
+    }
+    uint8_t* bounce_bytes = reinterpret_cast<uint8_t*>(bounce);
     size_t total = 0;
     while (total < sizeof(Message)) {
-        long result = descriptor_read(handle, bytes + total, sizeof(Message) - total);
+        long result = descriptor_read(handle,
+                                      bounce_bytes + total,
+                                      sizeof(Message) - total);
         if (result == kDescriptorWouldBlock) {
             if (total == 0) {
+                unmap(bounce, sizeof(Message));
                 return false;
             }
             yield();
             continue;
         }
         if (result <= 0) {
+            unmap(bounce, sizeof(Message));
             return false;
         }
         total += static_cast<size_t>(result);
     }
-    return message.magic == kMessageMagic &&
-           message.version == kMessageVersion;
+    uint8_t* dest = reinterpret_cast<uint8_t*>(&message);
+    for (size_t i = 0; i < sizeof(Message); ++i) {
+        dest[i] = bounce_bytes[i];
+    }
+    bool ok = message.magic == kMessageMagic &&
+              message.version == kMessageVersion;
+    unmap(bounce, sizeof(Message));
+    return ok;
 }
 
 }  // namespace tcpd_protocol

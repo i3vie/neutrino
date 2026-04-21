@@ -6,12 +6,16 @@
 namespace capabilities {
 
 using CapabilityMask = uint64_t;
+constexpr CapabilityMask kFullPermissions = ~CapabilityMask{0};
 
 // Compile-time capability kinds understood by the kernel.
 enum class CapabilityKind : uint16_t {
     SysSettingsWrite = 0,
     BlockDeviceReadWrite = 1,
     ProcessSpawn = 2,
+    HardwareAccess = 3,
+    SecurityManage = 4,
+    Stream = 5,
     Count,
 };
 
@@ -52,6 +56,22 @@ Principal* principal_from_handle(uint64_t handle);
 bool capability_from_value(uint64_t value, CapabilityKind& out_kind);
 inline uint64_t capability_bit(CapabilityKind kind) {
     return 1ull << static_cast<uint16_t>(kind);
+}
+
+inline CapabilityMask normalize_mask(CapabilityMask mask) {
+    constexpr CapabilityMask kCurrentAllCapabilities =
+        (1ull << static_cast<uint16_t>(CapabilityKind::Count)) - 1;
+    return (mask == kCurrentAllCapabilities) ? kFullPermissions : mask;
+}
+
+inline bool mask_allows(CapabilityMask mask, CapabilityMask requested_bits) {
+    return mask == kFullPermissions ||
+           (mask & requested_bits) == requested_bits;
+}
+
+inline bool principal_allows_or_unconfined(const Principal* principal,
+                                           CapabilityKind kind) {
+    return principal == nullptr || principal_allows(*principal, kind);
 }
 
 CapabilityToken* issue_token(Principal& issuer, CapabilityKind kind);

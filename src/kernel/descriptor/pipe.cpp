@@ -1,5 +1,6 @@
 #include "../descriptor.hpp"
 
+#include "../../drivers/log/logging.hpp"
 #include "../../lib/mem.hpp"
 #include "../process.hpp"
 #include "../scheduler.hpp"
@@ -407,10 +408,16 @@ int64_t pipe_read(process::Process& proc,
         read_count = static_cast<size_t>(copied);
     }
 
-    if (read_count > 0 || async) {
+    if (read_count > 0) {
         wake_write_waiters_locked(*pipe);
         unlock_pipe(*pipe);
         return static_cast<int64_t>(read_count);
+    }
+
+    if (async) {
+        wake_write_waiters_locked(*pipe);
+        unlock_pipe(*pipe);
+        return kWouldBlock;
     }
 
     PipeWaiter* waiter = allocate_pipe_waiter();
@@ -477,10 +484,16 @@ int64_t pipe_write(process::Process& proc,
         written = static_cast<size_t>(copied);
     }
 
-    if (written > 0 || async) {
+    if (written > 0) {
         wake_read_waiters_locked(*pipe);
         unlock_pipe(*pipe);
         return static_cast<int64_t>(written);
+    }
+
+    if (async) {
+        wake_read_waiters_locked(*pipe);
+        unlock_pipe(*pipe);
+        return kWouldBlock;
     }
 
     PipeWaiter* waiter = allocate_pipe_waiter();
@@ -596,7 +609,7 @@ const Ops kPipeOps{
     .set_property = nullptr,
 };
 
-bool open_pipe(process::Process&,
+bool open_pipe(process::Process& proc,
                uint64_t flags,
                uint64_t existing_id,
                uint64_t,
@@ -616,7 +629,7 @@ bool open_pipe(process::Process&,
     }
 
     PipeEndpoint* endpoint =
-        allocate_pipe_endpoint(pipe, process::current(), want_read, want_write);
+        allocate_pipe_endpoint(pipe, &proc, want_read, want_write);
     if (endpoint == nullptr) {
         if (created_pipe) {
             pipe->in_use = false;

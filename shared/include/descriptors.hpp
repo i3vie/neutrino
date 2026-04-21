@@ -17,6 +17,7 @@ enum class Type : uint16_t {
     Vty         = 0x050,
     CpuStats    = 0x060,
     NetDevice   = 0x070,
+    NetEndpoint = 0x071,
 };
 
 enum class Flag : uint64_t {
@@ -28,6 +29,7 @@ enum class Flag : uint64_t {
     EventSource = 1ull << 9,
     Device      = 1ull << 10,
     Block       = 1ull << 11,
+    Stream      = 1ull << 12,
 };
 
 enum class Property : uint32_t {
@@ -49,6 +51,7 @@ enum class Property : uint32_t {
     NetDeviceInfo     = 0x00060001,
     NetIpv4Config     = 0x00060002,
     NetDeviceDebug    = 0x00060003,
+    NetEndpointInfo   = 0x00070001,
 };
 
 enum KeyboardEventFlag : uint8_t {
@@ -183,7 +186,7 @@ struct NetIpv4Config {
     uint8_t address[4];
     uint8_t netmask[4];
     uint8_t gateway[4];
-    uint8_t reserved[4];
+    uint8_t dns[4];
     uint32_t flags;
 };
 
@@ -199,6 +202,17 @@ struct NetDeviceDebug {
     uint32_t tx_completed;
     uint32_t rx_desc_seen;
     uint32_t rx_frames_passed;
+    uint32_t reserved;
+};
+
+enum NetEndpointOpenFlag : uint64_t {
+    kNetEndpointOpenService = 1ull << 0,
+};
+
+struct NetEndpointInfo {
+    uint32_t id;
+    uint32_t flags;
+    uint32_t role;
     uint32_t reserved;
 };
 
