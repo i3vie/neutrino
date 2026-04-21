@@ -22,7 +22,8 @@ QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
 QEMU_NET_DEVICE ?= e1000e
-QEMU_HOSTFWD ?=
+QEMU_STORAGE ?= ide
+QEMU_HOSTFWD ?= tcp::2222-:2222
 QEMU_TAP_IFACE ?= tap0
 QEMU_TAP_SCRIPT ?= no
 QEMU_TAP_DOWN_SCRIPT ?= no
@@ -37,9 +38,18 @@ endif
 QEMU_NET_ARGS := $(QEMU_NETDEV_USER) \
 		-device $(QEMU_NET_DEVICE),netdev=net0,mac=$(QEMU_NET_MAC)
 endif
+ifeq ($(QEMU_STORAGE),ahci)
+QEMU_STORAGE_ARGS := -device ahci,id=ahci0 \
+		-drive file=hdd.img,format=raw,if=none,id=disk0 \
+		-device ide-hd,drive=disk0,bus=ahci0.0
+QEMU_ROOT_DEVICE := AHCI_0_0
+else
+QEMU_STORAGE_ARGS := -drive file=hdd.img,format=raw,if=ide
+QEMU_ROOT_DEVICE := IDE_PM_0
+endif
 QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
-		-drive file=hdd.img,format=raw,if=ide \
+		$(QEMU_STORAGE_ARGS) \
 		-enable-kvm -display sdl \
 		-machine pc -cpu qemu64,+apic \
 		$(QEMU_NET_ARGS)
@@ -106,7 +116,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	printf '/Neutrino (disk install)\n' >> $(ISO_ROOT)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
-	printf '    cmdline: ROOT=IDE_PM_0\n\n' >> $(ISO_ROOT)/limine.conf
+	printf '    cmdline: ROOT=$(QEMU_ROOT_DEVICE)\n\n' >> $(ISO_ROOT)/limine.conf
 	printf '/Neutrino (live ISO)\n' >> $(ISO_ROOT)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
@@ -142,7 +152,7 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	printf '/Neutrino\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf
-	printf '    cmdline: ROOT=IDE_PM_0\n\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    cmdline: ROOT=$(QEMU_ROOT_DEVICE)\n\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '/Neutrino (rootfs in memory)\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf

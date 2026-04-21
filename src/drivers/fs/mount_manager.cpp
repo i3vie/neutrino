@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "drivers/log/logging.hpp"
+#include "drivers/storage/ahci_provider.hpp"
 #include "drivers/storage/ide_provider.hpp"
 #include "drivers/storage/ramdisk_provider.hpp"
 #include "drivers/fs/fat32/driver.hpp"
@@ -28,6 +29,7 @@ void ensure_builtins_registered() {
         return;
     }
     register_ramdisk_block_device_provider();
+    register_ahci_block_device_provider();
     register_ide_block_device_provider();
     register_fat32_filesystem_driver();
     g_builtins_registered = true;
@@ -84,7 +86,7 @@ bool mount_requested_filesystems(const char* root_spec,
     ensure_builtins_registered();
     descriptor::reset_block_device_registry();
 
-    BlockDevice discovered[kMaxDiscoveredDevices];
+    BlockDevice discovered[kMaxDiscoveredDevices]{};
     size_t device_count = 0;
 
     for (size_t i = 0; i < g_provider_count; ++i) {
