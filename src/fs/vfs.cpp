@@ -247,6 +247,29 @@ void set_root_mount(const char* name) {
     log_message(LogLevel::Info, "VFS: root mount alias set to '%s'", g_root_mount);
 }
 
+const char* root_mount_name() {
+    return g_root_mount;
+}
+
+bool has_explicit_mount_prefix(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+
+    const char* trimmed = skip_leading_slash(path);
+    if (trimmed == nullptr || *trimmed == '\0') {
+        return false;
+    }
+
+    const char* mount_end = trimmed;
+    while (*mount_end != '\0' && *mount_end != '/') {
+        ++mount_end;
+    }
+
+    size_t mount_len = static_cast<size_t>(mount_end - trimmed);
+    return find_mount(trimmed, mount_len) != nullptr;
+}
+
 size_t enumerate_mounts(const char** names, size_t max_names) {
     size_t count = 0;
     for (auto& mount : g_mounts) {

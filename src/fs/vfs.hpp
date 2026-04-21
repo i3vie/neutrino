@@ -70,6 +70,8 @@ bool register_mount(const char* name,
                     const FilesystemOps* ops,
                     void* fs_context);
 void set_root_mount(const char* name);
+const char* root_mount_name();
+bool has_explicit_mount_prefix(const char* path);
 size_t enumerate_mounts(const char** names, size_t max_names);
 
 bool list(const char* path,

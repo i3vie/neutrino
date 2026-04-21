@@ -110,7 +110,7 @@ bool map_slot_into_process(process::Process& proc,
     if (proc.cr3 == 0 || slot.physical_base == 0 || slot.buffer_bytes == 0) {
         return false;
     }
-    vm::Region region = vm::reserve_user_region(slot.buffer_bytes);
+    vm::Region region = vm::reserve_user_region(proc.cr3, slot.buffer_bytes);
     if (region.base == 0 || region.length == 0) {
         return false;
     }
