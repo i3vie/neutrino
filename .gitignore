@@ -5,6 +5,8 @@ build/
 userspace/programs/**/**.elf
 userspace/binary/
 userspace/deps/
+/browse.debug.elf
+/.codex
 
 # drive images
 /*.img
