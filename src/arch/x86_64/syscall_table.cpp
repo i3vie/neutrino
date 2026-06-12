@@ -38,6 +38,18 @@ struct ProcessSpawnConfig {
     ProcessStdioConfig stdio;
 };
 
+struct UserInfo {
+    uint64_t id_machine;
+    uint64_t id_local;
+    char name[32];
+    uint64_t allowed_caps;
+    uint64_t generation;
+    uint32_t password_set;
+    uint32_t active;
+};
+
+static_assert(sizeof(UserInfo) == 72, "UserInfo size mismatch");
+
 constexpr uint64_t kProcessChildFlagStdioConfig = 1ull << 0;
 
 uint64_t place_args_on_stack(process::Process& child, const char* args) {
@@ -1294,6 +1306,44 @@ Result handle_syscall(SyscallFrame& frame) {
                                     reinterpret_cast<uint64_t>(user_hash),
                                     sizeof(hash)) ||
                 !users::set_password(*user, salt, hash, iterations)) {
+                frame.rax = static_cast<uint64_t>(-1);
+            } else {
+                frame.rax = 0;
+            }
+            return Result::Continue;
+        }
+        case SystemCall::UserInfo: {
+            process::Process* proc = process::current();
+            if (proc == nullptr ||
+                !require_capability(*proc,
+                                    capabilities::CapabilityKind::SecurityManage,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            auto* user = reinterpret_cast<users::User*>(frame.rdi);
+            auto* user_info = reinterpret_cast<syscall::UserInfo*>(frame.rsi);
+            if (user == nullptr || user_info == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            syscall::UserInfo info{};
+            info.id_machine = user->id.machine;
+            info.id_local = user->id.local;
+            for (size_t i = 0; i < sizeof(info.name); ++i) {
+                info.name[i] = user->name[i];
+                if (user->name[i] == '\0') {
+                    break;
+                }
+            }
+            info.allowed_caps = user->allowed_caps;
+            info.generation = user->generation;
+            info.password_set = user->password_set ? 1u : 0u;
+            info.active = user->active ? 1u : 0u;
+            if (!vm::copy_to_user(proc->cr3,
+                                  reinterpret_cast<uint64_t>(user_info),
+                                  &info,
+                                  sizeof(info))) {
                 frame.rax = static_cast<uint64_t>(-1);
             } else {
                 frame.rax = 0;

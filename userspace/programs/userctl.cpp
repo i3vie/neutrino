@@ -42,6 +42,31 @@ void print_hex(const char* label, uint64_t v) {
     print(label); print(buf); print("\n");
 }
 
+void u64_to_dec(uint64_t v, char* out, size_t out_sz) {
+    if (out_sz == 0) return;
+    char temp[32];
+    size_t idx = 0;
+    if (v == 0) {
+        temp[idx++] = '0';
+    } else {
+        while (v > 0 && idx < sizeof(temp)) {
+            temp[idx++] = static_cast<char>('0' + (v % 10));
+            v /= 10;
+        }
+    }
+    size_t n = idx < out_sz - 1 ? idx : out_sz - 1;
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = temp[idx - 1 - i];
+    }
+    out[n] = '\0';
+}
+
+void print_dec(const char* label, uint64_t v) {
+    char buf[32];
+    u64_to_dec(v, buf, sizeof(buf));
+    print(label); print(buf); print("\n");
+}
+
 bool parse_u64(const char* s, uint64_t& out) {
     if (!s || !*s) return false;
     uint64_t val = 0;
@@ -177,7 +202,7 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
     };
 
     if (tok_count < 1) {
-        print("usage: userctl create <name> <capmask>|find <name>|bump <name>|passwd <name>\n");
+        print("usage: userctl create <name> <capmask>|find <name>|bump <name>|passwd <name>|info <name>\n");
         return 1;
     }
 
@@ -271,6 +296,34 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
             return 1;
         }
         print("password updated\n");
+        return 0;
+    }
+
+    if (token_equals(0, "info")) {
+        if (tok_count < 2) {
+            print("info needs <name>\n");
+            return 1;
+        }
+        char name_buf[33];
+        copy_token(1, name_buf, sizeof(name_buf));
+        void* user = user_find(name_buf);
+        if (!user) {
+            print("not found\n");
+            return 1;
+        }
+        UserInfo info;
+        long r = user_info(user, &info);
+        if (r < 0) {
+            print("info failed\n");
+            return 1;
+        }
+        print("name: "); print(info.name); print("\n");
+        print_dec("id.machine: ", info.id_machine);
+        print_dec("id.local: ", info.id_local);
+        print_hex("allowed_caps: ", info.allowed_caps);
+        print_dec("generation: ", info.generation);
+        print_dec("password_set: ", info.password_set);
+        print_dec("active: ", info.active);
         return 0;
     }
 

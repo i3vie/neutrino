@@ -48,6 +48,7 @@ enum class SystemCall : uint64_t {
     UserFind              = 38,
     UserBumpGeneration    = 39,
     UserSetPassword       = 40,
+    UserInfo              = 47,
     DirectoryCreate       = 41,
     FileRemove            = 42,
     DirectoryRemove       = 43,

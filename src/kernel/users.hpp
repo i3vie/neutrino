@@ -5,7 +5,13 @@
 
 namespace users {
 
+struct UserId {
+    uint64_t machine;
+    uint64_t local;
+};
+
 struct User {
+    UserId id;
     char name[32];
     uint64_t allowed_caps;
     uint64_t generation;
@@ -16,11 +22,23 @@ struct User {
     bool active;
 };
 
+struct UserInfo {
+    uint64_t id_machine;
+    uint64_t id_local;
+    char name[32];
+    uint64_t allowed_caps;
+    uint64_t generation;
+    uint32_t password_set;
+    uint32_t active;
+};
+
 constexpr size_t kMaxUsers = 32;
 
 void init();
 User* create(const char* name, uint64_t allowed_caps);
 User* find(const char* name);
+User* find(const UserId& id);
+const UserId& machine_id();
 void bump_generation(User& user);
 bool allows(const User& user, uint64_t cap_bitmask);
 bool set_password(User& user,

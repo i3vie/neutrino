@@ -36,6 +36,15 @@ struct UserStoreHeader {
     uint32_t count;
 };
 
+struct UserStoreHeaderV3 {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t entry_size;
+    uint32_t count;
+    uint64_t next_user_id;
+    uint64_t machine_id;
+};
+
 struct PackedUserV1 {
     char name[kMaxUserNameLength];
     uint64_t allowed_caps;
@@ -302,18 +311,31 @@ bool load_login_users(LoginUsers& users) {
         ensure_login_user(users, kRootUserName);
         return users.count != 0;
     }
-    bool current = header.version == 2 &&
-                   header.entry_size == sizeof(PackedUser);
+    bool current_v2 = header.version == 2 &&
+                      header.entry_size == sizeof(PackedUser);
+    bool current_v3 = header.version == 3 &&
+                      header.entry_size == sizeof(PackedUser);
     bool legacy = header.version == 1 &&
                   header.entry_size == sizeof(PackedUserV1);
-    if (!current && !legacy) {
+    if (!current_v2 && !current_v3 && !legacy) {
         ensure_login_user(users, kRootUserName);
         return users.count != 0;
     }
 
-    size_t available =
-        (len - sizeof(UserStoreHeader)) / header.entry_size;
+    size_t available = 0;
     size_t count = header.count;
+    if (current_v3) {
+        if (len < sizeof(UserStoreHeaderV3)) {
+            ensure_login_user(users, kRootUserName);
+            return users.count != 0;
+        }
+        available = (len - sizeof(UserStoreHeaderV3)) / header.entry_size;
+    } else {
+        available = (len - sizeof(UserStoreHeader)) / header.entry_size;
+    }
+    if (count > available) {
+        count = available;
+    }
     if (count > available) {
         count = available;
     }
@@ -331,8 +353,8 @@ bool load_login_users(LoginUsers& users) {
             ensure_login_user(users, entries[i].name);
         }
     } else {
-        const PackedUser* entries =
-            reinterpret_cast<const PackedUser*>(buffer + sizeof(UserStoreHeader));
+        const PackedUser* entries = reinterpret_cast<const PackedUser*>(
+            buffer + (current_v3 ? sizeof(UserStoreHeaderV3) : sizeof(UserStoreHeader)));
         for (size_t i = 0; i < count; ++i) {
             if (entries[i].active == 0 || entries[i].name[0] == '\0') {
                 continue;

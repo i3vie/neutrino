@@ -54,6 +54,7 @@ enum class SystemCall : long {
     TimeGet              = 44,
     TimeSleepTicks       = 45,
     DescriptorWait       = 46,
+    UserInfo             = 47,
 };
 
 enum : uint32_t {
@@ -81,6 +82,16 @@ struct ProcessStdioConfig {
 struct ProcessSpawnConfig {
     uint64_t cwd_ptr;
     ProcessStdioConfig stdio;
+};
+
+struct UserInfo {
+    uint64_t id_machine;
+    uint64_t id_local;
+    char name[32];
+    uint64_t allowed_caps;
+    uint64_t generation;
+    uint32_t password_set;
+    uint32_t active;
 };
 
 struct DirEntry {
@@ -725,6 +736,12 @@ static inline long user_set_password(void* user,
                         reinterpret_cast<long>(salt),
                         reinterpret_cast<long>(hash),
                         static_cast<long>(iterations));
+}
+
+static inline long user_info(void* user, UserInfo* out) {
+    return raw_syscall2(SystemCall::UserInfo,
+                        reinterpret_cast<long>(user),
+                        reinterpret_cast<long>(out));
 }
 
 static inline void* principal_create(void* backing_user, uint64_t allowed_caps) {
