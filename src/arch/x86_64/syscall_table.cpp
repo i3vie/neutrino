@@ -8,6 +8,7 @@
 #include "../../kernel/process.hpp"
 #include "../../kernel/path_util.hpp"
 #include "../../kernel/scheduler.hpp"
+#include "../../kernel/time.hpp"
 #include "../../kernel/vm.hpp"
 #include "../../fs/vfs.hpp"
 #include "../../lib/mem.hpp"
@@ -20,7 +21,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 0;
-constexpr uint64_t kAbiMinor = 2;
+constexpr uint64_t kAbiMinor = 5;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
@@ -198,6 +199,11 @@ bool descriptor_type_requires_hardware_access(uint32_t type) {
            type == descriptor::kTypeNetDevice;
 }
 
+bool descriptor_type_requires_monitor_access(uint32_t type) {
+    return type == descriptor::kTypeCpuStats ||
+           type == descriptor::kTypeTaskStats;
+}
+
 uint32_t duplicate_stream_descriptor(process::Process& from,
                                      process::Process& to,
                                      uint32_t handle,
@@ -331,6 +337,13 @@ Result handle_syscall(SyscallFrame& frame) {
             if (descriptor_type_requires_hardware_access(type) &&
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::HardwareAccess,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (descriptor_type_requires_monitor_access(type) &&
+                !require_capability(*proc,
+                                    capabilities::CapabilityKind::Monitor,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -486,6 +499,27 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rdx,
                 frame.r10);
             frame.rax = (result == 0) ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DescriptorWait: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            int result = descriptor::wait(*proc,
+                                          proc->descriptors,
+                                          frame.rdi,
+                                          static_cast<size_t>(frame.rsi));
+            if (result == descriptor::kWouldBlock) {
+                frame.rax = static_cast<uint64_t>(
+                    static_cast<int64_t>(result));
+                if (proc->state != process::State::Blocked) {
+                    return Result::Continue;
+                }
+                return Result::Reschedule;
+            }
+            frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
             return Result::Continue;
         }
         case SystemCall::FileOpen: {
@@ -936,6 +970,89 @@ Result handle_syscall(SyscallFrame& frame) {
             int32_t handle = file_io::create_file_at(*proc, parent, name);
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(handle));
             return Result::Continue;
+        }
+        case SystemCall::DirectoryCreate: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            frame.rax = file_io::create_directory(*proc, path)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::FileRemove: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            frame.rax = file_io::remove_file(*proc, path)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::DirectoryRemove: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            const char* path = reinterpret_cast<const char*>(frame.rdi);
+            frame.rax = file_io::remove_directory(*proc, path)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::TimeGet: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            auto* out_time =
+                reinterpret_cast<NeutrinoWallTime*>(frame.rdi);
+            uint64_t out_size = frame.rsi;
+            if (out_time == nullptr || out_size < sizeof(NeutrinoWallTime)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            NeutrinoWallTime snapshot{};
+            if (!timekeeping::snapshot(snapshot) ||
+                !vm::copy_to_user(proc->cr3,
+                                  reinterpret_cast<uint64_t>(out_time),
+                                  &snapshot,
+                                  sizeof(snapshot))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::TimeSleepTicks: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            uint64_t ticks = frame.rdi;
+            if (ticks == 0) {
+                frame.rax = 0;
+                return Result::Continue;
+            }
+
+            proc->sleep_until_tick = timekeeping::tick_count() + ticks;
+            proc->waiting_on = nullptr;
+            proc->state = process::State::Blocked;
+            frame.rax = 0;
+            return Result::Reschedule;
         }
         case SystemCall::MapAnonymous: {
             process::Process* proc = process::current();

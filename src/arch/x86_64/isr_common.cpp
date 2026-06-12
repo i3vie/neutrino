@@ -11,6 +11,7 @@
 #include "../../kernel/interrupts.hpp"
 #include "../../kernel/process.hpp"
 #include "../../kernel/scheduler.hpp"
+#include "../../kernel/time.hpp"
 #include "../../kernel/vm.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 #include "percpu.hpp"
@@ -94,21 +95,36 @@ extern "C" void isr_handler(InterruptFrame* regs) {
     }
 
     if (regs->int_no >= 32) {
-        percpu::record_irq();
-        if (interrupts::dispatch(static_cast<uint8_t>(regs->int_no))) {
-            lapic::eoi();
-            return;
-        }
         uint64_t irq = regs->int_no - 32;
         if (irq == 0) {
             bool user_mode = (regs->cs & 0x3) != 0;
             bool has_proc = process::current() != nullptr;
             percpu::record_tick(user_mode, has_proc);
+            if (has_proc) {
+                process::record_tick(user_mode);
+            }
+            timekeeping::tick_pit();
             scheduler::tick(*regs);
             pic::send_eoi(0);
             lapic::eoi();
             return;
-        } else if (irq == 1) {
+        } else if (regs->int_no == 0x40) {
+            bool user_mode = (regs->cs & 0x3) != 0;
+            bool has_proc = process::current() != nullptr;
+            percpu::record_tick(user_mode, has_proc);
+            if (has_proc) {
+                process::record_tick(user_mode);
+            }
+            scheduler::tick(*regs);
+            lapic::eoi();
+            return;
+        }
+        percpu::record_irq();
+        if (interrupts::dispatch(static_cast<uint8_t>(regs->int_no))) {
+            lapic::eoi();
+            return;
+        }
+        if (irq == 1) {
             keyboard::handle_irq();
             if (!ioapic::handles_irq(1)) {
                 pic::send_eoi(1);
@@ -120,13 +136,6 @@ extern "C" void isr_handler(InterruptFrame* regs) {
             if (!ioapic::handles_irq(12)) {
                 pic::send_eoi(12);
             }
-            lapic::eoi();
-            return;
-        } else if (regs->int_no == 0x40) {
-            bool user_mode = (regs->cs & 0x3) != 0;
-            bool has_proc = process::current() != nullptr;
-            percpu::record_tick(user_mode, has_proc);
-            scheduler::tick(*regs);
             lapic::eoi();
             return;
         }

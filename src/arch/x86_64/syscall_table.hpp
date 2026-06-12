@@ -48,6 +48,12 @@ enum class SystemCall : uint64_t {
     UserFind              = 38,
     UserBumpGeneration    = 39,
     UserSetPassword       = 40,
+    DirectoryCreate       = 41,
+    FileRemove            = 42,
+    DirectoryRemove       = 43,
+    TimeGet               = 44,
+    TimeSleepTicks        = 45,
+    DescriptorWait        = 46,
 };
 
 Result handle_syscall(SyscallFrame& frame);

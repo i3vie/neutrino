@@ -7,6 +7,7 @@
 #include "drivers/limine/limine_requests.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "lib/mem.hpp"
+#include "kernel/error.hpp"
 
 extern "C" char kernel_start[];
 extern "C" char kernel_end[];
@@ -77,11 +78,7 @@ void* alloc_boot_page() {
         return v;
     }
     if (boot_pool_off + PAGE_SIZE > BOOT_POOL_SIZE) {
-        if (kconsole != nullptr) {
-            kconsole->set_color(0xFFFF0000, 0x00000000);
-            kconsole->printf("Paging bootstrap pool exhausted, halting.\n");
-        }
-        halt_system();
+        error_screen::display("PAGING_", "BOOT_POOL_EXHAUSTED", nullptr);
     }
 
     void* v = &boot_pool[boot_pool_off];
@@ -136,7 +133,7 @@ PagingStructurePage alloc_paging_structure_page() {
                 kconsole->printf("Paging structure allocation failed, free=%llu pages, halting.\n",
                                  static_cast<unsigned long long>(free_pages));
             }
-            halt_system();
+            error_screen::display("PAGING_", "STRUCTURE_ALLOCATION_FAILED", nullptr);
         }
         return PagingStructurePage{paging_phys_to_virt(phys), phys};
     }
@@ -359,7 +356,7 @@ bool should_map(uint64_t type) {
 void paging_init() {
     if (memmap_request.response == nullptr ||
         kernel_addr_request.response == nullptr) {
-        halt_system();
+        error_screen::display("PAGING_", "LIMINE_REQUEST_FAILED", nullptr);
     }
     if (hhdm_request.response != nullptr) {
         g_hhdm_offset = hhdm_request.response->offset;
@@ -371,7 +368,7 @@ void paging_init() {
     g_kernel_virt_base = reinterpret_cast<uint64_t>(&kernel_start);
     uint64_t kernel_virtual_end = reinterpret_cast<uint64_t>(&kernel_end);
     if (kernel_virtual_end < g_kernel_virt_base) {
-        halt_system();
+        error_screen::display("PAGING_", "KERNEL_ADDRESS_INVALID", nullptr);
     }
     g_kernel_size =
         align_up(kernel_virtual_end - g_kernel_virt_base, PAGE_SIZE);

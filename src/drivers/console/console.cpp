@@ -336,6 +336,7 @@ Console::Console(uint32_t framebuffer_handle)
       cursor_y(0),
       fg_color(0xFFFFFFFF),
       bg_color(0x00000000),
+      text_flags(0),
       columns(0),
       rows(0),
       text_width(0),
@@ -455,6 +456,25 @@ void Console::draw_char(char c, size_t x, size_t y) {
                   bg_color);
     }
 
+    if ((text_flags & descriptor_defs::kTextCellUnderline) != 0) {
+        size_t underline_y = base_py + glyph_height;
+        if (underline_y >= target->height && target->height != 0) {
+            underline_y = target->height - 1;
+        }
+        if (underline_y < target->height) {
+            size_t underline_h = static_cast<size_t>(scale);
+            if (underline_y + underline_h > target->height) {
+                underline_h = target->height - underline_y;
+            }
+            fill_rect(target,
+                      base_px,
+                      underline_y,
+                      glyph_draw_width,
+                      underline_h,
+                      fg_color);
+        }
+    }
+
     if (back_buffer != nullptr) {
         size_t flush_height = glyph_height + kLineSpacing;
         size_t remaining_height = (base_py < target->height)
@@ -477,6 +497,10 @@ void Console::draw_char(char c, size_t x, size_t y) {
 void Console::set_color(uint32_t fg, uint32_t bg) {
     fg_color = fg;
     bg_color = bg;
+}
+
+void Console::set_text_flags(uint8_t flags) {
+    text_flags = flags;
 }
 
 void Console::scroll() {

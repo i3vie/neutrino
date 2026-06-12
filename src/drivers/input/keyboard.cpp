@@ -89,6 +89,7 @@ void enqueue(uint32_t slot, const descriptor_defs::KeyboardEvent& event) {
     }
     buf.data[buf.head] = event;
     buf.head = next;
+    descriptor::wake_waiters();
 }
 
 bool dequeue(uint32_t slot, descriptor_defs::KeyboardEvent& event) {
@@ -260,6 +261,14 @@ size_t read(uint32_t slot,
         buffer[count++] = event;
     }
     return count;
+}
+
+bool has_data(uint32_t slot) {
+    if (slot >= kInputSlots) {
+        return false;
+    }
+    const SlotBuffer& buf = g_buffers[slot];
+    return buf.head != buf.tail;
 }
 
 void inject_scancode(uint8_t scancode, bool extended, bool pressed) {

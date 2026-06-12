@@ -791,6 +791,10 @@ bool zero_range(Fat32Volume& volume,
     return true;
 }
 
+bool resolve_entry(Fat32Volume& volume,
+                   const char* path,
+                   Fat32DirEntry& out_entry);
+
 bool update_directory_entry(Fat32Volume& volume,
                             const Fat32DirEntry& entry) {
     uint32_t entries_per_cluster32 =
@@ -844,6 +848,152 @@ bool update_directory_entry(Fat32Volume& volume,
     *reinterpret_cast<uint32_t*>(raw + 28) = entry.size;
 
     return write_sector(volume.device, lba + sector_offset, sector_buffer);
+}
+
+bool with_directory_entry_sector(Fat32Volume& volume,
+                                 const Fat32DirEntry& entry,
+                                 uint8_t*& out_raw,
+                                 uint32_t& out_lba) {
+    uint32_t entries_per_cluster32 =
+        static_cast<uint32_t>(entries_per_cluster(volume));
+    if (entries_per_cluster32 == 0) {
+        return false;
+    }
+
+    uint32_t raw_index = entry.raw_entry_index;
+    uint32_t cluster_offset = raw_index / entries_per_cluster32;
+    uint32_t index_in_cluster = raw_index % entries_per_cluster32;
+
+    uint32_t cluster = entry.directory_cluster;
+    if (cluster < 2) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < cluster_offset; ++i) {
+        uint32_t next = read_fat_entry(volume, cluster);
+        if (next == kFatBadCluster || next >= kFatEoc) {
+            return false;
+        }
+        cluster = next;
+    }
+
+    uint32_t lba = cluster_to_lba(volume, cluster);
+    uint32_t entry_byte = index_in_cluster * 32;
+    uint32_t sector_offset = entry_byte / 512;
+    uint32_t byte_offset = entry_byte % 512;
+
+    out_lba = lba + sector_offset;
+    if (!read_sector(volume.device, out_lba, sector_buffer)) {
+        return false;
+    }
+    out_raw = sector_buffer + byte_offset;
+    return true;
+}
+
+bool mark_directory_entry_deleted(Fat32Volume& volume,
+                                  const Fat32DirEntry& entry) {
+    uint8_t* raw = nullptr;
+    uint32_t lba = 0;
+    if (!with_directory_entry_sector(volume, entry, raw, lba)) {
+        return false;
+    }
+    raw[0] = 0xE5;
+    return write_sector(volume.device, lba, sector_buffer);
+}
+
+bool free_cluster_chain(Fat32Volume& volume, uint32_t first_cluster) {
+    if (first_cluster < 2) {
+        return true;
+    }
+
+    uint32_t max_cluster = volume.total_clusters + 1;
+    uint32_t cluster = first_cluster;
+    uint32_t traversed = 0;
+    while (cluster >= 2 && cluster <= max_cluster) {
+        if (++traversed > volume.total_clusters + 1) {
+            log_message(LogLevel::Warn, "FAT32: cluster chain loop detected");
+            return false;
+        }
+        uint32_t next = read_fat_entry(volume, cluster);
+        if (next == kFatBadCluster) {
+            log_message(LogLevel::Warn, "FAT32: bad cluster in chain");
+            return false;
+        }
+        if (!write_fat_entry(volume, cluster, kFatFreeCluster)) {
+            return false;
+        }
+        if (cluster < volume.next_free_cluster) {
+            volume.next_free_cluster = cluster;
+        }
+        if (next >= kFatEoc) {
+            return true;
+        }
+        cluster = next;
+    }
+    return false;
+}
+
+bool directory_is_empty(Fat32Volume& volume, uint32_t directory_cluster) {
+    bool empty = true;
+    bool ok = iterate_directory(volume, directory_cluster,
+                                [&](const uint8_t* raw,
+                                    uint32_t,
+                                    uint32_t,
+                                    uint32_t,
+                                    const char* long_name) -> IterationResult {
+        const char* entry_long =
+            (long_name != nullptr && long_name[0] != '\0') ? long_name : nullptr;
+        char entry_name[64] = {0};
+        format_83_name(raw, entry_name);
+        const char* name = (entry_long != nullptr) ? entry_long : entry_name;
+        if (names_equal(name, ".") || names_equal(name, "..")) {
+            return IterationResult::Continue;
+        }
+        empty = false;
+        return IterationResult::StopSuccess;
+    });
+    return ok && empty;
+}
+
+bool fat32_remove_file(Fat32Volume& volume, const char* path) {
+    if (!volume.mounted || path == nullptr) {
+        return false;
+    }
+
+    Fat32DirEntry entry{};
+    if (!resolve_entry(volume, path, entry)) {
+        return false;
+    }
+    if ((entry.attributes & ATTR_DIRECTORY) != 0) {
+        return false;
+    }
+
+    if (!mark_directory_entry_deleted(volume, entry)) {
+        return false;
+    }
+    return free_cluster_chain(volume, entry.first_cluster);
+}
+
+bool fat32_remove_directory(Fat32Volume& volume, const char* path) {
+    if (!volume.mounted || path == nullptr) {
+        return false;
+    }
+
+    Fat32DirEntry entry{};
+    if (!resolve_entry(volume, path, entry)) {
+        return false;
+    }
+    if ((entry.attributes & ATTR_DIRECTORY) == 0) {
+        return false;
+    }
+    if (!directory_is_empty(volume, entry.first_cluster)) {
+        return false;
+    }
+
+    if (!mark_directory_entry_deleted(volume, entry)) {
+        return false;
+    }
+    return free_cluster_chain(volume, entry.first_cluster);
 }
 
 const char* trim_leading_slashes(const char* path) {
@@ -1436,60 +1586,49 @@ bool fat32_read_file_range(Fat32Volume& volume, const Fat32DirEntry& entry,
         return true;
     }
 
-    uint32_t cluster = entry.first_cluster;
-    uint32_t consumed = 0;
     const size_t cluster_size = static_cast<size_t>(volume.sectors_per_cluster) *
                                 512u;
+    if (cluster_size == 0) {
+        return false;
+    }
     if (cluster_size > sizeof(cluster_buffer)) {
         log_message(LogLevel::Warn,
                     "FAT32: cluster size %zu exceeds buffer capacity",
                     cluster_size);
         return false;
     }
-    uint8_t* out_ptr = static_cast<uint8_t*>(buffer);
 
-    while (consumed < entry.size) {
+    uint32_t cluster_index = offset / static_cast<uint32_t>(cluster_size);
+    size_t cluster_offset =
+        static_cast<size_t>(offset % static_cast<uint32_t>(cluster_size));
+    uint32_t cluster = 0;
+    if (!get_cluster_at_index(volume, entry.first_cluster, cluster_index, cluster)) {
+        return false;
+    }
+
+    uint8_t* out_ptr = static_cast<uint8_t*>(buffer);
+    size_t remaining_in_file = static_cast<size_t>(entry.size - offset);
+    size_t remaining =
+        (buffer_size < remaining_in_file) ? buffer_size : remaining_in_file;
+
+    while (remaining != 0) {
         uint32_t lba = cluster_to_lba(volume, cluster);
         if (!read_sectors(volume.device, lba, volume.sectors_per_cluster,
                           cluster_buffer)) {
             return false;
         }
 
-        size_t bytes_in_cluster =
-            static_cast<size_t>(entry.size - consumed);
-        if (bytes_in_cluster > cluster_size) {
-            bytes_in_cluster = cluster_size;
+        size_t available = cluster_size - cluster_offset;
+        if (available > remaining) {
+            available = remaining;
         }
 
-        bool skip_cluster = false;
-        size_t start = 0;
-        if (offset > consumed) {
-            if (offset >= consumed + bytes_in_cluster) {
-                consumed += static_cast<uint32_t>(bytes_in_cluster);
-                skip_cluster = true;
-            } else {
-                start = static_cast<size_t>(offset - consumed);
-            }
-        }
-
-        if (!skip_cluster) {
-            size_t available = bytes_in_cluster - start;
-            if (available > buffer_size) {
-                available = buffer_size;
-            }
-
-            if (available > 0) {
-                memcpy(out_ptr, cluster_buffer + start, available);
-                out_ptr += available;
-                out_size += available;
-                buffer_size -= available;
-            }
-
-            consumed += static_cast<uint32_t>(bytes_in_cluster);
-            if (buffer_size == 0 || consumed >= entry.size) {
-                return true;
-            }
-        } else if (consumed >= entry.size) {
+        memcpy(out_ptr, cluster_buffer + cluster_offset, available);
+        out_ptr += available;
+        out_size += available;
+        remaining -= available;
+        cluster_offset = 0;
+        if (remaining == 0) {
             return true;
         }
 
@@ -1657,6 +1796,9 @@ constexpr size_t kMaxOpenDirectories = 32;
 struct Fat32FileContext {
     Fat32Volume* volume;
     Fat32DirEntry entry;
+    uint32_t cached_cluster;
+    uint32_t cached_cluster_index;
+    bool cache_valid;
 };
 
 struct Fat32DirectoryContext {
@@ -1677,10 +1819,52 @@ Fat32FileContext* allocate_file_context() {
             g_file_context_used[i] = true;
             g_file_contexts[i].volume = nullptr;
             memset(&g_file_contexts[i].entry, 0, sizeof(Fat32DirEntry));
+            g_file_contexts[i].cached_cluster = 0;
+            g_file_contexts[i].cached_cluster_index = 0;
+            g_file_contexts[i].cache_valid = false;
             return &g_file_contexts[i];
         }
     }
     return nullptr;
+}
+
+bool get_file_context_cluster_at_index(Fat32FileContext& ctx,
+                                       uint32_t index,
+                                       uint32_t& out_cluster) {
+    if (ctx.volume == nullptr) {
+        return false;
+    }
+
+    uint32_t cluster = ctx.entry.first_cluster;
+    uint32_t cluster_index = 0;
+    if (ctx.cache_valid && ctx.cached_cluster >= 2 &&
+        ctx.cached_cluster_index <= index) {
+        cluster = ctx.cached_cluster;
+        cluster_index = ctx.cached_cluster_index;
+    }
+
+    while (cluster_index < index) {
+        uint32_t next = read_fat_entry(*ctx.volume, cluster);
+        if (next == kFatBadCluster) {
+            log_message(LogLevel::Warn, "FAT32: bad cluster in chain");
+            return false;
+        }
+        if (next >= kFatEoc) {
+            return false;
+        }
+        cluster = next;
+        ++cluster_index;
+        if (cluster_index > ctx.volume->total_clusters + 1) {
+            log_message(LogLevel::Warn, "FAT32: cluster traversal overflow");
+            return false;
+        }
+    }
+
+    ctx.cached_cluster = cluster;
+    ctx.cached_cluster_index = cluster_index;
+    ctx.cache_valid = true;
+    out_cluster = cluster;
+    return true;
 }
 
 void release_file_context(Fat32FileContext* ctx) {
@@ -1821,6 +2005,22 @@ bool fat32_vfs_create_directory(void* fs_context, const char* path) {
     return true;
 }
 
+bool fat32_vfs_remove_file(void* fs_context, const char* path) {
+    auto* volume = static_cast<Fat32Volume*>(fs_context);
+    if (volume == nullptr || path == nullptr || *path == '\0') {
+        return false;
+    }
+    return fat32_remove_file(*volume, path);
+}
+
+bool fat32_vfs_remove_directory(void* fs_context, const char* path) {
+    auto* volume = static_cast<Fat32Volume*>(fs_context);
+    if (volume == nullptr || path == nullptr || *path == '\0') {
+        return false;
+    }
+    return fat32_remove_directory(*volume, path);
+}
+
 bool fat32_vfs_read_file(void* file_context,
                          uint64_t offset,
                          void* buffer,
@@ -1840,13 +2040,77 @@ bool fat32_vfs_read_file(void* file_context,
     if (offset32 >= ctx->entry.size) {
         return true;
     }
+    if (buffer_size == 0) {
+        return true;
+    }
 
-    return fat32_read_file_range(*ctx->volume,
-                                 ctx->entry,
-                                 offset32,
-                                 buffer,
-                                 buffer_size,
-                                 out_size);
+    Fat32Volume& volume = *ctx->volume;
+    const size_t cluster_size =
+        static_cast<size_t>(volume.sectors_per_cluster) * 512u;
+    if (cluster_size == 0) {
+        return false;
+    }
+    if (cluster_size > sizeof(cluster_buffer)) {
+        log_message(LogLevel::Warn,
+                    "FAT32: cluster size %zu exceeds buffer capacity",
+                    cluster_size);
+        return false;
+    }
+
+    uint32_t cluster_index = offset32 / static_cast<uint32_t>(cluster_size);
+    size_t cluster_offset =
+        static_cast<size_t>(offset32 % static_cast<uint32_t>(cluster_size));
+    uint32_t cluster = 0;
+    if (!get_file_context_cluster_at_index(*ctx, cluster_index, cluster)) {
+        return false;
+    }
+
+    auto* out_ptr = static_cast<uint8_t*>(buffer);
+    size_t remaining_in_file = static_cast<size_t>(ctx->entry.size - offset32);
+    size_t remaining =
+        (buffer_size < remaining_in_file) ? buffer_size : remaining_in_file;
+
+    while (remaining != 0) {
+        uint32_t lba = cluster_to_lba(volume, cluster);
+        if (!read_sectors(volume.device, lba, volume.sectors_per_cluster,
+                          cluster_buffer)) {
+            return false;
+        }
+
+        size_t available = cluster_size - cluster_offset;
+        if (available > remaining) {
+            available = remaining;
+        }
+
+        memcpy(out_ptr, cluster_buffer + cluster_offset, available);
+        out_ptr += available;
+        out_size += available;
+        remaining -= available;
+        cluster_offset = 0;
+        ctx->cached_cluster = cluster;
+        ctx->cached_cluster_index = cluster_index;
+        ctx->cache_valid = true;
+        if (remaining == 0) {
+            return true;
+        }
+
+        uint32_t next = read_fat_entry(volume, cluster);
+        if (next >= kFatEoc) {
+            return true;
+        }
+        if (next == kFatBadCluster) {
+            log_message(LogLevel::Warn, "FAT32: bad cluster in chain");
+            return false;
+        }
+        cluster = next;
+        ++cluster_index;
+        if (cluster_index > volume.total_clusters + 1) {
+            log_message(LogLevel::Warn, "FAT32: cluster traversal overflow");
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool fat32_vfs_write_file(void* file_context,
@@ -1865,6 +2129,7 @@ bool fat32_vfs_write_file(void* file_context,
     }
 
     uint32_t offset32 = static_cast<uint32_t>(offset);
+    ctx->cache_valid = false;
     return fat32_write_file_range(*ctx->volume,
                                   ctx->entry,
                                   offset32,
@@ -1933,6 +2198,8 @@ const vfs::FilesystemOps kFat32FilesystemOps{
     &fat32_vfs_open_file,
     &fat32_vfs_create_file,
     &fat32_vfs_create_directory,
+    &fat32_vfs_remove_file,
+    &fat32_vfs_remove_directory,
     &fat32_vfs_read_file,
     &fat32_vfs_write_file,
     &fat32_vfs_close_file,

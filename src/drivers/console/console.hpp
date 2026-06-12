@@ -34,6 +34,7 @@ public:
     void get_dimensions(size_t& out_cols, size_t& out_rows) const;
 
     void set_color(uint32_t fg, uint32_t bg);
+    void set_text_flags(uint8_t flags);
 
     bool enable_back_buffer();
     void present();
@@ -45,6 +46,7 @@ private:
     size_t cursor_y;
     uint32_t fg_color;
     uint32_t bg_color;
+    uint8_t text_flags;
     size_t columns;
     size_t rows;
     size_t text_width;
