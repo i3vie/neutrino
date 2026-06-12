@@ -16,6 +16,7 @@ enum class CapabilityKind : uint16_t {
     HardwareAccess = 3,
     SecurityManage = 4,
     Stream = 5,
+    Monitor = 6,
     Count,
 };
 

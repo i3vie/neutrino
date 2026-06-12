@@ -2,10 +2,32 @@
 
 #include "process.hpp"
 #include "arch/x86_64/memory/paging.hpp"
+#include "scheduler.hpp"
 #include "string_util.hpp"
+#include "vm.hpp"
 #include "../lib/mem.hpp"
 
 namespace descriptor {
+
+namespace descriptor_pipe {
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
+}
+
+namespace descriptor_net_endpoint {
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
+}
+
+namespace descriptor_net_device {
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
+}
+
+namespace descriptor_keyboard {
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
+}
+
+namespace descriptor_vty {
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
+}
 
 namespace {
 
@@ -100,6 +122,63 @@ const DescriptorEntry* lookup_entry(const Table& table, uint32_t handle) {
         return nullptr;
     }
     return &entry;
+}
+
+bool query_entry_wait(DescriptorEntry& entry,
+                      uint32_t events,
+                      uint32_t& revents) {
+    revents = 0;
+    switch (entry.type) {
+        case kTypePipe:
+            return descriptor_pipe::query_wait(entry, events, revents);
+        case kTypeNetEndpoint:
+            return descriptor_net_endpoint::query_wait(entry, events, revents);
+        case kTypeNetDevice:
+            return descriptor_net_device::query_wait(entry, events, revents);
+        case kTypeKeyboard:
+            return descriptor_keyboard::query_wait(entry, events, revents);
+        case kTypeVty:
+            return descriptor_vty::query_wait(entry, events, revents);
+        case kTypeConsole:
+        case kTypeSerial:
+        case kTypeFramebuffer:
+            revents = events & descriptor_defs::kWaitWrite;
+            return true;
+        default:
+            return false;
+    }
+}
+
+int evaluate_waits(Table& table,
+                   descriptor_defs::DescriptorWait* items,
+                   size_t count) {
+    if (items == nullptr || count == 0 || count > kMaxWaitDescriptors) {
+        return -1;
+    }
+
+    uint32_t ready_count = 0;
+    for (size_t i = 0; i < count; ++i) {
+        descriptor_defs::DescriptorWait& item = items[i];
+        item.revents = 0;
+        item.reserved = 0;
+        if ((item.events &
+             ~(descriptor_defs::kWaitRead | descriptor_defs::kWaitWrite)) != 0 ||
+            item.events == 0) {
+            return -1;
+        }
+        DescriptorEntry* entry = lookup_entry(table, item.handle);
+        if (entry == nullptr) {
+            return -1;
+        }
+        if (!query_entry_wait(*entry, item.events, item.revents)) {
+            return -1;
+        }
+        if (item.revents != 0) {
+            ++ready_count;
+        }
+    }
+
+    return static_cast<int>(ready_count);
 }
 
 void populate_entry(DescriptorEntry& entry, const Allocation& alloc) {
@@ -494,6 +573,81 @@ int set_property(process::Process& proc,
         return -1;
     }
     return entry->ops->set_property(*entry, property, in, static_cast<size_t>(size));
+}
+
+int wait(process::Process& proc,
+         Table& table,
+         uint64_t user_address,
+         size_t count) {
+    if (user_address == 0 || count == 0 || count > kMaxWaitDescriptors) {
+        return -1;
+    }
+
+    descriptor_defs::DescriptorWait items[kMaxWaitDescriptors];
+    if (!vm::copy_from_user(proc.cr3,
+                            items,
+                            user_address,
+                            count * sizeof(items[0]))) {
+        return -1;
+    }
+
+    int ready = evaluate_waits(table, items, count);
+    if (ready < 0) {
+        return -1;
+    }
+    if (ready > 0) {
+        if (!vm::copy_to_user(proc.cr3,
+                              user_address,
+                              items,
+                              count * sizeof(items[0]))) {
+            return -1;
+        }
+        return ready;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        proc.wait_descriptors[i] = items[i];
+    }
+    proc.wait_descriptors_user = user_address;
+    proc.wait_descriptor_count = static_cast<uint32_t>(count);
+    proc.waiting_on = nullptr;
+    proc.state = process::State::Blocked;
+    return kWouldBlock;
+}
+
+void wake_waiters() {
+    for (size_t i = 0; i < process::kMaxProcesses; ++i) {
+        process::Process* proc = process::table_entry(i);
+        if (proc == nullptr ||
+            proc->state != process::State::Blocked ||
+            proc->wait_descriptor_count == 0) {
+            continue;
+        }
+
+        size_t count = static_cast<size_t>(proc->wait_descriptor_count);
+        int ready = evaluate_waits(proc->descriptors,
+                                   proc->wait_descriptors,
+                                   count);
+        if (ready <= 0) {
+            continue;
+        }
+
+        int result = ready;
+        if (!vm::copy_to_user(proc->cr3,
+                              proc->wait_descriptors_user,
+                              proc->wait_descriptors,
+                              count * sizeof(proc->wait_descriptors[0]))) {
+            result = -1;
+        }
+
+        proc->wait_descriptors_user = 0;
+        proc->wait_descriptor_count = 0;
+        proc->waiting_on = nullptr;
+        proc->context.rax =
+            static_cast<uint64_t>(static_cast<int64_t>(result));
+        proc->state = process::State::Ready;
+        scheduler::enqueue(proc);
+    }
 }
 
 uint32_t open_kernel(uint32_t type,

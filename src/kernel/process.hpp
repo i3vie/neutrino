@@ -59,10 +59,18 @@ struct Process {
     void (*kernel_entry)(Process&);
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
     uint32_t vty_id;
+    uint64_t sleep_until_tick;
+    uint64_t user_ticks;
+    uint64_t kernel_ticks;
+    uint64_t wait_descriptors_user;
+    uint32_t wait_descriptor_count;
+    uint32_t wait_descriptor_reserved;
     char cwd[128];
     char image_path[path_util::kMaxPathLength];
     uint32_t standard_descriptors[3];
     descriptor::Table descriptors;
+    descriptor_defs::DescriptorWait
+        wait_descriptors[descriptor::kMaxWaitDescriptors];
     capabilities::Principal* principal;
     capabilities::CapHandleEntry cap_handles[capabilities::kMaxProcessCapabilities];
     FileHandle file_handles[kMaxFileHandles];
@@ -76,6 +84,9 @@ Process* current();
 void set_current(Process* proc);
 Process* table_entry(size_t index);
 Process* find_by_pid(uint32_t pid);
+void record_tick(bool user_mode);
+size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries);
+void wake_ready_sleepers(uint64_t current_tick);
 void reclaim(Process& proc);
 
 }  // namespace process

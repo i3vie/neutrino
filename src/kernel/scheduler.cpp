@@ -12,6 +12,7 @@
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/smp.hpp"
 #include "descriptor.hpp"
+#include "time.hpp"
 
 namespace {
 
@@ -427,30 +428,34 @@ void reschedule(syscall::SyscallFrame& frame) {
         }
     }
 
-    // Run any ready kernel tasks immediately (they have no userspace frame)
-    while (next != nullptr && next->is_kernel_task) {
-        process::set_current(next);
-        set_rsp0(next->kernel_stack_top);
-        if (next->kernel_entry != nullptr) {
-            next->kernel_entry(*next);
-        }
-        if (next->state == process::State::Ready) {
-            QueueGuard guard;
-            enqueue_locked(next);
-        }
-        // fetch another runnable task (prefer userspace)
-        {
-            QueueGuard guard;
-            next = pop_locked();
-            while (next != nullptr &&
-                   (next->state == process::State::Terminated)) {
-                process::reclaim(*next);
+    for (;;) {
+        // Run any ready kernel tasks immediately (they have no userspace frame)
+        while (next != nullptr && next->is_kernel_task) {
+            process::set_current(next);
+            set_rsp0(next->kernel_stack_top);
+            if (next->kernel_entry != nullptr) {
+                next->kernel_entry(*next);
+            }
+            if (next->state == process::State::Ready) {
+                QueueGuard guard;
+                enqueue_locked(next);
+            }
+            // fetch another runnable task (prefer userspace)
+            {
+                QueueGuard guard;
                 next = pop_locked();
+                while (next != nullptr &&
+                       (next->state == process::State::Terminated)) {
+                    process::reclaim(*next);
+                    next = pop_locked();
+                }
             }
         }
-    }
 
-    if (next == nullptr) {
+        if (next != nullptr) {
+            break;
+        }
+
         if (terminated) {
             process::set_current(nullptr);
             paging_switch_cr3(paging_kernel_cr3());
@@ -459,10 +464,29 @@ void reschedule(syscall::SyscallFrame& frame) {
                 asm volatile("sti; hlt");
             }
         }
-        process::set_current(current_proc);
-        prepare_frame_for_process(*current_proc, frame);
-        asm volatile("pause");
-        return;
+
+        if (current_proc->state == process::State::Ready ||
+            current_proc->state == process::State::Running) {
+            process::set_current(current_proc);
+            prepare_frame_for_process(*current_proc, frame);
+            asm volatile("pause");
+            return;
+        }
+
+        process::set_current(nullptr);
+        paging_switch_cr3(paging_kernel_cr3());
+        cpu::write_fs_base(0);
+
+        do {
+            asm volatile("sti; hlt");
+            QueueGuard guard;
+            next = pop_locked();
+            while (next != nullptr &&
+                   next->state == process::State::Terminated) {
+                process::reclaim(*next);
+                next = pop_locked();
+            }
+        } while (next == nullptr);
     }
 
     process::set_current(next);
@@ -485,6 +509,7 @@ void reschedule_from_interrupt(InterruptFrame& frame) {
 
 void tick(InterruptFrame& frame) {
     descriptor::service_block_io();
+    process::wake_ready_sleepers(timekeeping::tick_count());
     if ((frame.cs & 0x3) != 0) {
         scheduler::reschedule_from_interrupt(frame);
         return;

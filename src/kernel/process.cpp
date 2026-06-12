@@ -5,6 +5,8 @@
 #include "arch/x86_64/memory/paging.hpp"
 #include "capabilities.hpp"
 #include "lib/mem.hpp"
+#include "scheduler.hpp"
+#include "string_util.hpp"
 
 namespace {
 
@@ -30,6 +32,12 @@ void reset_process_resources(process::Process& proc) {
     proc.kernel_entry = nullptr;
     proc.preferred_cpu = UINT32_MAX;
     proc.vty_id = 0;
+    proc.sleep_until_tick = 0;
+    proc.user_ticks = 0;
+    proc.kernel_ticks = 0;
+    proc.wait_descriptors_user = 0;
+    proc.wait_descriptor_count = 0;
+    proc.wait_descriptor_reserved = 0;
     proc.cwd[0] = '/';
     proc.cwd[1] = '\0';
     proc.image_path[0] = '\0';
@@ -132,6 +140,68 @@ Process* find_by_pid(uint32_t pid) {
         }
     }
     return nullptr;
+}
+
+void record_tick(bool user_mode) {
+    Process* proc = current();
+    if (proc == nullptr) {
+        return;
+    }
+    if (user_mode) {
+        ++proc->user_ticks;
+    } else {
+        ++proc->kernel_ticks;
+    }
+}
+
+size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries) {
+    if (out == nullptr || max_entries == 0) {
+        return 0;
+    }
+
+    size_t written = 0;
+    for (size_t i = 0; i < kMaxProcesses && written < max_entries; ++i) {
+        const Process& proc = g_process_table[i];
+        if (proc.state == State::Unused || proc.pid == 0) {
+            continue;
+        }
+
+        descriptor_defs::TaskUsage& snapshot = out[written++];
+        snapshot.pid = proc.pid;
+        snapshot.parent_pid = proc.parent ? proc.parent->pid : 0;
+        snapshot.state = static_cast<uint32_t>(proc.state);
+        snapshot.flags = 0;
+        if (proc.is_kernel_task) {
+            snapshot.flags |= descriptor_defs::kTaskStatFlagKernel;
+        }
+        if (proc.has_exited) {
+            snapshot.flags |= descriptor_defs::kTaskStatFlagExited;
+        }
+        snapshot.preferred_cpu = proc.preferred_cpu;
+        snapshot.reserved0 = 0;
+        snapshot.user_ticks = proc.user_ticks;
+        snapshot.kernel_ticks = proc.kernel_ticks;
+        string_util::copy(snapshot.image_path,
+                          sizeof(snapshot.image_path),
+                          proc.image_path[0] != '\0' ? proc.image_path : "(kernel)");
+    }
+    return written;
+}
+
+void wake_ready_sleepers(uint64_t current_tick) {
+    for (size_t i = 0; i < kMaxProcesses; ++i) {
+        Process& proc = g_process_table[i];
+        if (proc.state != State::Blocked || proc.sleep_until_tick == 0) {
+            continue;
+        }
+        if (current_tick < proc.sleep_until_tick) {
+            continue;
+        }
+        proc.sleep_until_tick = 0;
+        proc.waiting_on = nullptr;
+        proc.state = State::Ready;
+        scheduler::enqueue(&proc);
+    }
 }
 
 Process* allocate_kernel_task(void (*entry)(Process&)) {

@@ -25,6 +25,9 @@ int32_t open_directory_root(process::Process& proc);
 int32_t open_directory_at(process::Process& proc,
                           uint32_t dir_handle,
                           const char* name);
+bool create_directory(process::Process& proc, const char* path);
+bool remove_file(process::Process& proc, const char* path);
+bool remove_directory(process::Process& proc, const char* path);
 bool close_directory(process::Process& proc, uint32_t handle);
 int64_t read_directory(process::Process& proc, uint32_t handle,
                        uint64_t user_addr);

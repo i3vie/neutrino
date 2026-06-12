@@ -381,6 +381,7 @@ int64_t endpoint_read(process::Process& proc,
                                   handle->role == Role::App ? Role::Service
                                                             : Role::App);
         unlock_endpoint(endpoint);
+        descriptor::wake_waiters();
         return copied;
     }
     if (peer_handles(endpoint, handle->role) == 0) {
@@ -444,6 +445,7 @@ int64_t endpoint_write(process::Process& proc,
                                  handle->role == Role::App ? Role::Service
                                                            : Role::App);
         unlock_endpoint(endpoint);
+        descriptor::wake_waiters();
         return copied;
     }
     if (async) {
@@ -527,6 +529,7 @@ void close_endpoint(DescriptorEntry& entry) {
         return;
     }
     NetEndpoint& endpoint = *handle->endpoint;
+    bool notify_waiters = false;
     lock_endpoint(endpoint);
     if (endpoint.refcount > 0) {
         --endpoint.refcount;
@@ -542,6 +545,7 @@ void close_endpoint(DescriptorEntry& entry) {
     wake_write_waiters_locked(endpoint, Role::App);
     wake_read_waiters_locked(endpoint, Role::Service);
     wake_write_waiters_locked(endpoint, Role::Service);
+    notify_waiters = true;
     drop_waiters_for_owner_locked(endpoint, handle->owner);
 
     bool empty = endpoint.refcount == 0;
@@ -559,6 +563,37 @@ void close_endpoint(DescriptorEntry& entry) {
     }
     unlock_endpoint(endpoint);
     release_handle(handle);
+    if (notify_waiters) {
+        descriptor::wake_waiters();
+    }
+}
+
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
+    revents = 0;
+    auto* handle = static_cast<EndpointHandle*>(entry.subsystem_data);
+    if (handle == nullptr || !handle->in_use || handle->endpoint == nullptr) {
+        return false;
+    }
+    NetEndpoint& endpoint = *handle->endpoint;
+    if (!endpoint.in_use) {
+        return false;
+    }
+
+    lock_endpoint(endpoint);
+    Ring& incoming = incoming_ring(endpoint, handle->role);
+    Ring& outgoing = outgoing_ring(endpoint, handle->role);
+    size_t peers = peer_handles(endpoint, handle->role);
+    if ((events & descriptor_defs::kWaitRead) != 0 &&
+        (incoming.count > 0 || peers == 0)) {
+        revents |= descriptor_defs::kWaitRead;
+    }
+    if ((events & descriptor_defs::kWaitWrite) != 0 &&
+        peers != 0 &&
+        outgoing.count < kEndpointBufferSize) {
+        revents |= descriptor_defs::kWaitWrite;
+    }
+    unlock_endpoint(endpoint);
+    return true;
 }
 
 const Ops kEndpointOps{
@@ -600,6 +635,7 @@ bool open_endpoint(process::Process& proc,
         ++endpoint->service_handles;
     }
     unlock_endpoint(*endpoint);
+    descriptor::wake_waiters();
 
     uint64_t descriptor_flags =
         static_cast<uint64_t>(Flag::Readable) |

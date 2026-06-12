@@ -3,6 +3,7 @@
 #include "drivers/log/logging.hpp"
 #include "fs/vfs.hpp"
 #include "kernel/config.hpp"
+#include "kernel/descriptor.hpp"
 #include "kernel/string_util.hpp"
 #include "lib/mem.hpp"
 
@@ -709,6 +710,7 @@ void receive_frame(LinkDevice* device, const void* frame, size_t length) {
             device->rx_head = next_head;
         }
         unlock_device(*device);
+        descriptor::wake_waiters();
     }
 
     const uint8_t* bytes = static_cast<const uint8_t*>(frame);

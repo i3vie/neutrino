@@ -4,6 +4,10 @@
 #include "../process.hpp"
 
 namespace descriptor {
+int vty_get_property(uint32_t id,
+                     uint32_t property,
+                     void* out,
+                     size_t size);
 int vty_set_property(uint32_t id,
                      uint32_t property,
                      const void* in,
@@ -14,10 +18,65 @@ namespace descriptor {
 
 namespace console_descriptor {
 
+extern const Ops kConsoleOps;
+
+constexpr uintptr_t kRedirectStdoutTag = 1ull << 63;
+
+bool is_stdout_redirect(const DescriptorEntry& entry) {
+    return (reinterpret_cast<uintptr_t>(entry.subsystem_data) &
+            kRedirectStdoutTag) != 0;
+}
+
+uint32_t stdout_redirect_handle(const DescriptorEntry& entry) {
+    return static_cast<uint32_t>(
+        reinterpret_cast<uintptr_t>(entry.subsystem_data) &
+        ~kRedirectStdoutTag);
+}
+
+void fill_stdout_redirect(process::Process& proc, Allocation& alloc) {
+    alloc.type = kTypeConsole;
+    alloc.flags = static_cast<uint64_t>(Flag::Writable);
+    alloc.extended_flags = 0;
+    alloc.has_extended_flags = false;
+    alloc.object = nullptr;
+    alloc.close = nullptr;
+    alloc.name = "console-stdout";
+    alloc.subsystem_data =
+        reinterpret_cast<void*>(kRedirectStdoutTag |
+                                proc.standard_descriptors[1]);
+    alloc.ops = &kConsoleOps;
+}
+
+bool can_redirect_to_stdout(process::Process& proc) {
+    uint32_t handle = proc.standard_descriptors[1];
+    if (handle == kInvalidHandle) {
+        return false;
+    }
+    uint64_t flags = 0;
+    if (!get_flags(proc.descriptors, handle, false, flags)) {
+        return false;
+    }
+    return (flags & static_cast<uint64_t>(Flag::Writable)) != 0;
+}
+
 int console_set_property(DescriptorEntry& entry,
                          uint32_t property,
                          const void* in,
                          size_t size) {
+    if (is_stdout_redirect(entry)) {
+        if (property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleCursor) ||
+            property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleClear) ||
+            property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleColor) ||
+            property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleTextFlags)) {
+            return 0;
+        }
+        return -1;
+    }
+
     auto* console = static_cast<Console*>(entry.object);
     if (console == nullptr) {
         return -1;
@@ -73,6 +132,42 @@ int console_set_property(DescriptorEntry& entry,
         }
         return 0;
     }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleTextFlags)) {
+        if (in == nullptr || size < sizeof(uint8_t)) {
+            return -1;
+        }
+        uint8_t flags = *reinterpret_cast<const uint8_t*>(in);
+        console->set_text_flags(flags);
+        if (vty_id != 0) {
+            return vty_set_property(
+                vty_id,
+                static_cast<uint32_t>(descriptor_defs::Property::VtyTextFlags),
+                in,
+                size);
+        }
+        return 0;
+    }
+    return -1;
+}
+
+int console_get_property(DescriptorEntry& entry,
+                         uint32_t property,
+                         void* out,
+                         size_t size) {
+    if (is_stdout_redirect(entry)) {
+        return -1;
+    }
+
+    uint32_t vty_id = 0;
+    if (entry.subsystem_data != nullptr) {
+        vty_id = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(entry.subsystem_data));
+    }
+    if (vty_id != 0 &&
+        property == static_cast<uint32_t>(descriptor_defs::Property::VtyInfo)) {
+        return vty_get_property(vty_id, property, out, size);
+    }
     return -1;
 }
 
@@ -91,6 +186,14 @@ int64_t console_write(process::Process& proc,
                       uint64_t offset) {
     if (offset != 0) {
         return -1;
+    }
+    if (is_stdout_redirect(entry)) {
+        return write(proc,
+                     proc.descriptors,
+                     stdout_redirect_handle(entry),
+                     user_address,
+                     length,
+                     offset);
     }
     if (proc.vty_id != 0) {
         const char* data = reinterpret_cast<const char*>(user_address);
@@ -119,7 +222,7 @@ int64_t console_write(process::Process& proc,
 const Ops kConsoleOps{
     .read = console_read,
     .write = console_write,
-    .get_property = nullptr,
+    .get_property = console_get_property,
     .set_property = console_set_property,
 };
 
@@ -151,6 +254,12 @@ bool open_console(process::Process& proc,
         alloc.subsystem_data =
             reinterpret_cast<void*>(static_cast<uintptr_t>(proc.vty_id));
         alloc.ops = &kConsoleOps;
+        return true;
+    }
+    if ((kconsole == nullptr ||
+         (g_console_owner != nullptr && g_console_owner != &proc)) &&
+        can_redirect_to_stdout(proc)) {
+        fill_stdout_redirect(proc, alloc);
         return true;
     }
     if (kconsole == nullptr) {
@@ -189,7 +298,7 @@ bool transfer_console_owner(process::Process& from, process::Process& to) {
 
 void restore_console_owner(process::Process& proc) {
     console_descriptor::g_console_owner = &proc;
-    console_descriptor::g_console_refcount = 1;
+    ++console_descriptor::g_console_refcount;
 }
 
 bool console_is_owner(const process::Process& proc) {

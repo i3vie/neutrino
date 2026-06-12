@@ -222,6 +222,22 @@ bool open_net_device(process::Process&,
     return true;
 }
 
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
+    revents = 0;
+    auto* device = static_cast<net::LinkDevice*>(entry.object);
+    if (device == nullptr) {
+        return false;
+    }
+    if ((events & descriptor_defs::kWaitRead) != 0 &&
+        net::queued_frame_count(*device) != 0) {
+        revents |= descriptor_defs::kWaitRead;
+    }
+    if ((events & descriptor_defs::kWaitWrite) != 0 && device->up) {
+        revents |= descriptor_defs::kWaitWrite;
+    }
+    return true;
+}
+
 }  // namespace descriptor_net_device
 
 bool register_net_device_descriptor() {

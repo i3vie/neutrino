@@ -442,6 +442,44 @@ bool create_directory(const char* path) {
     return mount->ops->create_directory(mount->fs_context, relative);
 }
 
+bool remove_file(const char* path) {
+    const char* remainder = nullptr;
+    MountEntry* mount = find_mount_for_path(path, remainder);
+    if (mount == nullptr) {
+        log_message(LogLevel::Warn,
+                    "VFS: mount not found for path '%s'",
+                    (path != nullptr) ? path : "(null)");
+        return false;
+    }
+    if (mount->ops == nullptr || mount->ops->remove_file == nullptr) {
+        return false;
+    }
+    const char* relative = normalize_relative_path(remainder);
+    if (relative == nullptr || *relative == '\0') {
+        return false;
+    }
+    return mount->ops->remove_file(mount->fs_context, relative);
+}
+
+bool remove_directory(const char* path) {
+    const char* remainder = nullptr;
+    MountEntry* mount = find_mount_for_path(path, remainder);
+    if (mount == nullptr) {
+        log_message(LogLevel::Warn,
+                    "VFS: mount not found for path '%s'",
+                    (path != nullptr) ? path : "(null)");
+        return false;
+    }
+    if (mount->ops == nullptr || mount->ops->remove_directory == nullptr) {
+        return false;
+    }
+    const char* relative = normalize_relative_path(remainder);
+    if (relative == nullptr || *relative == '\0') {
+        return false;
+    }
+    return mount->ops->remove_directory(mount->fs_context, relative);
+}
+
 void close_file(FileHandle& handle) {
     if (handle.ops != nullptr && handle.ops->close_file != nullptr &&
         handle.file_context != nullptr) {

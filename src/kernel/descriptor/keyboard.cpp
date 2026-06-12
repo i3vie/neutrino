@@ -81,6 +81,22 @@ bool open_keyboard(process::Process& proc,
     return true;
 }
 
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
+    revents = 0;
+    if ((events & descriptor_defs::kWaitRead) == 0) {
+        return true;
+    }
+    uintptr_t slot_raw = reinterpret_cast<uintptr_t>(entry.subsystem_data);
+    if (slot_raw == 0) {
+        return false;
+    }
+    uint32_t slot = static_cast<uint32_t>(slot_raw - 1);
+    if (keyboard::has_data(slot)) {
+        revents |= descriptor_defs::kWaitRead;
+    }
+    return true;
+}
+
 }  // namespace descriptor_keyboard
 
 bool register_keyboard_descriptor() {

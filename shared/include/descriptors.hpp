@@ -16,6 +16,7 @@ enum class Type : uint16_t {
     SharedMemory = 0x040,
     Vty         = 0x050,
     CpuStats    = 0x060,
+    TaskStats   = 0x061,
     NetDevice   = 0x070,
     NetEndpoint = 0x071,
 };
@@ -37,6 +38,7 @@ enum class Property : uint32_t {
     ConsoleCursor     = 0x00000002,
     ConsoleClear      = 0x00000003,
     ConsoleColor      = 0x00000004,
+    ConsoleTextFlags  = 0x00000005,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     BlockGeometry     = 0x00020001,
@@ -48,6 +50,7 @@ enum class Property : uint32_t {
     VtyCursor         = 0x00050004,
     VtyClear          = 0x00050005,
     VtyColor          = 0x00050006,
+    VtyTextFlags      = 0x00050007,
     NetDeviceInfo     = 0x00060001,
     NetIpv4Config     = 0x00060002,
     NetDeviceDebug    = 0x00060003,
@@ -147,6 +150,10 @@ struct VtyCell {
     uint8_t reserved[2];
 };
 
+enum TextCellFlag : uint8_t {
+    kTextCellUnderline = 1u << 0,
+};
+
 struct CursorPosition {
     uint32_t x;
     uint32_t y;
@@ -159,6 +166,35 @@ struct CpuUsage {
     uint64_t kernel_ticks;
     uint64_t idle_ticks;
     uint64_t irq_ticks;
+};
+
+enum TaskStatFlag : uint32_t {
+    kTaskStatFlagKernel = 1u << 0,
+    kTaskStatFlagExited = 1u << 1,
+};
+
+enum WaitFlag : uint32_t {
+    kWaitRead = 1u << 0,
+    kWaitWrite = 1u << 1,
+};
+
+struct DescriptorWait {
+    uint32_t handle;
+    uint32_t events;
+    uint32_t revents;
+    uint32_t reserved;
+};
+
+struct TaskUsage {
+    uint32_t pid;
+    uint32_t parent_pid;
+    uint32_t state;
+    uint32_t flags;
+    uint32_t preferred_cpu;
+    uint32_t reserved0;
+    uint64_t user_ticks;
+    uint64_t kernel_ticks;
+    char image_path[64];
 };
 
 enum NetDeviceInfoFlag : uint32_t {

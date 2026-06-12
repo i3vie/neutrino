@@ -411,6 +411,7 @@ int64_t pipe_read(process::Process& proc,
     if (read_count > 0) {
         wake_write_waiters_locked(*pipe);
         unlock_pipe(*pipe);
+        descriptor::wake_waiters();
         return static_cast<int64_t>(read_count);
     }
 
@@ -487,6 +488,7 @@ int64_t pipe_write(process::Process& proc,
     if (written > 0) {
         wake_read_waiters_locked(*pipe);
         unlock_pipe(*pipe);
+        descriptor::wake_waiters();
         return static_cast<int64_t>(written);
     }
 
@@ -551,6 +553,7 @@ void close_pipe(DescriptorEntry& entry) {
         release_pipe_endpoint(endpoint);
         return;
     }
+    bool notify_waiters = false;
 
     lock_pipe(*pipe);
 
@@ -566,9 +569,11 @@ void close_pipe(DescriptorEntry& entry) {
 
     if (pipe->writer_count == 0) {
         wake_read_waiters_locked(*pipe);
+        notify_waiters = true;
     }
     if (pipe->reader_count == 0) {
         wake_write_waiters_locked(*pipe);
+        notify_waiters = true;
     }
 
     drop_waiters_for_owner_locked(*pipe, endpoint->owner);
@@ -600,6 +605,36 @@ void close_pipe(DescriptorEntry& entry) {
     unlock_pipe(*pipe);
 
     release_pipe_endpoint(endpoint);
+    if (notify_waiters) {
+        descriptor::wake_waiters();
+    }
+}
+
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
+    revents = 0;
+    auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
+    if (endpoint == nullptr || !endpoint->in_use) {
+        return false;
+    }
+    Pipe* pipe = endpoint->pipe;
+    if (pipe == nullptr || !pipe->in_use) {
+        return false;
+    }
+
+    lock_pipe(*pipe);
+    if ((events & descriptor_defs::kWaitRead) != 0 &&
+        endpoint->can_read &&
+        pipe->count > 0) {
+        revents |= descriptor_defs::kWaitRead;
+    }
+    if ((events & descriptor_defs::kWaitWrite) != 0 &&
+        endpoint->can_write &&
+        pipe->reader_count != 0 &&
+        pipe->count < kPipeBufferSize) {
+        revents |= descriptor_defs::kWaitWrite;
+    }
+    unlock_pipe(*pipe);
+    return true;
 }
 
 const Ops kPipeOps{
@@ -646,6 +681,7 @@ bool open_pipe(process::Process& proc,
         pipe->writer_count++;
     }
     unlock_pipe(*pipe);
+    descriptor::wake_waiters();
 
     uint64_t descriptor_flags = 0;
     if (want_read) {

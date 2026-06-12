@@ -294,6 +294,30 @@ int32_t open_directory_at(process::Process& proc,
     return slot;
 }
 
+bool create_directory(process::Process& proc, const char* path) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
+        return false;
+    }
+    return vfs::create_directory(local_path);
+}
+
+bool remove_file(process::Process& proc, const char* path) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
+        return false;
+    }
+    return vfs::remove_file(local_path);
+}
+
+bool remove_directory(process::Process& proc, const char* path) {
+    char local_path[path_util::kMaxPathLength];
+    if (!copy_path(proc, path, local_path)) {
+        return false;
+    }
+    return vfs::remove_directory(local_path);
+}
+
 int32_t open_file_at(process::Process& proc,
                      uint32_t dir_handle,
                      const char* name) {
