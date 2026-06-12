@@ -20,16 +20,10 @@ namespace {
 
 constexpr size_t kMaxInputLength = 256;
 constexpr size_t kMaxCommandLength = 128;
-constexpr size_t kPathMax = 128;
-constexpr size_t kMaxSegments = 64;
 constexpr size_t kMaxSearchDirs = 8;
 constexpr uint32_t kPromptUserColor = 0xFF8FD0FFu;
 constexpr uint32_t kPromptPathColor = 0xFFF2F4F8u;
 constexpr uint32_t kPromptBgColor = 0x00000000u;
-struct PathSegment {
-    const char* data;
-    size_t length;
-};
 
 void print(long console, const char* str) {
     if (console < 0 || str == nullptr) {
@@ -119,7 +113,6 @@ uint32_t parse_vty_arg(const char* args) {
 }
 
 char g_current_cwd[128] = "/";
-char g_boot_mount[64] = {0};
 char g_session_user[32] = "root";
 
 void strip_control(char* str) {
@@ -136,66 +129,9 @@ void strip_control(char* str) {
     str[write] = '\0';
 }
 
-void extract_mount_name(const char* path, char* out, size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return;
-    }
-    out[0] = '\0';
-    if (path == nullptr || path[0] != '/') {
-        return;
-    }
-    size_t src = 1;
-    size_t dst = 0;
-    while (path[src] != '\0' && path[src] != '/') {
-        if (dst + 1 >= out_size) {
-            out[0] = '\0';
-            return;
-        }
-        out[dst++] = path[src++];
-    }
-    if (dst == 0) {
-        out[0] = '\0';
-        return;
-    }
-    out[dst] = '\0';
-}
-
-bool build_mount_subpath(const char* mount,
-                         const char* suffix,
-                         char* out,
-                         size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-    if (mount == nullptr || mount[0] == '\0') {
-        return false;
-    }
-    size_t idx = 0;
-    out[idx++] = '/';
-    for (size_t i = 0; mount[i] != '\0'; ++i) {
-        if (idx + 1 >= out_size) {
-            return false;
-        }
-        out[idx++] = mount[i];
-    }
-    if (suffix != nullptr && suffix[0] != '\0') {
-        if (idx + 1 >= out_size) {
-            return false;
-        }
-        out[idx++] = '/';
-        for (size_t i = 0; suffix[i] != '\0'; ++i) {
-            if (idx + 1 >= out_size) {
-                return false;
-            }
-            out[idx++] = suffix[i];
-        }
-    }
-    out[idx] = '\0';
-    return true;
-}
-
 size_t build_search_directories(const char* cwd,
                                 char (&out)[kMaxSearchDirs][128]) {
+    (void)cwd;
     size_t count = 0;
 
     auto append = [&](const char* path) {
@@ -209,216 +145,10 @@ size_t build_search_directories(const char* cwd,
         ++count;
     };
 
-    auto append_mount_dirs = [&](const char* mount) {
-        if (mount == nullptr || mount[0] == '\0') {
-            return;
-        }
-        char buffer[128];
-        if (build_mount_subpath(mount, "binary", buffer, sizeof(buffer))) {
-            append(buffer);
-        }
-        if (build_mount_subpath(mount, "BINARY", buffer, sizeof(buffer))) {
-            append(buffer);
-        }
-    };
-
-    append("/binary");
-    append("/BINARY");
-
-    char mount_name[64];
-    extract_mount_name(cwd, mount_name, sizeof(mount_name));
-    if (strcmp(mount_name, "binary") == 0 ||
-        strcmp(mount_name, "config") == 0 ||
-        strcmp(mount_name, "system") == 0 ||
-        strcmp(mount_name, "user") == 0) {
-        mount_name[0] = '\0';
-    }
-    append_mount_dirs(mount_name);
-    if (g_boot_mount[0] != '\0' &&
-        strcmp(mount_name, g_boot_mount) != 0) {
-        append_mount_dirs(g_boot_mount);
-    }
+    append(".../binary");
+    append(".../BINARY");
 
     return count;
-}
-
-bool parse_segments(const char* path,
-                    bool path_is_absolute,
-                    size_t floor_count,
-                    const PathSegment* mount_root_segment,
-                    PathSegment (&segments)[kMaxSegments],
-                    size_t& count) {
-    if (path == nullptr) {
-        return true;
-    }
-
-    const char* cursor = path;
-    while (*cursor != '\0') {
-        while (*cursor == '/') {
-            ++cursor;
-        }
-        if (*cursor == '\0') {
-            break;
-        }
-
-        const char* start = cursor;
-        while (*cursor != '\0' && *cursor != '/') {
-            ++cursor;
-        }
-        size_t len = static_cast<size_t>(cursor - start);
-        if (len == 0) {
-            continue;
-        }
-        if (len == 1 && start[0] == '.') {
-            continue;
-        }
-        if (len == 2 && start[0] == '.' && start[1] == '.') {
-            if (count > floor_count) {
-                --count;
-            } else if (!path_is_absolute) {
-                // ignore attempts to traverse above the root of the
-                // combined path for relative inputs
-            }
-            continue;
-        }
-        if (!path_is_absolute &&
-            len == 3 &&
-            start[0] == '.' &&
-            start[1] == '.' &&
-            start[2] == '.') {
-            if (mount_root_segment != nullptr &&
-                mount_root_segment->data != nullptr &&
-                mount_root_segment->length != 0) {
-                segments[0] = *mount_root_segment;
-                count = 1;
-            } else if (count > floor_count) {
-                count = floor_count;
-            }
-            continue;
-        }
-        if (count >= kMaxSegments) {
-            return false;
-        }
-        segments[count++] = PathSegment{start, len};
-    }
-    return true;
-}
-
-bool write_segments(const PathSegment (&segments)[kMaxSegments],
-                    size_t count,
-                    char* out,
-                    size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-    if (out_size < 2) {
-        return false;
-    }
-
-    size_t length = 0;
-    out[length++] = '/';
-    for (size_t i = 0; i < count; ++i) {
-        if (length > 1) {
-            if (length + 1 >= out_size) {
-                return false;
-            }
-            out[length++] = '/';
-        }
-        if (length + segments[i].length >= out_size) {
-            return false;
-        }
-        for (size_t j = 0; j < segments[i].length; ++j) {
-            out[length++] = segments[i].data[j];
-        }
-    }
-    if (length > 1 && out[length - 1] == '/') {
-        --length;
-    }
-    if (length >= out_size) {
-        return false;
-    }
-    out[length] = '\0';
-    return true;
-}
-
-bool build_absolute_path_user(const char* base,
-                              const char* input,
-                              char* out,
-                              size_t out_size) {
-    PathSegment segments[kMaxSegments];
-    size_t segment_count = 0;
-    PathSegment mount_root_segment{nullptr, 0};
-
-    const char* effective_base =
-        (base != nullptr && base[0] != '\0') ? base : "/";
-    size_t floor_count = 0;
-    if (g_boot_mount[0] != '\0') {
-        size_t mount_len = strlen(g_boot_mount);
-        bool mount_matches = true;
-        for (size_t i = 0; i < mount_len; ++i) {
-            if (effective_base[1 + i] != g_boot_mount[i]) {
-                mount_matches = false;
-                break;
-            }
-        }
-        if (effective_base[0] == '/' &&
-            mount_matches &&
-            (effective_base[1 + mount_len] == '\0' ||
-             effective_base[1 + mount_len] == '/')) {
-            floor_count = 1;
-        }
-    }
-    if (!parse_segments(effective_base, true, 0, nullptr, segments, segment_count)) {
-        return false;
-    }
-    if (floor_count == 1 && segment_count > 0) {
-        mount_root_segment = segments[0];
-    } else if (g_boot_mount[0] != '\0') {
-        mount_root_segment = PathSegment{g_boot_mount, strlen(g_boot_mount)};
-    }
-
-    if (input == nullptr || input[0] == '\0') {
-        return write_segments(segments, segment_count, out, out_size);
-    }
-
-    if (input[0] == '/') {
-        segment_count = 0;
-        if (!parse_segments(input, true, 0, nullptr, segments, segment_count)) {
-            return false;
-        }
-        return write_segments(segments, segment_count, out, out_size);
-    }
-
-    if (!parse_segments(input,
-                        false,
-                        floor_count,
-                        &mount_root_segment,
-                        segments,
-                        segment_count)) {
-        return false;
-    }
-    return write_segments(segments, segment_count, out, out_size);
-}
-
-bool resolve_path(const char* base,
-                  const char* input,
-                  char* out,
-                  size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-
-    if (input == nullptr) {
-        return build_absolute_path_user(base, nullptr, out, out_size);
-    }
-
-    if (strlen(input) >= kPathMax) {
-        return false;
-    }
-
-    char input_copy[kPathMax];
-    strlcpy(input_copy, input, sizeof(input_copy));
-    return build_absolute_path_user(base, input_copy, out, out_size);
 }
 
 size_t build_prompt(char* buffer, size_t buffer_size) {
@@ -599,13 +329,9 @@ long run_with_search(const char* command,
     };
 
     if (contains_slash(command)) {
-        char resolved[128];
-        if (!resolve_path(cwd, command, resolved, sizeof(resolved))) {
-            return -1;
-        }
-        long value = invoke_exec(resolved, args, flags);
+        long value = invoke_exec(command, args, flags);
         if (value >= 0 && resolved_path != nullptr) {
-            strlcpy(resolved_path, resolved, resolved_path_size);
+            strlcpy(resolved_path, command, resolved_path_size);
         }
         return value;
     }
@@ -867,15 +593,7 @@ void execute_command(long console, const char* line) {
                 path_info[idx++] = text[i];
             }
         };
-        append_literal("simple shell (PATH=/binary:/BINARY");
-        if (g_boot_mount[0] != '\0') {
-            append_literal(":/");
-            append_literal(g_boot_mount);
-            append_literal("/binary:/");
-            append_literal(g_boot_mount);
-            append_literal("/BINARY");
-        }
-        append_literal(")");
+        append_literal("simple shell (PATH=.../binary:.../BINARY)");
         path_info[idx] = '\0';
         print_line(console, path_info);
         print_line(console, "builtins: cd, help, whoami, spawn, burst");
@@ -925,14 +643,13 @@ int main(uint64_t arg, uint64_t) {
     const char* args = reinterpret_cast<const char*>(arg);
     parse_session_user(args);
     uint32_t vty_id = parse_vty_arg(args);
-    long vty_handle = -1;
     if (vty_id != 0) {
         uint64_t flags =
             static_cast<uint64_t>(descriptor_defs::Flag::Readable) |
             static_cast<uint64_t>(descriptor_defs::Flag::Writable);
         uint64_t open_context =
             static_cast<uint64_t>(descriptor_defs::VtyOpen::Attach);
-        vty_handle = descriptor_open(kDescVty, vty_id, flags, open_context);
+        (void)descriptor_open(kDescVty, vty_id, flags, open_context);
     }
 
     long std_input = process_get_standard_descriptor(0);
@@ -942,7 +659,7 @@ int main(uint64_t arg, uint64_t) {
     }
     if (console < 0) return 1;
 
-    long input_handle = std_input >= 0 ? std_input : vty_handle;
+    long input_handle = std_input;
     if (input_handle < 0) {
         input_handle = descriptor_open(kDescKeyboard, 0);
         if (input_handle < 0) return 1;
@@ -954,7 +671,6 @@ int main(uint64_t arg, uint64_t) {
         g_current_cwd[1] = '\0';
     }
     maybe_enter_home_directory();
-    extract_mount_name(g_current_cwd, g_boot_mount, sizeof(g_boot_mount));
 
     char prompt_buffer[160];
     size_t prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
@@ -966,11 +682,28 @@ int main(uint64_t arg, uint64_t) {
     input_buffer[0] = '\0';
     size_t rendered_length = prompt_len;
 
-    bool input_is_keyboard = (std_input < 0 && input_handle != vty_handle);
+    bool input_is_keyboard = (std_input < 0);
     bool echo_input = std_input < 0;
     bool suppress_next_lf = false;
+    uint8_t escape_state = 0;
     while (1) {
         auto handle_input_byte = [&](uint8_t key) {
+            if (escape_state != 0) {
+                if (escape_state == 1 && key == '[') {
+                    escape_state = 2;
+                    return;
+                }
+                if (escape_state == 2 && key >= 0x40 && key <= 0x7E) {
+                    escape_state = 0;
+                    return;
+                }
+                escape_state = 0;
+                return;
+            }
+            if (key == 0x1B) {
+                escape_state = 1;
+                return;
+            }
             if (key == '\n' && suppress_next_lf) {
                 suppress_next_lf = false;
                 return;

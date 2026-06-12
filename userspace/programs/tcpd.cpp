@@ -481,7 +481,22 @@ void reset_connection(Connection& conn) {
     conn.listener = nullptr;
 }
 
+void release_client_port(ServerContext& ctx, uint16_t port) {
+    ClientPort* client_port = find_client_port(ctx, port);
+    if (client_port == nullptr) {
+        return;
+    }
+    client_port->binding_in_progress = false;
+    if (client_port->bound) {
+        return;
+    }
+    client_port->in_use = false;
+    client_port->port = 0;
+}
+
 void close_connection(ServerContext& ctx, Connection& conn, uint32_t reason) {
+    bool outbound = conn.listener == nullptr;
+    uint16_t local_port = conn.local_port;
     send_closed_event(conn, reason);
     if (conn.endpoint_handle != 0) {
         descriptor_close(conn.endpoint_handle);
@@ -490,6 +505,9 @@ void close_connection(ServerContext& ctx, Connection& conn, uint32_t reason) {
         descriptor_close(conn.app_pipe_handle);
     }
     reset_connection(conn);
+    if (outbound && local_port != 0) {
+        release_client_port(ctx, local_port);
+    }
     recount_registry(ctx);
 }
 
@@ -522,6 +540,18 @@ bool is_outbound_port_busy(ServerContext& ctx, uint16_t port) {
 }
 
 uint16_t choose_client_port(ServerContext& ctx) {
+    for (uint32_t port = kEphemeralPortStart; port <= kEphemeralPortEnd; ++port) {
+        if (find_client_port(ctx, static_cast<uint16_t>(port)) != nullptr) {
+            continue;
+        }
+        if (!is_outbound_port_busy(ctx, static_cast<uint16_t>(port))) {
+            return static_cast<uint16_t>(port);
+        }
+    }
+
+    // Prefer a fresh source port before reusing a cached bound port. Reusing
+    // the same local port immediately after closing a connection to the same
+    // peer recreates the same 4-tuple and can stall reconnects during redirects.
     for (size_t i = 0; i < kMaxClientPorts; ++i) {
         ClientPort& port = ctx.client_ports[i];
         if (port.in_use &&
@@ -532,14 +562,6 @@ uint16_t choose_client_port(ServerContext& ctx) {
         }
     }
 
-    for (uint32_t port = kEphemeralPortStart; port <= kEphemeralPortEnd; ++port) {
-        if (find_client_port(ctx, static_cast<uint16_t>(port)) != nullptr) {
-            continue;
-        }
-        if (!is_outbound_port_busy(ctx, static_cast<uint16_t>(port))) {
-            return static_cast<uint16_t>(port);
-        }
-    }
     return 0;
 }
 
@@ -551,11 +573,13 @@ bool begin_outbound_connection(ServerContext& ctx,
                                uint32_t endpoint_id) {
     Connection* conn = allocate_connection(ctx);
     if (conn == nullptr) {
+        release_client_port(ctx, local_port);
         return false;
     }
 
     descriptor_defs::NetIpv4Config cfg{};
     if (!load_ipv4_config(ctx, cfg)) {
+        release_client_port(ctx, local_port);
         return false;
     }
 
@@ -581,6 +605,7 @@ bool begin_outbound_connection(ServerContext& ctx,
                                        descriptor_defs::kNetEndpointOpenService);
         if (endpoint < 0) {
             reset_connection(*conn);
+            release_client_port(ctx, local_port);
             return false;
         }
         conn->endpoint_handle = static_cast<uint32_t>(endpoint);
@@ -603,6 +628,7 @@ bool begin_outbound_connection(ServerContext& ctx,
             descriptor_close(conn->endpoint_handle);
         }
         reset_connection(*conn);
+        release_client_port(ctx, local_port);
         return false;
     }
 
@@ -780,6 +806,11 @@ void handle_connect_request(ServerContext& ctx,
     }
     PendingConnect* pending = allocate_pending_connect(ctx);
     if (client_port == nullptr || pending == nullptr) {
+        if (client_port != nullptr && !client_port->bound) {
+            client_port->in_use = false;
+            client_port->binding_in_progress = false;
+            client_port->port = 0;
+        }
         send_connect_response(app_pipe_handle, tcpd_protocol::kStatusIo, 0, 0, 0);
         descriptor_close(app_pipe_handle);
         return;
@@ -805,7 +836,9 @@ void handle_connect_request(ServerContext& ctx,
     message.bind_tcp_request.port = local_port;
     if (!networkd_protocol::write_message(ctx.networkd_server_pipe, message)) {
         pending->in_use = false;
+        client_port->in_use = false;
         client_port->binding_in_progress = false;
+        client_port->port = 0;
         send_connect_response(app_pipe_handle,
                               tcpd_protocol::kStatusIo,
                               0,
@@ -815,12 +848,14 @@ void handle_connect_request(ServerContext& ctx,
     }
 }
 
-void poll_control(ServerContext& ctx) {
+bool poll_control(ServerContext& ctx) {
+    bool did_work = false;
     for (;;) {
         tcpd_protocol::Message message{};
         if (!tcpd_protocol::read_message(ctx.tcpd_server_pipe, message)) {
-            break;
+            return did_work;
         }
+        did_work = true;
         if (message.type == tcpd_protocol::kListenRequest) {
             handle_listen_request(ctx, message.listen_request);
         } else if (message.type == tcpd_protocol::kSendRequest) {
@@ -833,8 +868,9 @@ void poll_control(ServerContext& ctx) {
     }
 }
 
-void poll_connection_endpoints(ServerContext& ctx) {
+bool poll_connection_endpoints(ServerContext& ctx) {
     uint8_t buffer[tcpd_protocol::kMaxPayload];
+    bool did_work = false;
     for (size_t i = 0; i < kMaxConnections; ++i) {
         Connection& conn = ctx.connections[i];
         if (!conn.in_use ||
@@ -850,6 +886,7 @@ void poll_connection_endpoints(ServerContext& ctx) {
                 break;
             }
             if (result == 0) {
+                did_work = true;
                 tcpd_protocol::CloseRequest request{};
                 request.connection_id = conn.id;
                 handle_close_request(ctx, request);
@@ -858,12 +895,14 @@ void poll_connection_endpoints(ServerContext& ctx) {
             if (result < 0) {
                 break;
             }
+            did_work = true;
             send_connection_payload(ctx,
                                     conn,
                                     buffer,
                                     static_cast<size_t>(result));
         }
     }
+    return did_work;
 }
 
 void handle_bind_response(ServerContext& ctx,
@@ -1112,6 +1151,7 @@ void handle_existing_connection(ServerContext& ctx,
 
     if (conn.state == kConnStateSynSent) {
         if ((segment.flags & usernet::kTcpFlagRst) != 0) {
+            uint16_t local_port = conn.local_port;
             send_connect_response(conn.app_pipe_handle,
                                   tcpd_protocol::kStatusNotFound,
                                   0,
@@ -1119,6 +1159,7 @@ void handle_existing_connection(ServerContext& ctx,
                                   0);
             descriptor_close(conn.app_pipe_handle);
             reset_connection(conn);
+            release_client_port(ctx, local_port);
             recount_registry(ctx);
             return;
         }
@@ -1186,12 +1227,14 @@ void handle_tcp_segment(ServerContext& ctx,
     handle_new_connection(ctx, *listener, segment);
 }
 
-void poll_network(ServerContext& ctx) {
+bool poll_network(ServerContext& ctx) {
+    bool did_work = false;
     for (;;) {
         networkd_protocol::Message message{};
         if (!networkd_protocol::read_message(ctx.network_reply_pipe, message)) {
-            break;
+            return did_work;
         }
+        did_work = true;
         if (message.type == networkd_protocol::kBindTcpResponse) {
             handle_bind_response(ctx, message.bind_tcp_response);
         } else if (message.type == networkd_protocol::kTcpSegmentEvent) {
@@ -1240,6 +1283,7 @@ bool wait_for_networkd(uint32_t& server_pipe_id) {
 
 int main(uint64_t, uint64_t) {
     ServerContext ctx{};
+    descriptor_defs::DescriptorWait waits[64]{};
     print_line("tcpd: build dbg-2026-04-11b");
 
     if (!usernet::open_device(ctx.device, 0, static_cast<uint64_t>(descriptor_defs::Flag::Async))) {
@@ -1315,9 +1359,46 @@ int main(uint64_t, uint64_t) {
     print_line("tcpd: ready");
 
     for (;;) {
-        poll_control(ctx);
-        poll_connection_endpoints(ctx);
-        poll_network(ctx);
-        yield();
+        bool did_work = false;
+        did_work = poll_control(ctx) || did_work;
+        did_work = poll_connection_endpoints(ctx) || did_work;
+        did_work = poll_network(ctx) || did_work;
+        if (did_work) {
+            continue;
+        }
+
+        size_t wait_count = 0;
+        waits[wait_count].handle = ctx.tcpd_server_pipe;
+        waits[wait_count].events = descriptor_defs::kWaitRead;
+        waits[wait_count].revents = 0;
+        waits[wait_count].reserved = 0;
+        ++wait_count;
+
+        waits[wait_count].handle = ctx.network_reply_pipe;
+        waits[wait_count].events = descriptor_defs::kWaitRead;
+        waits[wait_count].revents = 0;
+        waits[wait_count].reserved = 0;
+        ++wait_count;
+
+        for (size_t i = 0;
+             i < kMaxConnections &&
+             wait_count < (sizeof(waits) / sizeof(waits[0]));
+             ++i) {
+            const Connection& conn = ctx.connections[i];
+            if (!conn.in_use ||
+                conn.state != kConnStateEstablished ||
+                conn.endpoint_handle == kInvalidDescriptor) {
+                continue;
+            }
+            waits[wait_count].handle = conn.endpoint_handle;
+            waits[wait_count].events = descriptor_defs::kWaitRead;
+            waits[wait_count].revents = 0;
+            waits[wait_count].reserved = 0;
+            ++wait_count;
+        }
+
+        if (descriptor_wait(waits, wait_count) < 0) {
+            yield();
+        }
     }
 }

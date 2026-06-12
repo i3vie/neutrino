@@ -9,12 +9,11 @@
 
 namespace {
 
-constexpr const char* kDefaultShellPath = "binary/shell.elf";
-constexpr const char* kSpawnConfigPath = "config/spawn.cfg";
+constexpr const char* kDefaultShellPath = ".../binary/shell.elf";
+constexpr const char* kSpawnConfigPath = ".../config/spawn.cfg";
 constexpr const char* kPrimaryUserStorePath = "/system/users.ntd";
 constexpr const char* kFallbackUserStorePath = "/users.ntd";
 constexpr size_t kConfigBufferSize = 1024;
-constexpr size_t kMaxPathLength = 160;
 constexpr size_t kMaxUserNameLength = 32;
 constexpr size_t kMaxLoginUsers = 32;
 constexpr const char* kRootUserName = "root";
@@ -113,41 +112,6 @@ void zero_memory(void* ptr, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         bytes[i] = 0;
     }
-}
-
-bool build_mount_subpath(const char* mount,
-                         const char* suffix,
-                         char* out,
-                         size_t out_size) {
-    if (mount == nullptr || mount[0] == '\0' ||
-        out == nullptr || out_size == 0) {
-        return false;
-    }
-
-    size_t idx = 0;
-    out[idx++] = '/';
-    for (size_t i = 0; mount[i] != '\0'; ++i) {
-        if (idx + 1 >= out_size) {
-            return false;
-        }
-        out[idx++] = mount[i];
-    }
-
-    if (suffix != nullptr && suffix[0] != '\0') {
-        if (idx + 1 >= out_size) {
-            return false;
-        }
-        out[idx++] = '/';
-        for (size_t i = 0; suffix[i] != '\0'; ++i) {
-            if (idx + 1 >= out_size) {
-                return false;
-            }
-            out[idx++] = suffix[i];
-        }
-    }
-
-    out[idx] = '\0';
-    return true;
 }
 
 void* find_cached_principal(const char* user_name) {
@@ -263,38 +227,6 @@ bool set_console_color(uint32_t fg, uint32_t bg) {
                static_cast<uint32_t>(descriptor_defs::Property::ConsoleColor),
                &colors,
                sizeof(colors)) == 0;
-}
-
-bool read_file_from_mounts(const char* suffix,
-                           char* buffer,
-                           size_t buffer_size,
-                           size_t& out_len) {
-    if (read_file_into_buffer(suffix, buffer, buffer_size, out_len)) {
-        return true;
-    }
-
-    long dir = directory_open("/");
-    if (dir < 0) {
-        return false;
-    }
-
-    DirEntry entry{};
-    char path[kMaxPathLength];
-    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
-        if (entry.name[0] == '\0') {
-            continue;
-        }
-        if (!build_mount_subpath(entry.name, suffix, path, sizeof(path))) {
-            continue;
-        }
-        if (read_file_into_buffer(path, buffer, buffer_size, out_len)) {
-            directory_close(static_cast<uint32_t>(dir));
-            return true;
-        }
-    }
-
-    directory_close(static_cast<uint32_t>(dir));
-    return false;
 }
 
 bool user_exists(const LoginUsers& users, const char* name) {
@@ -691,31 +623,6 @@ bool spawn_command_line(char* line) {
         return true;
     }
 
-    long dir = directory_open("/");
-    if (dir < 0) {
-        return false;
-    }
-
-    DirEntry entry{};
-    char path[kMaxPathLength];
-    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
-        if (entry.name[0] == '\0') {
-            continue;
-        }
-        if (!build_mount_subpath(entry.name, command, path, sizeof(path))) {
-            continue;
-        }
-        pid = child(path, args, 0, nullptr);
-        if (pid >= 0) {
-            directory_close(static_cast<uint32_t>(dir));
-            print("init: spawned ");
-            print(path);
-            print("\n");
-            return true;
-        }
-    }
-
-    directory_close(static_cast<uint32_t>(dir));
     print("init: failed to spawn ");
     print(command);
     print("\n");
@@ -725,7 +632,7 @@ bool spawn_command_line(char* line) {
 bool spawn_from_config() {
     char buffer[kConfigBufferSize];
     size_t len = 0;
-    if (!read_file_from_mounts(kSpawnConfigPath, buffer, sizeof(buffer), len)) {
+    if (!read_file_into_buffer(kSpawnConfigPath, buffer, sizeof(buffer), len)) {
         return false;
     }
 

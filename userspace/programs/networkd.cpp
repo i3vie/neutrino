@@ -51,7 +51,7 @@ networkd_protocol::Message* g_control_message_buffer = nullptr;
 networkd_protocol::Message* g_tx_message_buffer = nullptr;
 uint8_t* g_frame_buffer = nullptr;
 
-void poll_network(ServerContext& ctx);
+bool poll_network(ServerContext& ctx);
 
 void print(const char* text) {
     static int32_t console = -1;
@@ -172,6 +172,17 @@ Binding* allocate_binding(ServerContext& ctx) {
         }
     }
     return nullptr;
+}
+
+void release_binding(Binding& binding) {
+    if (binding.pipe_handle != kInvalidDescriptor) {
+        descriptor_close(binding.pipe_handle);
+    }
+    binding.in_use = false;
+    binding.protocol = 0;
+    binding.port = 0;
+    binding.pipe_id = 0;
+    binding.pipe_handle = kInvalidDescriptor;
 }
 
 ArpEntry* find_arp_entry(ServerContext& ctx, const uint8_t ip[4]) {
@@ -528,6 +539,17 @@ void handle_udp_bind_request(ServerContext& ctx,
                         networkd_protocol::kBindUdpResponse);
 }
 
+void handle_udp_unbind_request(ServerContext& ctx,
+                               const networkd_protocol::UnbindUdpRequest& request) {
+    if (request.port == 0) {
+        return;
+    }
+    Binding* binding = find_binding(ctx, kBindingProtocolUdp, request.port);
+    if (binding != nullptr) {
+        release_binding(*binding);
+    }
+}
+
 void handle_tcp_bind_request(ServerContext& ctx,
                              const networkd_protocol::BindTcpRequest& request) {
     handle_bind_request(ctx,
@@ -686,20 +708,24 @@ void handle_icmp_request(ServerContext& ctx,
     (void)descriptor_write(ctx.device.handle, frame, frame_length);
 }
 
-void poll_control(ServerContext& ctx) {
+bool poll_control(ServerContext& ctx) {
+    bool did_work = false;
     for (;;) {
         auto* message = allocate_control_message_buffer();
         if (message == nullptr) {
-            break;
+            return did_work;
         }
         if (!networkd_protocol::read_message(ctx.server_pipe, *message)) {
-            break;
+            return did_work;
         }
+        did_work = true;
         print("networkd: control message type=");
         print_u32(message->type);
         print("\n");
         if (message->type == networkd_protocol::kBindUdpRequest) {
             handle_udp_bind_request(ctx, message->bind_request);
+        } else if (message->type == networkd_protocol::kUnbindUdpRequest) {
+            handle_udp_unbind_request(ctx, message->unbind_request);
         } else if (message->type == networkd_protocol::kBindTcpRequest) {
             handle_tcp_bind_request(ctx, message->bind_tcp_request);
         } else if (message->type == networkd_protocol::kSendUdpRequest) {
@@ -743,17 +769,19 @@ bool lookup_or_resolve_mac(ServerContext& ctx,
     return false;
 }
 
-void poll_network(ServerContext& ctx) {
+bool poll_network(ServerContext& ctx) {
     auto* frame = allocate_frame_buffer();
     if (frame == nullptr) {
-        return;
+        return false;
     }
+    bool did_work = false;
     for (;;) {
         long result =
             descriptor_read(ctx.device.handle, frame, usernet::kMaxFrameSize);
         if (result == kDescriptorWouldBlock || result <= 0) {
-            break;
+            return did_work;
         }
+        did_work = true;
         if (ctx.registry != nullptr) {
             ++ctx.registry->net_rx_frames;
         }
@@ -824,6 +852,7 @@ void poll_network(ServerContext& ctx) {
 
 int main(uint64_t, uint64_t) {
     ServerContext ctx{};
+    descriptor_defs::DescriptorWait waits[2]{};
     print_line("networkd: start");
 
     uint64_t net_flags = static_cast<uint64_t>(descriptor_defs::Flag::Async);
@@ -866,8 +895,23 @@ int main(uint64_t, uint64_t) {
     print_line("networkd: ready");
 
     for (;;) {
-        poll_control(ctx);
-        poll_network(ctx);
-        yield();
+        bool did_work = false;
+        did_work = poll_control(ctx) || did_work;
+        did_work = poll_network(ctx) || did_work;
+        if (did_work) {
+            continue;
+        }
+
+        waits[0].handle = ctx.server_pipe;
+        waits[0].events = descriptor_defs::kWaitRead;
+        waits[0].revents = 0;
+        waits[0].reserved = 0;
+        waits[1].handle = ctx.device.handle;
+        waits[1].events = descriptor_defs::kWaitRead;
+        waits[1].revents = 0;
+        waits[1].reserved = 0;
+        if (descriptor_wait(waits, 2) < 0) {
+            yield();
+        }
     }
 }
