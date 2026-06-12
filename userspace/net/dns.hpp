@@ -71,7 +71,13 @@ inline bool ipv4_is_zero(const uint8_t ip[4]) {
     return ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0;
 }
 
+inline bool unbind_udp(uint32_t server_handle, uint16_t port);
+
 inline void close_context(ResolverContext& ctx) {
+    if (ctx.server_pipe != kInvalidDescriptor && ctx.source_port != 0) {
+        (void)unbind_udp(ctx.server_pipe, ctx.source_port);
+        ctx.source_port = 0;
+    }
     if (ctx.server_pipe != kInvalidDescriptor) {
         descriptor_close(ctx.server_pipe);
         ctx.server_pipe = kInvalidDescriptor;
@@ -121,6 +127,18 @@ inline bool bind_udp(uint32_t server_handle, uint32_t reply_pipe_id, uint16_t po
     networkd_protocol::init_message(*request, networkd_protocol::kBindUdpRequest);
     request->bind_request.reply_pipe_id = reply_pipe_id;
     request->bind_request.port = port;
+    bool ok = networkd_protocol::write_message(server_handle, *request);
+    unmap(request, sizeof(*request));
+    return ok;
+}
+
+inline bool unbind_udp(uint32_t server_handle, uint16_t port) {
+    auto* request = allocate_message_buffer();
+    if (request == nullptr) {
+        return false;
+    }
+    networkd_protocol::init_message(*request, networkd_protocol::kUnbindUdpRequest);
+    request->unbind_request.port = port;
     bool ok = networkd_protocol::write_message(server_handle, *request);
     unmap(request, sizeof(*request));
     return ok;

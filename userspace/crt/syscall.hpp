@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "descriptors.hpp"
+#include "neutrino_time.h"
 
 enum class SystemCall : long {
     AbiMajor         = 0,
@@ -47,6 +48,12 @@ enum class SystemCall : long {
     UserFind             = 38,
     UserBumpGeneration   = 39,
     UserSetPassword      = 40,
+    DirectoryCreate      = 41,
+    FileRemove           = 42,
+    DirectoryRemove      = 43,
+    TimeGet              = 44,
+    TimeSleepTicks       = 45,
+    DescriptorWait       = 46,
 };
 
 enum : uint32_t {
@@ -157,6 +164,31 @@ static inline long abi_minor() {
 
 static inline long yield() {
     return raw_syscall0(SystemCall::Yield);
+}
+
+static inline long time_get(NeutrinoWallTime* out_time) {
+    if (out_time == nullptr) {
+        return -1;
+    }
+    return raw_syscall2(SystemCall::TimeGet,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(out_time)),
+                        static_cast<long>(sizeof(*out_time)));
+}
+
+static inline long sleep_ticks(uint64_t ticks) {
+    return raw_syscall1(SystemCall::TimeSleepTicks,
+                        static_cast<long>(ticks));
+}
+
+static inline long descriptor_wait(descriptor_defs::DescriptorWait* items,
+                                   size_t count) {
+    if (items == nullptr || count == 0) {
+        return -1;
+    }
+    return raw_syscall2(SystemCall::DescriptorWait,
+                        static_cast<long>(
+                            reinterpret_cast<uintptr_t>(items)),
+                        static_cast<long>(count));
 }
 
 static inline void* map_anonymous(size_t length, uint64_t flags) {
@@ -649,6 +681,21 @@ static inline long directory_read(uint32_t handle, DirEntry* out_entry) {
 static inline long directory_close(uint32_t handle) {
     return raw_syscall1(SystemCall::DirectoryClose,
                         static_cast<long>(handle));
+}
+
+static inline long directory_create(const char* path) {
+    return raw_syscall1(SystemCall::DirectoryCreate,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long file_remove(const char* path) {
+    return raw_syscall1(SystemCall::FileRemove,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long directory_remove(const char* path) {
+    return raw_syscall1(SystemCall::DirectoryRemove,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
 }
 // user and principal helpers
 static inline void* user_create(const char* name, uint64_t caps) {

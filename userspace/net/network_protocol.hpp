@@ -26,6 +26,7 @@ enum MessageType : uint16_t {
     kSendIcmpEchoRequest = 3,
     kBindTcpRequest = 4,
     kSendTcpRequest = 5,
+    kUnbindUdpRequest = 6,
     kBindUdpResponse = 0x8001,
     kSendUdpResponse = 0x8002,
     kUdpPacketEvent = 0x8003,
@@ -112,6 +113,12 @@ struct BindUdpResponse {
     int32_t status;
     uint16_t port;
     uint16_t reserved;
+};
+
+struct UnbindUdpRequest {
+    uint16_t port;
+    uint16_t reserved0;
+    uint32_t reserved1;
 };
 
 struct SendUdpRequest {
@@ -208,6 +215,7 @@ struct Message {
     union {
         BindUdpRequest bind_request;
         BindUdpResponse bind_response;
+        UnbindUdpRequest unbind_request;
         SendUdpRequest send_request;
         SendUdpResponse send_response;
         UdpPacketEvent udp_event;
@@ -244,10 +252,22 @@ inline bool write_message(uint32_t handle, const Message& message) {
         bounce_bytes[i] = src[i];
     }
     size_t written = 0;
+    descriptor_defs::DescriptorWait wait{};
+    wait.handle = handle;
+    wait.events = descriptor_defs::kWaitWrite;
+    wait.revents = 0;
+    wait.reserved = 0;
     while (written < sizeof(Message)) {
         long result = descriptor_write(handle,
                                        bounce_bytes + written,
                                        sizeof(Message) - written);
+        if (result == kDescriptorWouldBlock) {
+            wait.revents = 0;
+            if (descriptor_wait(&wait, 1) < 0) {
+                yield();
+            }
+            continue;
+        }
         if (result <= 0) {
             return false;
         }
@@ -267,6 +287,11 @@ inline bool read_message(uint32_t handle, Message& message) {
     }
     uint8_t* bounce_bytes = reinterpret_cast<uint8_t*>(bounce);
     size_t total = 0;
+    descriptor_defs::DescriptorWait wait{};
+    wait.handle = handle;
+    wait.events = descriptor_defs::kWaitRead;
+    wait.revents = 0;
+    wait.reserved = 0;
     while (total < sizeof(Message)) {
         long result = descriptor_read(handle,
                                       bounce_bytes + total,
@@ -275,7 +300,10 @@ inline bool read_message(uint32_t handle, Message& message) {
             if (total == 0) {
                 return false;
             }
-            yield();
+            wait.revents = 0;
+            if (descriptor_wait(&wait, 1) < 0) {
+                yield();
+            }
             continue;
         }
         if (result <= 0) {
