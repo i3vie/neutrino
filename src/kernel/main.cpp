@@ -36,147 +36,15 @@
 #include "error.hpp"
 #include "loader.hpp"
 #include "memory/physical_allocator.hpp"
+#include "path_util.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
 #include "string_util.hpp"
+#include "time.hpp"
 
 static void hcf(void) {
     for (;;) asm("hlt");
 }
-
-namespace {
-
-constexpr const char kRootDevicePlaceholder[] = "RootDevice";
-bool matches_literal(const char* str, size_t len, const char* literal) {
-    if (str == nullptr || literal == nullptr) {
-        return false;
-    }
-    size_t idx = 0;
-    while (idx < len && literal[idx] != '\0') {
-        if (str[idx] != literal[idx]) {
-            return false;
-        }
-        ++idx;
-    }
-    return (idx == len) && (literal[idx] == '\0');
-}
-
-bool append_chunk(const char* data, size_t length, char* out, size_t out_size,
-                  size_t& index) {
-    if (data == nullptr || out == nullptr) {
-        return false;
-    }
-    if (length == 0) {
-        return true;
-    }
-    if (index + length >= out_size) {
-        return false;
-    }
-    for (size_t i = 0; i < length; ++i) {
-        out[index++] = data[i];
-    }
-    return true;
-}
-
-bool build_mount_path(const char* spec, const char* default_mount, char* out,
-                      size_t out_size) {
-    if (spec == nullptr || out == nullptr || out_size == 0) {
-        return false;
-    }
-
-    if (spec[0] == '(') {
-        const char* mount_start = spec + 1;
-        const char* mount_end = mount_start;
-        while (*mount_end != '\0' && *mount_end != ')') {
-            ++mount_end;
-        }
-        if (*mount_end != ')') {
-            return false;
-        }
-        size_t mount_len = static_cast<size_t>(mount_end - mount_start);
-        if (mount_len == 0) {
-            return false;
-        }
-
-        const char* remainder = mount_end + 1;
-        while (*remainder == '/') {
-            ++remainder;
-        }
-        size_t remainder_len = string_util::length(remainder);
-        if (remainder_len == 0) {
-            return false;
-        }
-
-        const char* mount_value = mount_start;
-        size_t mount_value_len = mount_len;
-        if (matches_literal(mount_start, mount_len, kRootDevicePlaceholder)) {
-            if (default_mount == nullptr || default_mount[0] == '\0') {
-                return false;
-            }
-            mount_value = default_mount;
-            mount_value_len = string_util::length(default_mount);
-        }
-
-        size_t idx = 0;
-        if (!append_chunk(mount_value, mount_value_len, out, out_size, idx)) {
-            return false;
-        }
-        if (idx + 1 >= out_size) {
-            return false;
-        }
-        out[idx++] = '/';
-        if (!append_chunk(remainder, remainder_len, out, out_size, idx)) {
-            return false;
-        }
-        if (idx >= out_size) {
-            return false;
-        }
-        out[idx] = '\0';
-        return true;
-    }
-
-    size_t spec_len = string_util::length(spec);
-    if (spec_len == 0) {
-        return false;
-    }
-
-    bool has_slash = string_util::contains(spec, '/');
-    if (has_slash || default_mount == nullptr || default_mount[0] == '\0') {
-        size_t idx = 0;
-        if (!append_chunk(spec, spec_len, out, out_size, idx)) {
-            return false;
-        }
-        if (idx >= out_size) {
-            return false;
-        }
-        out[idx] = '\0';
-        return true;
-    }
-
-    size_t mount_len = string_util::length(default_mount);
-    if (mount_len == 0) {
-        return false;
-    }
-
-    size_t idx = 0;
-    if (!append_chunk(default_mount, mount_len, out, out_size, idx)) {
-        return false;
-    }
-    if (idx + 1 >= out_size) {
-        return false;
-    }
-    out[idx++] = '/';
-    if (!append_chunk(spec, spec_len, out, out_size, idx)) {
-        return false;
-    }
-    if (idx >= out_size) {
-        return false;
-    }
-    out[idx] = '\0';
-    return true;
-}
-
-}  // namespace
 
 constexpr size_t BOOTSTRAP_STACK_SIZE = 0x8000;
 alignas(16) static uint8_t bootstrap_stack[BOOTSTRAP_STACK_SIZE];
@@ -198,7 +66,8 @@ static void kernel_main_stage2() {
     if (framebuffer_request.response == nullptr ||
         framebuffer_request.response->framebuffer_count == 0) {
         // limine didn't give us a framebuffer
-        hcf();
+        hcf(); // normally we'd want to use error_screen::display but that depends on fbcon
+        // so we can't actually use it without a framebuffer
     }
 
     auto fb = *framebuffer_request.response->framebuffers[0];
@@ -310,6 +179,11 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Info, "Configuring PIT");
     pit::init(100);
     log_message(LogLevel::Info, "PIT configured");
+
+    log_message(LogLevel::Info, "Initializing wall clock");
+    if (!timekeeping::init_from_rtc(100)) {
+        log_message(LogLevel::Warn, "Wall clock unavailable");
+    }
 
     log_message(
         LogLevel::Debug, "Kernel phys base addr: %016x",
@@ -495,7 +369,7 @@ static void kernel_main_stage2() {
 
     config::Table kernel_config{};
     bool kernel_config_loaded = false;
-    char init_task_path[64] = {0};
+    char init_task_path[path_util::kMaxPathLength] = {0};
     bool init_task_path_valid = false;
 
     constexpr size_t kMountQueryLimit = 16;
@@ -552,21 +426,8 @@ static void kernel_main_stage2() {
                         static_cast<unsigned int>(entry_count));
         }
 
-        char path[64];
-        string_util::copy(path, sizeof(path), root_ptr);
-        size_t base_len = string_util::length(path);
-        if (base_len + 1 < sizeof(path)) {
-            path[base_len] = '/';
-            ++base_len;
-
-            const char* target = "KERNEL.CFG";
-            size_t target_len = string_util::length(target);
-            if (base_len + target_len < sizeof(path)) {
-                for (size_t idx = 0; idx < target_len; ++idx) {
-                    path[base_len + idx] = target[idx];
-                }
-                path[base_len + target_len] = '\0';
-
+        char path[path_util::kMaxPathLength];
+        if (path_util::build_absolute_path(boot_cwd, ".../KERNEL.CFG", path)) {
                 uint8_t file_buffer[1024];
                 size_t file_size = 0;
                 if (vfs::read_file(path, file_buffer, sizeof(file_buffer),
@@ -584,9 +445,9 @@ static void kernel_main_stage2() {
                     const char* init_spec = nullptr;
                     if (config::get(kernel_config, "KERNEL.INIT_TASK",
                                     init_spec)) {
-                        if (build_mount_path(init_spec, root_ptr,
-                                             init_task_path,
-                                             sizeof(init_task_path))) {
+                        if (path_util::build_absolute_path(boot_cwd,
+                                                           init_spec,
+                                                           init_task_path)) {
                             init_task_path_valid = true;
                             log_message(LogLevel::Info,
                                         "Boot: init task set to %s",
@@ -602,7 +463,6 @@ static void kernel_main_stage2() {
                     log_message(LogLevel::Debug,
                                 "VFS: %s not present or read failed", path);
                 }
-            }
         }
     } else {
         log_message(LogLevel::Warn,
@@ -631,43 +491,27 @@ static void kernel_main_stage2() {
         init_candidates[init_candidate_count++] = init_task_path;
     }
 
-    char default_init_paths[2][64] = {{0}};
+    char default_init_paths[2][path_util::kMaxPathLength] = {{0}};
     size_t default_paths_used = 0;
 
     if (root_ptr != nullptr) {
-        constexpr const char* kDefaultInitFiles[] = {"init.elf", "init.bin"};
+        constexpr const char* kDefaultInitFiles[] = {
+            ".../init.elf",
+            ".../init.bin",
+        };
 
         for (const char* fallback : kDefaultInitFiles) {
             if (default_paths_used >= 2) {
                 break;
             }
 
-            char* buffer = default_init_paths[default_paths_used];
-            string_util::copy(buffer,
-                              sizeof(default_init_paths[default_paths_used]),
-                              root_ptr);
-            size_t len = string_util::length(buffer);
-            if (len + 1 >= sizeof(default_init_paths[default_paths_used])) {
+            auto& buffer = default_init_paths[default_paths_used];
+            if (!path_util::build_absolute_path(boot_cwd, fallback, buffer)) {
                 log_message(LogLevel::Warn,
-                            "Boot: init path truncated for root mount '%s'",
-                            root_ptr);
+                            "Boot: invalid init fallback path '%s'",
+                            fallback);
                 continue;
             }
-            buffer[len++] = '/';
-
-            size_t fallback_len = string_util::length(fallback);
-            if (len + fallback_len >=
-                sizeof(default_init_paths[default_paths_used])) {
-                log_message(
-                    LogLevel::Warn,
-                    "Boot: init filename '%s' truncated for root mount '%s'",
-                    fallback, root_ptr);
-                continue;
-            }
-            for (size_t idx = 0; idx < fallback_len; ++idx) {
-                buffer[len + idx] = fallback[idx];
-            }
-            buffer[len + fallback_len] = '\0';
 
             bool duplicate = init_task_path_valid &&
                              string_util::equals(init_task_path, buffer);
@@ -736,6 +580,4 @@ static void kernel_main_stage2() {
     scheduler::run();
 
     error_screen::display("SCHEDULER_EXITED", nullptr, nullptr);
-
-    hcf();
 }

@@ -14,6 +14,7 @@ bool register_block_device_descriptor();
 bool register_shared_memory_descriptor();
 bool register_vty_descriptor();
 bool register_cpu_stats_descriptor();
+bool register_task_stats_descriptor();
 bool register_net_device_descriptor();
 bool register_net_endpoint_descriptor();
 
@@ -59,6 +60,10 @@ void register_builtin_types() {
     if (!register_cpu_stats_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register cpu stats descriptor type");
+    }
+    if (!register_task_stats_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register task stats descriptor type");
     }
     if (!register_net_device_descriptor()) {
         log_message(LogLevel::Warn,

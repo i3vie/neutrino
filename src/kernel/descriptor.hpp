@@ -18,6 +18,7 @@ struct BlockDevice;
 namespace descriptor {
 
 constexpr size_t kMaxDescriptors = 640;
+constexpr size_t kMaxWaitDescriptors = 64;
 constexpr uint32_t kInvalidHandle = 0xFFFFFFFFu;
 
 constexpr uint32_t kHandleIndexBits = 16;
@@ -44,6 +45,8 @@ constexpr uint32_t kTypeVty =
     static_cast<uint32_t>(descriptor_defs::Type::Vty);
 constexpr uint32_t kTypeCpuStats =
     static_cast<uint32_t>(descriptor_defs::Type::CpuStats);
+constexpr uint32_t kTypeTaskStats =
+    static_cast<uint32_t>(descriptor_defs::Type::TaskStats);
 constexpr uint32_t kTypeNetDevice =
     static_cast<uint32_t>(descriptor_defs::Type::NetDevice);
 constexpr uint32_t kTypeNetEndpoint =
@@ -201,6 +204,11 @@ int set_property(process::Process& proc,
                  uint32_t property,
                  uint64_t in_ptr,
                  uint64_t size);
+int wait(process::Process& proc,
+         Table& table,
+         uint64_t user_address,
+         size_t count);
+void wake_waiters();
 
 void register_framebuffer_device(Framebuffer& framebuffer,
                                  uint64_t physical_base);
