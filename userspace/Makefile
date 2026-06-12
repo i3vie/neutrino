@@ -18,7 +18,7 @@ SRC_PROG_DIR := programs
 OUT_DIR  := out
 BIN_DIR  := binary
 
-PROGRAMS := init shell photon wavelength ion orbital ls cat flux userctl hexedit installer netctl networkd tcpd dhcp ping tcpecho netget browse netshell
+PROGRAMS := init shell ls cat mkdir rm cp mv userctl hexedit installer netctl networkd tcpd dhcp ping tcpecho netget browse netshell date top
 PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
@@ -47,6 +47,7 @@ MOUNT_GID ?= $(shell id -g)
 MOUNT_OPTS ?= loop,rw,uid=$(MOUNT_UID),gid=$(MOUNT_GID),umask=022
 
 .PHONY: all bearssl clean install install-mount install-mtools
+.SECONDEXPANSION:
 
 all: $(PROGRAM_OUTPUTS)
 
@@ -58,13 +59,13 @@ $(BEARSSL_DIR)/inc/bearssl.h:
 $(OBJ_DIR)/crt0.o: $(CRT_DIR)/crt0.s $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(NASM) $(ASFLAGS) $< -o $@
 
-$(OBJ_DIR)/lattice.o: lattice/lattice.cpp lattice/lattice.hpp $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
-	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
-
 $(OBJ_DIR)/libc_string.o: $(LIBC_DIR)/string.cpp $(LIBC_DIR)/include/string.h | $(OBJ_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/libc_ctype.o: $(LIBC_DIR)/ctype.cpp $(LIBC_DIR)/include/ctype.h | $(OBJ_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/libc_neutrino.o: $(LIBC_DIR)/neutrino.cpp $(LIBC_DIR)/include/neutrino.h $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
 
 $(OBJ_DIR)/bearssl/%.o: $(BEARSSL_DIR)/src/%.c $(BEARSSL_DIR)/inc/bearssl.h | $(OBJ_DIR)
@@ -76,8 +77,8 @@ $(BEARSSL_LIB): $(BEARSSL_DIR)/inc/bearssl.h $(BEARSSL_OBJECTS) | $(OBJ_DIR)
 
 bearssl: $(BEARSSL_LIB)
 
-$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/lattice.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(CRT_DIR)/syscall.hpp $(PROGRAM_LIBS_$*) | $(OUT_DIR)
-	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/lattice.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $< $(PROGRAM_LIBS_$*) -o $@
+$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_LIBS_$$*) | $(OUT_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $< $(PROGRAM_LIBS_$*) -o $@
 	@mkdir -p $(BIN_DIR)
 	@cp $@ $(BIN_DIR)/$*.elf
 
