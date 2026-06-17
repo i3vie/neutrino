@@ -235,8 +235,12 @@ size_t enumerate_ahci_devices(fs::BlockDevice* out_devices, size_t max_devices) 
 
             fs::BlockDevice& device = out_devices[exported_count];
             device.name = name_buffer;
+            device.parent_name = ahci::device_name(device_index);
             device.sector_size = 512;
             device.sector_count = sector_count;
+            device.start_lba = base_lba;
+            device.partition_index = partition_ordinal;
+            device.partition_type = partitions[partition_index].type;
             device.descriptor_handle = descriptor::kInvalidHandle;
             device.read = ahci_partition_read;
             device.write = ahci_partition_write;

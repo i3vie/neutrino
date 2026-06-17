@@ -55,6 +55,7 @@ enum class SystemCall : uint64_t {
     TimeGet               = 44,
     TimeSleepTicks        = 45,
     DescriptorWait        = 46,
+    Mount                 = 48,
 };
 
 Result handle_syscall(SyscallFrame& frame);

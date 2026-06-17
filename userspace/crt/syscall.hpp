@@ -55,6 +55,7 @@ enum class SystemCall : long {
     TimeSleepTicks       = 45,
     DescriptorWait       = 46,
     UserInfo             = 47,
+    Mount                = 48,
 };
 
 enum : uint32_t {
@@ -398,6 +399,14 @@ static inline long descriptor_set_property(uint32_t handle,
                                static_cast<long>(reinterpret_cast<uintptr_t>(bounce)),
                                static_cast<long>(size));
     return result;
+}
+
+static inline long mount_descriptor(uint32_t block_handle,
+                                    const char* mount_name) {
+    return raw_syscall2(SystemCall::Mount,
+                        static_cast<long>(block_handle),
+                        static_cast<long>(
+                            reinterpret_cast<uintptr_t>(mount_name)));
 }
 
 static inline long shared_memory_open(const char* name, size_t length) {

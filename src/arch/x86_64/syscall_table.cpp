@@ -1,6 +1,7 @@
 #include "arch/x86_64/syscall_table.hpp"
 
 #include "../../drivers/log/logging.hpp"
+#include "../../drivers/fs/mount_manager.hpp"
 #include "../../kernel/descriptor.hpp"
 #include "../../kernel/capabilities.hpp"
 #include "../../kernel/file_io.hpp"
@@ -21,7 +22,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 0;
-constexpr uint64_t kAbiMinor = 5;
+constexpr uint64_t kAbiMinor = 6;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
@@ -208,6 +209,8 @@ bool load_program_image(const char* path, loader::ProgramImage& out_image) {
 bool descriptor_type_requires_hardware_access(uint32_t type) {
     return type == descriptor::kTypeSerial ||
            type == descriptor::kTypeBlockDevice ||
+           type == descriptor::kTypeDisk ||
+           type == descriptor::kTypePartition ||
            type == descriptor::kTypeNetDevice;
 }
 
@@ -532,6 +535,47 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Reschedule;
             }
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
+            return Result::Continue;
+        }
+        case SystemCall::Mount: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::HardwareAccess,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            fs::BlockDevice device{};
+            if (!descriptor::block_device_from_descriptor(
+                    *proc,
+                    static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
+                    device)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char mount_name[64]{};
+            const char* mount_name_ptr = nullptr;
+            if (frame.rsi != 0) {
+                if (!vm::copy_user_string(
+                        reinterpret_cast<const char*>(frame.rsi),
+                        mount_name,
+                        sizeof(mount_name))) {
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+                if (mount_name[0] != '\0') {
+                    mount_name_ptr = mount_name;
+                }
+            }
+
+            bool ok = fs::mount_block_device(device, mount_name_ptr);
+            frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
         case SystemCall::FileOpen: {

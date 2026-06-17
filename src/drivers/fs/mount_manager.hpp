@@ -21,4 +21,6 @@ bool mount_requested_filesystems(const char* root_spec,
                                  size_t mount_count,
                                  size_t& out_total_mounted);
 
+bool mount_block_device(const BlockDevice& device, const char* mount_name);
+
 }  // namespace fs

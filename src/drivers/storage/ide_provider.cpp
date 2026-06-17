@@ -237,8 +237,12 @@ size_t enumerate_ide_devices(fs::BlockDevice* out_devices,
 
             fs::BlockDevice& device = out_devices[device_count];
             device.name = name_buffer;
+            device.parent_name = cfg.base_name;
             device.sector_size = 512;
             device.sector_count = sector_count;
+            device.start_lba = base_lba;
+            device.partition_index = partition_index;
+            device.partition_type = partitions[index].type;
             device.read = ide_partition_read;
             device.write = ide_partition_write;
             device.context = &context;

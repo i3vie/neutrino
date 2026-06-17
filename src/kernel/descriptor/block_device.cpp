@@ -23,7 +23,13 @@ struct BlockDeviceRecord {
     char name[kMaxBlockDeviceNameLen];
 };
 
+struct DiskRecord {
+    bool in_use;
+    char name[kMaxBlockDeviceNameLen];
+};
+
 BlockDeviceRecord g_block_devices[kMaxBlockDescriptors];
+DiskRecord g_disk_records[kMaxBlockDescriptors];
 
 BlockDeviceRecord* find_block_device_by_name(const char* name) {
     if (name == nullptr) {
@@ -52,6 +58,149 @@ BlockDeviceRecord* find_block_device_by_index(uint64_t index) {
         ++count;
     }
     return nullptr;
+}
+
+bool starts_with_disk_partition_prefix(const char* name, const char* disk_name) {
+    if (name == nullptr || disk_name == nullptr || disk_name[0] == '\0') {
+        return false;
+    }
+    size_t idx = 0;
+    while (disk_name[idx] != '\0') {
+        if (name[idx] != disk_name[idx]) {
+            return false;
+        }
+        ++idx;
+    }
+    return name[idx] == '_';
+}
+
+bool block_device_belongs_to_disk(const BlockDeviceRecord& record,
+                                  const char* disk_name) {
+    if (!record.in_use) {
+        return false;
+    }
+    if (record.device.parent_name != nullptr &&
+        string_util::equals(record.device.parent_name, disk_name)) {
+        return true;
+    }
+    return starts_with_disk_partition_prefix(record.name, disk_name);
+}
+
+BlockDeviceRecord* find_partition_by_index(const char* disk_name,
+                                           uint64_t index) {
+    size_t count = 0;
+    for (auto& record : g_block_devices) {
+        if (!block_device_belongs_to_disk(record, disk_name)) {
+            continue;
+        }
+        if (count == index) {
+            return &record;
+        }
+        ++count;
+    }
+    return nullptr;
+}
+
+size_t partition_count_for_disk(const char* disk_name) {
+    size_t count = 0;
+    for (auto& record : g_block_devices) {
+        if (block_device_belongs_to_disk(record, disk_name)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool disk_exists(const char* disk_name) {
+    return partition_count_for_disk(disk_name) != 0;
+}
+
+bool disk_name_seen(const char* disk_name, char names[][kMaxBlockDeviceNameLen],
+                    size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (string_util::equals(names[i], disk_name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool disk_name_from_partition(const char* partition_name,
+                              char* out,
+                              size_t out_size) {
+    if (partition_name == nullptr || out == nullptr || out_size == 0) {
+        return false;
+    }
+    size_t len = string_util::length(partition_name);
+    while (len > 0 && partition_name[len - 1] != '_') {
+        --len;
+    }
+    if (len == 0 || len >= out_size) {
+        return false;
+    }
+    --len;
+    if (len == 0 || len >= out_size) {
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = partition_name[i];
+    }
+    out[len] = '\0';
+    return true;
+}
+
+bool disk_name_by_index(uint64_t index, char* out, size_t out_size) {
+    char seen[kMaxBlockDescriptors][kMaxBlockDeviceNameLen]{};
+    size_t seen_count = 0;
+    for (auto& record : g_block_devices) {
+        if (!record.in_use) {
+            continue;
+        }
+        char disk_name[kMaxBlockDeviceNameLen]{};
+        if (record.device.parent_name != nullptr) {
+            string_util::copy(disk_name,
+                              sizeof(disk_name),
+                              record.device.parent_name);
+        } else if (!disk_name_from_partition(record.name,
+                                             disk_name,
+                                             sizeof(disk_name))) {
+            continue;
+        }
+        if (disk_name_seen(disk_name, seen, seen_count)) {
+            continue;
+        }
+        if (seen_count == index) {
+            string_util::copy(out, out_size, disk_name);
+            return true;
+        }
+        string_util::copy(seen[seen_count], sizeof(seen[seen_count]), disk_name);
+        ++seen_count;
+    }
+    return false;
+}
+
+DiskRecord* allocate_disk_record(const char* name) {
+    for (auto& record : g_disk_records) {
+        if (!record.in_use) {
+            record.in_use = true;
+            string_util::copy(record.name, sizeof(record.name), name);
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+DescriptorEntry* lookup_process_entry(process::Process& proc, uint32_t handle) {
+    uint16_t index = handle_index(handle);
+    uint16_t generation = handle_generation(handle);
+    if (index >= kMaxDescriptors || generation == 0) {
+        return nullptr;
+    }
+    DescriptorEntry& entry = proc.descriptors.entries[index];
+    if (!entry.in_use || entry.generation != generation) {
+        return nullptr;
+    }
+    return &entry;
 }
 
 struct BlockRequest {
@@ -93,6 +242,14 @@ void lock_sync_io() {
 
 void unlock_sync_io() {
     __atomic_clear(&g_sync_io_lock, __ATOMIC_RELEASE);
+}
+
+void close_disk(DescriptorEntry& entry) {
+    auto* record = static_cast<DiskRecord*>(entry.object);
+    if (record != nullptr) {
+        record->in_use = false;
+        record->name[0] = '\0';
+    }
 }
 
 bool copy_from_caller(const process::Process& proc,
@@ -464,10 +621,107 @@ int block_device_get_property(DescriptorEntry& entry,
     return -1;
 }
 
+int disk_get_property(DescriptorEntry& entry,
+                      uint32_t property,
+                      void* out,
+                      size_t size) {
+    auto* record = static_cast<DiskRecord*>(entry.object);
+    if (record == nullptr || !record->in_use) {
+        return -1;
+    }
+    if (property == static_cast<uint32_t>(descriptor_defs::Property::DiskInfo)) {
+        if (out == nullptr || size < sizeof(descriptor_defs::DiskInfo)) {
+            return -1;
+        }
+        auto* info = reinterpret_cast<descriptor_defs::DiskInfo*>(out);
+        *info = {};
+        string_util::copy(info->name, sizeof(info->name), record->name);
+        info->partition_count =
+            static_cast<uint32_t>(partition_count_for_disk(record->name));
+        return 0;
+    }
+    return -1;
+}
+
+int partition_get_property(DescriptorEntry& entry,
+                           uint32_t property,
+                           void* out,
+                           size_t size) {
+    if (property == static_cast<uint32_t>(
+                        descriptor_defs::Property::PartitionInfo)) {
+        auto* record = static_cast<BlockDeviceRecord*>(entry.object);
+        if (record == nullptr || !record->in_use || out == nullptr ||
+            size < sizeof(descriptor_defs::PartitionInfo)) {
+            return -1;
+        }
+        auto* info = reinterpret_cast<descriptor_defs::PartitionInfo*>(out);
+        *info = {};
+        string_util::copy(info->name, sizeof(info->name), record->name);
+        info->start_lba = record->device.start_lba;
+        info->sector_count = record->device.sector_count;
+        info->index = record->device.partition_index;
+        info->type = record->device.partition_type;
+        return 0;
+    }
+    return block_device_get_property(entry, property, out, size);
+}
+
+int64_t disk_read(process::Process& proc,
+                  DescriptorEntry& entry,
+                  uint64_t user_address,
+                  uint64_t length,
+                  uint64_t offset) {
+    auto* disk = static_cast<DiskRecord*>(entry.object);
+    if (disk == nullptr || !disk->in_use || user_address == 0 ||
+        length == 0 ||
+        (offset % sizeof(descriptor_defs::PartitionInfo)) != 0) {
+        return -1;
+    }
+
+    uint64_t index = offset / sizeof(descriptor_defs::PartitionInfo);
+    size_t written = 0;
+    while (written + sizeof(descriptor_defs::PartitionInfo) <= length) {
+        BlockDeviceRecord* part = find_partition_by_index(disk->name, index);
+        if (part == nullptr) {
+            break;
+        }
+
+        descriptor_defs::PartitionInfo info{};
+        string_util::copy(info.name, sizeof(info.name), part->name);
+        info.start_lba = part->device.start_lba;
+        info.sector_count = part->device.sector_count;
+        info.index = part->device.partition_index;
+        info.type = part->device.partition_type;
+        if (!copy_to_caller(proc,
+                            user_address + written,
+                            &info,
+                            sizeof(info))) {
+            return -1;
+        }
+        written += sizeof(info);
+        ++index;
+    }
+    return static_cast<int64_t>(written);
+}
+
 const Ops kBlockDeviceOps{
     .read = block_device_read,
     .write = block_device_write,
     .get_property = block_device_get_property,
+    .set_property = nullptr,
+};
+
+const Ops kDiskOps{
+    .read = disk_read,
+    .write = nullptr,
+    .get_property = disk_get_property,
+    .set_property = nullptr,
+};
+
+const Ops kPartitionOps{
+    .read = block_device_read,
+    .write = block_device_write,
+    .get_property = partition_get_property,
     .set_property = nullptr,
 };
 
@@ -505,9 +759,88 @@ bool open_block_device(process::Process& proc,
     alloc.has_extended_flags = false;
     alloc.object = record;
     alloc.subsystem_data = nullptr;
-    alloc.close = nullptr;
+    alloc.close = close_disk;
     alloc.name = record->name;
     alloc.ops = &kBlockDeviceOps;
+    return true;
+}
+
+bool open_disk(process::Process&,
+               uint64_t name_ptr,
+               uint64_t index,
+               uint64_t,
+               Allocation& alloc) {
+    char disk_name[kMaxBlockDeviceNameLen]{};
+    if (name_ptr != 0) {
+        string_util::copy(disk_name,
+                          sizeof(disk_name),
+                          reinterpret_cast<const char*>(name_ptr));
+    } else if (!disk_name_by_index(index, disk_name, sizeof(disk_name))) {
+        return false;
+    }
+    if (!disk_exists(disk_name)) {
+        return false;
+    }
+    DiskRecord* record = allocate_disk_record(disk_name);
+    if (record == nullptr) {
+        return false;
+    }
+
+    alloc.type = kTypeDisk;
+    alloc.flags = static_cast<uint64_t>(Flag::Readable) |
+                  static_cast<uint64_t>(Flag::Device) |
+                  static_cast<uint64_t>(Flag::Block);
+    alloc.extended_flags = 0;
+    alloc.has_extended_flags = false;
+    alloc.object = record;
+    alloc.subsystem_data = nullptr;
+    alloc.close = nullptr;
+    alloc.name = record->name;
+    alloc.ops = &kDiskOps;
+    return true;
+}
+
+bool open_partition(process::Process& proc,
+                    uint64_t disk_handle,
+                    uint64_t partition_index,
+                    uint64_t,
+                    Allocation& alloc) {
+    DescriptorEntry* disk_entry =
+        lookup_process_entry(proc, static_cast<uint32_t>(disk_handle));
+    if (disk_entry == nullptr || disk_entry->type != kTypeDisk) {
+        return false;
+    }
+    auto* disk = static_cast<DiskRecord*>(disk_entry->object);
+    if (disk == nullptr || !disk->in_use) {
+        return false;
+    }
+
+    BlockDeviceRecord* record =
+        find_partition_by_index(disk->name, partition_index);
+    if (record == nullptr ||
+        (record->locked && !is_kernel_process(proc))) {
+        return false;
+    }
+
+    alloc.type = kTypePartition;
+    uint64_t flags = static_cast<uint64_t>(Flag::Seekable) |
+                     static_cast<uint64_t>(Flag::Device) |
+                     static_cast<uint64_t>(Flag::Block) |
+                     static_cast<uint64_t>(Flag::Async);
+    if (record->device.read != nullptr) {
+        flags |= static_cast<uint64_t>(Flag::Readable);
+    }
+    if (record->device.write != nullptr) {
+        flags |= static_cast<uint64_t>(Flag::Writable);
+    }
+    alloc.flags = flags;
+    alloc.extended_flags = 0;
+    alloc.has_extended_flags = false;
+    alloc.object = record;
+    alloc.subsystem_data = nullptr;
+    alloc.close = nullptr;
+    alloc.name = record->name;
+    alloc.ops = &kPartitionOps;
     return true;
 }
 
@@ -522,6 +855,9 @@ void clear_block_devices() {
         record.device.descriptor_handle = kInvalidHandle;
         record.handle = kInvalidHandle;
         record.locked = false;
+    }
+    for (auto& record : g_disk_records) {
+        record = {};
     }
 }
 
@@ -543,7 +879,36 @@ void service_requests(size_t sector_budget) {
 }  // namespace block_device_descriptor
 
 bool register_block_device_descriptor() {
-    return register_type(kTypeBlockDevice, block_device_descriptor::open_block_device, &block_device_descriptor::kBlockDeviceOps);
+    bool ok = register_type(kTypeBlockDevice,
+                            block_device_descriptor::open_block_device,
+                            &block_device_descriptor::kBlockDeviceOps);
+    ok = register_type(kTypeDisk,
+                       block_device_descriptor::open_disk,
+                       &block_device_descriptor::kDiskOps) && ok;
+    ok = register_type(kTypePartition,
+                       block_device_descriptor::open_partition,
+                       &block_device_descriptor::kPartitionOps) && ok;
+    return ok;
+}
+
+bool block_device_from_descriptor(process::Process& proc,
+                                  uint32_t handle,
+                                  fs::BlockDevice& out) {
+    DescriptorEntry* entry =
+        block_device_descriptor::lookup_process_entry(proc, handle);
+    if (entry == nullptr ||
+        (entry->type != kTypeBlockDevice && entry->type != kTypePartition)) {
+        return false;
+    }
+    auto* record =
+        static_cast<block_device_descriptor::BlockDeviceRecord*>(entry->object);
+    if (record == nullptr || !record->in_use) {
+        return false;
+    }
+    out = record->device;
+    out.name = entry->name;
+    out.descriptor_handle = kInvalidHandle;
+    return true;
 }
 
 bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel) {

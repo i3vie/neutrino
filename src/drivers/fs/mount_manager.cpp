@@ -51,6 +51,31 @@ bool strings_equal(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
+constexpr size_t kMaxDynamicMountNames = 16;
+constexpr size_t kDynamicMountNameLen = 64;
+char g_dynamic_mount_names[kMaxDynamicMountNames][kDynamicMountNameLen];
+size_t g_dynamic_mount_name_count = 0;
+
+const char* store_mount_name(const char* requested, const char* fallback) {
+    const char* source =
+        (requested != nullptr && requested[0] != '\0') ? requested : fallback;
+    if (source == nullptr || source[0] == '\0') {
+        return nullptr;
+    }
+    if (g_dynamic_mount_name_count >= kMaxDynamicMountNames) {
+        return nullptr;
+    }
+
+    char* dest = g_dynamic_mount_names[g_dynamic_mount_name_count++];
+    size_t idx = 0;
+    while (idx + 1 < kDynamicMountNameLen && source[idx] != '\0') {
+        dest[idx] = source[idx];
+        ++idx;
+    }
+    dest[idx] = '\0';
+    return dest;
+}
+
 }  // namespace
 
 void register_block_device_provider(BlockDeviceEnumerateFn fn) {
@@ -204,6 +229,32 @@ bool mount_requested_filesystems(const char* root_spec,
 
     out_total_mounted = mounted;
     return root_mounted;
+}
+
+bool mount_block_device(const BlockDevice& device, const char* mount_name) {
+    ensure_builtins_registered();
+
+    const char* stable_name = store_mount_name(mount_name, device.name);
+    if (stable_name == nullptr) {
+        log_message(LogLevel::Warn,
+                    "MountManager: no mount name available for dynamic mount");
+        return false;
+    }
+
+    BlockDevice mount_device = device;
+    mount_device.name = stable_name;
+
+    for (size_t driver_index = 0;
+         driver_index < g_filesystem_driver_count; ++driver_index) {
+        if (g_filesystem_drivers[driver_index](mount_device)) {
+            return true;
+        }
+    }
+
+    log_message(LogLevel::Info,
+                "MountManager: no filesystem driver accepted %s",
+                stable_name);
+    return false;
 }
 
 }  // namespace fs

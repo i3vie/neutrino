@@ -37,6 +37,10 @@ constexpr uint32_t kTypeFramebuffer =
     static_cast<uint32_t>(descriptor_defs::Type::Framebuffer);
 constexpr uint32_t kTypeBlockDevice =
     static_cast<uint32_t>(descriptor_defs::Type::BlockDevice);
+constexpr uint32_t kTypeDisk =
+    static_cast<uint32_t>(descriptor_defs::Type::Disk);
+constexpr uint32_t kTypePartition =
+    static_cast<uint32_t>(descriptor_defs::Type::Partition);
 constexpr uint32_t kTypePipe =
     static_cast<uint32_t>(descriptor_defs::Type::Pipe);
 constexpr uint32_t kTypeSharedMemory =
@@ -217,6 +221,9 @@ uint32_t framebuffer_active_slot();
 bool framebuffer_is_active(uint32_t index);
 int32_t framebuffer_slot_for_process(const process::Process& proc);
 bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel);
+bool block_device_from_descriptor(process::Process& proc,
+                                  uint32_t handle,
+                                  fs::BlockDevice& out);
 void reset_block_device_registry();
 bool vty_write(uint32_t id, const char* data, size_t length);
 

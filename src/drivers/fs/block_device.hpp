@@ -23,8 +23,12 @@ using BlockWriteFn =
 
 struct BlockDevice {
     const char* name;
+    const char* parent_name = nullptr;
     size_t sector_size;
     uint64_t sector_count;
+    uint64_t start_lba = 0;
+    uint32_t partition_index = 0;
+    uint8_t partition_type = 0xFF;
     uint32_t descriptor_handle = descriptor::kInvalidHandle;
     BlockReadFn read;
     BlockWriteFn write;

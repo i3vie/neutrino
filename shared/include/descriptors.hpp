@@ -12,6 +12,8 @@ enum class Type : uint16_t {
     Mouse       = 0x004,
     Framebuffer = 0x010,
     BlockDevice = 0x020,
+    Disk        = 0x021,
+    Partition   = 0x022,
     Pipe        = 0x030,
     SharedMemory = 0x040,
     Vty         = 0x050,
@@ -42,6 +44,8 @@ enum class Property : uint32_t {
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     BlockGeometry     = 0x00020001,
+    DiskInfo          = 0x00020002,
+    PartitionInfo     = 0x00020003,
     SharedMemoryInfo  = 0x00030001,
     PipeInfo          = 0x00040001,
     VtyInfo           = 0x00050001,
@@ -104,6 +108,21 @@ struct FramebufferRect {
 struct BlockGeometry {
     uint64_t sector_size;
     uint64_t sector_count;
+};
+
+struct DiskInfo {
+    char name[32];
+    uint32_t partition_count;
+    uint32_t reserved;
+};
+
+struct PartitionInfo {
+    char name[32];
+    uint64_t start_lba;
+    uint64_t sector_count;
+    uint32_t index;
+    uint8_t type;
+    uint8_t reserved[3];
 };
 
 struct SharedMemoryInfo {
