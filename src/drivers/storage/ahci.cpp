@@ -407,10 +407,21 @@ bool issue_command(DeviceState& device,
 
     volatile HbaPort& port = *device.port;
     if (!wait_port_idle(port)) {
+        log_message(LogLevel::Warn,
+                    "AHCI: port %u busy before %s lba=%llu count=%u tfd=%08x is=%08x serr=%08x ci=%08x",
+                    device.port_index,
+                    is_write ? "write" : "read",
+                    static_cast<unsigned long long>(lba),
+                    static_cast<unsigned>(sector_count),
+                    port.tfd,
+                    port.is,
+                    port.serr,
+                    port.ci);
         return false;
     }
 
     port.is = 0xFFFFFFFFu;
+    port.serr = 0xFFFFFFFFu;
 
     auto* headers =
         reinterpret_cast<HbaCommandHeader*>(device.command_list_virt);
@@ -450,16 +461,45 @@ bool issue_command(DeviceState& device,
     for (uint32_t spins = 0; spins < 4000000; ++spins) {
         if ((port.ci & 1u) == 0) {
             if ((port.is & kPortIsTfes) != 0) {
+                log_message(LogLevel::Warn,
+                            "AHCI: %s failed lba=%llu count=%u tfd=%08x is=%08x serr=%08x sact=%08x",
+                            is_write ? "write" : "read",
+                            static_cast<unsigned long long>(lba),
+                            static_cast<unsigned>(sector_count),
+                            port.tfd,
+                            port.is,
+                            port.serr,
+                            port.sact);
                 return false;
             }
             return true;
         }
         if ((port.is & kPortIsTfes) != 0) {
+            log_message(LogLevel::Warn,
+                        "AHCI: %s taskfile error lba=%llu count=%u tfd=%08x is=%08x serr=%08x sact=%08x ci=%08x",
+                        is_write ? "write" : "read",
+                        static_cast<unsigned long long>(lba),
+                        static_cast<unsigned>(sector_count),
+                        port.tfd,
+                        port.is,
+                        port.serr,
+                        port.sact,
+                        port.ci);
             return false;
         }
         cpu_relax();
     }
 
+    log_message(LogLevel::Warn,
+                "AHCI: %s timeout lba=%llu count=%u tfd=%08x is=%08x serr=%08x sact=%08x ci=%08x",
+                is_write ? "write" : "read",
+                static_cast<unsigned long long>(lba),
+                static_cast<unsigned>(sector_count),
+                port.tfd,
+                port.is,
+                port.serr,
+                port.sact,
+                port.ci);
     return false;
 }
 

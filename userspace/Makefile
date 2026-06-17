@@ -18,7 +18,7 @@ SRC_PROG_DIR := programs
 OUT_DIR  := out
 BIN_DIR  := binary
 
-PROGRAMS := init shell ls cat mkdir rm cp mv userctl hexedit installer netctl networkd tcpd dhcp ping tcpecho netget browse netshell date top
+PROGRAMS := init shell ls cat mkdir rm cp mv userctl hexedit installer mkneufs netctl networkd tcpd dhcp ping tcpecho netget browse netshell date top
 PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
@@ -45,9 +45,14 @@ MOUNT_DIR ?= $(HOME)/MountedImage
 MOUNT_UID ?= $(shell id -u)
 MOUNT_GID ?= $(shell id -g)
 MOUNT_OPTS ?= loop,rw,uid=$(MOUNT_UID),gid=$(MOUNT_GID),umask=022
+RESET_USERS ?= 0
 
-.PHONY: all bearssl clean install install-mount install-mtools
+.PHONY: all bearssl clean install install-reset-users install-mount install-mtools
 .SECONDEXPANSION:
+
+ifneq ($(filter clean,$(MAKECMDGOALS)),)
+.NOTPARALLEL:
+endif
 
 all: $(PROGRAM_OUTPUTS)
 
@@ -77,12 +82,14 @@ $(BEARSSL_LIB): $(BEARSSL_DIR)/inc/bearssl.h $(BEARSSL_OBJECTS) | $(OBJ_DIR)
 
 bearssl: $(BEARSSL_LIB)
 
+INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all
+
 $(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_LIBS_$$*) | $(OUT_DIR)
+	@mkdir -p $(OUT_DIR) $(BIN_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $< $(PROGRAM_LIBS_$*) -o $@
-	@mkdir -p $(BIN_DIR)
 	@cp $@ $(BIN_DIR)/$*.elf
 
-install: all
+install: $(INSTALL_PREREQS)
 	@set -euo pipefail; \
 	mkdir -p "$(MOUNT_DIR)"; \
 	mounted=0; \
@@ -94,6 +101,9 @@ install: all
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/binary"; \
 	$(SUDO) rm -rf "$(MOUNT_DIR)/config"; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/config"; \
+	if [[ "$(RESET_USERS)" == "1" ]]; then \
+		$(SUDO) rm -f "$(MOUNT_DIR)/system/users.ntd" "$(MOUNT_DIR)/users.ntd"; \
+	fi; \
 	for prog in $(PROGRAMS); do \
 		$(SUDO) install -m 0644 "$(OUT_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
 	done; \
@@ -104,6 +114,9 @@ install: all
 		$(SUDO) install -m 0644 "$(OUT_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \
 	fi; \
 	sync
+
+install-reset-users:
+	$(MAKE) install RESET_USERS=1
 
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)

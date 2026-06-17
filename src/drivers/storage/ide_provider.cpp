@@ -200,7 +200,7 @@ size_t enumerate_ide_devices(fs::BlockDevice* out_devices,
         bool use_whole_disk = false;
         if (partition_count == 0) {
             log_message(LogLevel::Info,
-                        "IDE %s: no FAT32 partitions detected, using whole disk",
+                        "IDE %s: no recognized partitions detected, using whole disk",
                         ide_device_name(cfg.device));
             partitions[0] = {0xFF, 0, 0, identify.sector_count};
             partition_count = 1;

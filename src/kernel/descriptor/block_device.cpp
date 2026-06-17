@@ -5,6 +5,7 @@
 #include "../string_util.hpp"
 #include "../scheduler.hpp"
 #include "../vm.hpp"
+#include "../../lib/mem.hpp"
 
 namespace descriptor {
 
@@ -12,6 +13,7 @@ namespace block_device_descriptor {
 
 constexpr size_t kMaxBlockDescriptors = 32;
 constexpr size_t kMaxBlockDeviceNameLen = 32;
+constexpr size_t kBlockIoBufferSize = 128 * 1024;
 
 struct BlockDeviceRecord {
     fs::BlockDevice device;
@@ -66,8 +68,10 @@ struct BlockRequest {
 
 constexpr size_t kMaxBlockRequests = 16;
 BlockRequest g_block_requests[kMaxBlockRequests];
-alignas(16) uint8_t g_block_io_buffer[4096];
+alignas(4096) uint8_t g_block_io_buffer[kBlockIoBufferSize];
+alignas(4096) uint8_t g_sync_block_io_buffer[kBlockIoBufferSize];
 volatile int g_request_lock = 0;
+volatile int g_sync_io_lock = 0;
 bool g_worker_started = false;
 process::Process* g_worker = nullptr;
 
@@ -79,6 +83,50 @@ void lock_requests() {
 
 void unlock_requests() {
     __atomic_clear(&g_request_lock, __ATOMIC_RELEASE);
+}
+
+void lock_sync_io() {
+    while (__atomic_test_and_set(&g_sync_io_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_sync_io() {
+    __atomic_clear(&g_sync_io_lock, __ATOMIC_RELEASE);
+}
+
+bool copy_from_caller(const process::Process& proc,
+                      void* dest,
+                      uint64_t src,
+                      size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (dest == nullptr || src == 0) {
+        return false;
+    }
+    if (is_kernel_process(proc)) {
+        memcpy(dest, reinterpret_cast<const void*>(src), length);
+        return true;
+    }
+    return vm::copy_from_user(proc.cr3, dest, src, length);
+}
+
+bool copy_to_caller(const process::Process& proc,
+                    uint64_t dest,
+                    const void* src,
+                    size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (dest == 0 || src == nullptr) {
+        return false;
+    }
+    if (is_kernel_process(proc)) {
+        memcpy(reinterpret_cast<void*>(dest), src, length);
+        return true;
+    }
+    return vm::copy_to_user(proc.cr3, dest, src, length);
 }
 
 BlockRequest* allocate_request() {
@@ -268,24 +316,44 @@ int64_t block_device_read(process::Process& proc,
     }
     uint64_t remaining = sector_count;
     uint64_t current_lba = lba;
-    uint8_t* buffer = reinterpret_cast<uint8_t*>(user_address);
-    if (buffer == nullptr) {
+    if (user_address == 0) {
+        return -1;
+    }
+    size_t max_sectors =
+        static_cast<size_t>(sizeof(g_sync_block_io_buffer) / sector_size);
+    if (max_sectors == 0) {
         return -1;
     }
 
+    lock_sync_io();
     while (remaining > 0) {
-        uint8_t chunk = static_cast<uint8_t>(
-            (remaining > 0xFFu) ? 0xFFu : remaining);
+        uint64_t chunk64 = remaining;
+        if (chunk64 > 0xFFu) {
+            chunk64 = 0xFFu;
+        }
+        if (chunk64 > max_sectors) {
+            chunk64 = max_sectors;
+        }
+        uint8_t chunk = static_cast<uint8_t>(chunk64);
         fs::BlockIoStatus status =
             read_fn(record->device.context, static_cast<uint32_t>(current_lba),
-                    chunk, buffer);
+                    chunk, g_sync_block_io_buffer);
         if (status != fs::BlockIoStatus::Ok) {
+            unlock_sync_io();
+            return -1;
+        }
+        size_t transfer_bytes =
+            static_cast<size_t>(chunk) * static_cast<size_t>(sector_size);
+        uint64_t dest = user_address +
+                        (current_lba - lba) * sector_size;
+        if (!copy_to_caller(proc, dest, g_sync_block_io_buffer, transfer_bytes)) {
+            unlock_sync_io();
             return -1;
         }
         current_lba += chunk;
         remaining -= chunk;
-        buffer += static_cast<uint64_t>(chunk) * sector_size;
     }
+    unlock_sync_io();
     return static_cast<int64_t>(length);
 }
 
@@ -332,26 +400,46 @@ int64_t block_device_write(process::Process& proc,
     }
     uint64_t remaining = sector_count;
     uint64_t current_lba = lba;
-    const uint8_t* buffer = reinterpret_cast<const uint8_t*>(user_address);
-    if (buffer == nullptr) {
+    if (user_address == 0) {
+        return -1;
+    }
+    size_t max_sectors =
+        static_cast<size_t>(sizeof(g_sync_block_io_buffer) / sector_size);
+    if (max_sectors == 0) {
         return -1;
     }
 
+    lock_sync_io();
     while (remaining > 0) {
-        uint8_t chunk = static_cast<uint8_t>(
-            (remaining > 0xFFu) ? 0xFFu : remaining);
+        uint64_t chunk64 = remaining;
+        if (chunk64 > 0xFFu) {
+            chunk64 = 0xFFu;
+        }
+        if (chunk64 > max_sectors) {
+            chunk64 = max_sectors;
+        }
+        uint8_t chunk = static_cast<uint8_t>(chunk64);
+        size_t transfer_bytes =
+            static_cast<size_t>(chunk) * static_cast<size_t>(sector_size);
+        uint64_t src = user_address +
+                       (current_lba - lba) * sector_size;
+        if (!copy_from_caller(proc, g_sync_block_io_buffer, src, transfer_bytes)) {
+            unlock_sync_io();
+            return -1;
+        }
         fs::BlockIoStatus status =
             write_fn(record->device.context,
                      static_cast<uint32_t>(current_lba),
                      chunk,
-                     buffer);
+                     g_sync_block_io_buffer);
         if (status != fs::BlockIoStatus::Ok) {
+            unlock_sync_io();
             return -1;
         }
         current_lba += chunk;
         remaining -= chunk;
-        buffer += static_cast<uint64_t>(chunk) * sector_size;
     }
+    unlock_sync_io();
     return static_cast<int64_t>(length);
 }
 

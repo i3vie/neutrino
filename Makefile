@@ -23,6 +23,9 @@ QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
 QEMU_NET_DEVICE ?= e1000e
 QEMU_STORAGE ?= ide
+QEMU_PRIMARY_IMG ?= hdd.img
+QEMU_EXTRA_IDE_IMG ?=
+QEMU_EXTRA_AHCI_IMG ?=
 QEMU_HOSTFWD ?= tcp::2222-:2222
 QEMU_TAP_IFACE ?= tap0
 QEMU_TAP_SCRIPT ?= no
@@ -40,13 +43,26 @@ QEMU_NET_ARGS := $(QEMU_NETDEV_USER) \
 endif
 ifeq ($(QEMU_STORAGE),ahci)
 QEMU_STORAGE_ARGS := -device ahci,id=ahci0 \
-		-drive file=hdd.img,format=raw,if=none,id=disk0 \
+		-drive file=$(QEMU_PRIMARY_IMG),format=raw,if=none,id=disk0 \
 		-device ide-hd,drive=disk0,bus=ahci0.0
 QEMU_ROOT_DEVICE := AHCI_0_0
-else
-QEMU_STORAGE_ARGS := -drive file=hdd.img,format=raw,if=ide
-QEMU_ROOT_DEVICE := IDE_PM_0
+ifneq ($(strip $(QEMU_EXTRA_AHCI_IMG)),)
+QEMU_AHCI_EXTRA_ARGS := -drive file=$(QEMU_EXTRA_AHCI_IMG),format=raw,if=none,id=ahci_extra_disk0 \
+		-device ide-hd,drive=ahci_extra_disk0,bus=ahci0.1
 endif
+else
+QEMU_STORAGE_ARGS := -drive file=$(QEMU_PRIMARY_IMG),format=raw,if=ide,index=0
+QEMU_ROOT_DEVICE := IDE_PM_0
+ifneq ($(strip $(QEMU_EXTRA_AHCI_IMG)),)
+QEMU_AHCI_EXTRA_ARGS := -device ahci,id=ahci_extra0 \
+		-drive file=$(QEMU_EXTRA_AHCI_IMG),format=raw,if=none,id=ahci_extra_disk0 \
+		-device ide-hd,drive=ahci_extra_disk0,bus=ahci_extra0.0
+endif
+endif
+ifneq ($(strip $(QEMU_EXTRA_IDE_IMG)),)
+QEMU_IDE_EXTRA_ARGS := -drive file=$(QEMU_EXTRA_IDE_IMG),format=raw,if=ide,index=2
+endif
+QEMU_STORAGE_ARGS += $(QEMU_IDE_EXTRA_ARGS) $(QEMU_AHCI_EXTRA_ARGS)
 QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		$(QEMU_STORAGE_ARGS) \

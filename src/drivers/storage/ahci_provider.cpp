@@ -192,7 +192,7 @@ size_t enumerate_ahci_devices(fs::BlockDevice* out_devices, size_t max_devices) 
         bool use_whole_disk = false;
         if (partition_count == 0) {
             log_message(LogLevel::Info,
-                        "AHCI %s: no FAT32 partitions detected, using whole disk",
+                        "AHCI %s: no recognized partitions detected, using whole disk",
                         ahci::device_name(device_index));
             uint64_t disk_sectors = identify.sector_count;
             if (disk_sectors > 0xFFFFFFFFull) {
