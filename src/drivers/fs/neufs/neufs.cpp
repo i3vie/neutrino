@@ -494,6 +494,59 @@ static bool bitmap_clear_range(const fs::BlockDevice& device,
     return true;
 }
 
+static bool bitmap_range_all_set(const fs::BlockDevice& device,
+                                 uint64_t bitmap_offset,
+                                 uint64_t start_bit,
+                                 uint64_t count_bits,
+                                 bool& out_all_set) {
+    out_all_set = false;
+    uint64_t current_bit = start_bit;
+    uint64_t end_bit = start_bit + count_bits;
+
+    while (current_bit < end_bit && (current_bit % 8) != 0) {
+        bool used = false;
+        if (!bitmap_get_bit(device, bitmap_offset, current_bit, used)) {
+            return false;
+        }
+        if (!used) {
+            return true;
+        }
+        ++current_bit;
+    }
+
+    uint8_t buffer[kSectorScratchSize];
+    while (current_bit + 8 <= end_bit) {
+        uint64_t bytes_remaining = (end_bit - current_bit) / 8;
+        size_t chunk = static_cast<size_t>(bytes_remaining);
+        if (chunk > sizeof(buffer)) {
+            chunk = sizeof(buffer);
+        }
+        if (!read_bytes(device, bitmap_offset + (current_bit / 8), buffer, chunk)) {
+            return false;
+        }
+        for (size_t i = 0; i < chunk; ++i) {
+            if (buffer[i] != 0xFF) {
+                return true;
+            }
+        }
+        current_bit += static_cast<uint64_t>(chunk) * 8;
+    }
+
+    while (current_bit < end_bit) {
+        bool used = false;
+        if (!bitmap_get_bit(device, bitmap_offset, current_bit, used)) {
+            return false;
+        }
+        if (!used) {
+            return true;
+        }
+        ++current_bit;
+    }
+
+    out_all_set = true;
+    return true;
+}
+
 static bool bitmap_find_run(const fs::BlockDevice& device,
                             uint64_t bitmap_offset,
                             uint64_t bitmap_bits,
@@ -520,6 +573,167 @@ static bool bitmap_find_run(const fs::BlockDevice& device,
         }
     }
     return false;
+}
+
+static bool bitmap_find_run_from(const fs::BlockDevice& device,
+                                 uint64_t bitmap_offset,
+                                 uint64_t bitmap_bits,
+                                 uint64_t start_bit,
+                                 uint64_t run_bits,
+                                 uint64_t& out_start_bit) {
+    if (run_bits == 0) {
+        out_start_bit = start_bit;
+        return start_bit <= bitmap_bits;
+    }
+    if (start_bit >= bitmap_bits) {
+        return false;
+    }
+
+    uint64_t consecutive = 0;
+    for (uint64_t bit = start_bit; bit < bitmap_bits; ++bit) {
+        bool used = false;
+        if (!bitmap_get_bit(device, bitmap_offset, bit, used)) {
+            return false;
+        }
+        if (!used) {
+            ++consecutive;
+            if (consecutive == run_bits) {
+                out_start_bit = bit - run_bits + 1;
+                return true;
+            }
+        } else {
+            consecutive = 0;
+        }
+    }
+    return false;
+}
+
+static bool bitmap_find_first_clear_from(const fs::BlockDevice& device,
+                                         uint64_t bitmap_offset,
+                                         uint64_t bitmap_bits,
+                                         uint64_t start_bit,
+                                         uint64_t& out_bit) {
+    if (start_bit >= bitmap_bits) {
+        return false;
+    }
+
+    uint64_t current_bit = start_bit;
+    while (current_bit < bitmap_bits && (current_bit % 8) != 0) {
+        bool used = false;
+        if (!bitmap_get_bit(device, bitmap_offset, current_bit, used)) {
+            return false;
+        }
+        if (!used) {
+            out_bit = current_bit;
+            return true;
+        }
+        ++current_bit;
+    }
+
+    uint8_t buffer[kSectorScratchSize];
+    while (current_bit + 8 <= bitmap_bits) {
+        uint64_t bytes_remaining = (bitmap_bits - current_bit) / 8;
+        size_t chunk = static_cast<size_t>(bytes_remaining);
+        if (chunk > sizeof(buffer)) {
+            chunk = sizeof(buffer);
+        }
+        if (!read_bytes(device, bitmap_offset + (current_bit / 8), buffer, chunk)) {
+            return false;
+        }
+        for (size_t byte_index = 0; byte_index < chunk; ++byte_index) {
+            if (buffer[byte_index] == 0xFF) {
+                continue;
+            }
+            uint64_t byte_bit =
+                current_bit + static_cast<uint64_t>(byte_index) * 8;
+            for (uint8_t bit = 0; bit < 8; ++bit) {
+                uint64_t candidate = byte_bit + bit;
+                if (candidate >= bitmap_bits) {
+                    return false;
+                }
+                if ((buffer[byte_index] & (1u << bit)) == 0) {
+                    out_bit = candidate;
+                    return true;
+                }
+            }
+        }
+        current_bit += static_cast<uint64_t>(chunk) * 8;
+    }
+
+    while (current_bit < bitmap_bits) {
+        bool used = false;
+        if (!bitmap_get_bit(device, bitmap_offset, current_bit, used)) {
+            return false;
+        }
+        if (!used) {
+            out_bit = current_bit;
+            return true;
+        }
+        ++current_bit;
+    }
+
+    return false;
+}
+
+static bool bitmap_reserved_ranges_valid(const neufs::NeufsVolume& volume) {
+    if (!volume.has_bitmaps) {
+        return false;
+    }
+
+    uint64_t used_data_sectors =
+        align_up(volume.meta_size, volume.device.sector_size) /
+        volume.device.sector_size;
+    bool range_set = false;
+    if (!bitmap_range_all_set(volume.device,
+                              volume.data_bitmap_offset,
+                              0,
+                              used_data_sectors,
+                              range_set) ||
+        !range_set) {
+        return false;
+    }
+
+    uint64_t rvt_blocks = align_up(sizeof(NeufsRvt), 8) / 8;
+    uint64_t data_bitmap_blocks =
+        align_up(volume.data_bitmap_size_bytes, 8) / 8;
+    uint64_t meta_bitmap_blocks =
+        align_up(volume.meta_bitmap_size_bytes, 8) / 8;
+    uint64_t root_blocks = align_up(sizeof(NeufsNdir), 8) / 8;
+
+    if (!bitmap_range_all_set(volume.device,
+                              volume.meta_bitmap_offset,
+                              0,
+                              rvt_blocks,
+                              range_set) ||
+        !range_set) {
+        return false;
+    }
+    if (!bitmap_range_all_set(volume.device,
+                              volume.meta_bitmap_offset,
+                              volume.data_bitmap_offset / 8,
+                              data_bitmap_blocks,
+                              range_set) ||
+        !range_set) {
+        return false;
+    }
+    if (!bitmap_range_all_set(volume.device,
+                              volume.meta_bitmap_offset,
+                              volume.meta_bitmap_offset / 8,
+                              meta_bitmap_blocks,
+                              range_set) ||
+        !range_set) {
+        return false;
+    }
+    if (!bitmap_range_all_set(volume.device,
+                              volume.meta_bitmap_offset,
+                              volume.root_offset / 8,
+                              root_blocks,
+                              range_set) ||
+        !range_set) {
+        return false;
+    }
+
+    return true;
 }
 
 bool mark_metadata_bytes(neufs::NeufsVolume& volume, uint64_t offset, size_t size) {
@@ -667,6 +881,63 @@ static bool free_data_bytes(neufs::NeufsVolume& volume, uint64_t offset, size_t 
     return bitmap_clear_range(volume.device, volume.data_bitmap_offset, start_sector, sector_count);
 }
 
+static bool extend_data_bytes(neufs::NeufsVolume& volume,
+                              uint64_t offset,
+                              size_t old_size,
+                              size_t new_size) {
+    if (new_size <= old_size) {
+        return true;
+    }
+
+    size_t old_aligned =
+        static_cast<size_t>(align_up(old_size, volume.device.sector_size));
+    size_t new_aligned =
+        static_cast<size_t>(align_up(new_size, volume.device.sector_size));
+    if (new_aligned <= old_aligned) {
+        return true;
+    }
+
+    uint64_t extension_offset = offset + old_aligned;
+    uint64_t extension_size = new_aligned - old_aligned;
+    uint64_t disk_size = volume.device.sector_size * volume.device.sector_count;
+    if (extension_offset > disk_size || extension_offset + extension_size > disk_size) {
+        return false;
+    }
+
+    uint64_t start_sector = extension_offset / volume.device.sector_size;
+    uint64_t sector_count = extension_size / volume.device.sector_size;
+
+    if (volume.has_bitmaps && volume.data_bitmap_size_bytes > 0) {
+        for (uint64_t sector = 0; sector < sector_count; ++sector) {
+            bool used = true;
+            if (!bitmap_get_bit(volume.device,
+                                volume.data_bitmap_offset,
+                                start_sector + sector,
+                                used) ||
+                used) {
+                return false;
+            }
+        }
+        if (!bitmap_set_range(volume.device,
+                              volume.data_bitmap_offset,
+                              start_sector,
+                              sector_count)) {
+            return false;
+        }
+        uint64_t extension_end = extension_offset + extension_size;
+        if (extension_end > volume.next_free_data) {
+            volume.next_free_data = extension_end;
+        }
+        return true;
+    }
+
+    if (volume.next_free_data != extension_offset) {
+        return false;
+    }
+    volume.next_free_data += extension_size;
+    return true;
+}
+
 static bool free_metadata_bytes(neufs::NeufsVolume& volume, uint64_t offset, size_t size) {
     if (!volume.has_bitmaps || volume.meta_bitmap_size_bytes == 0) {
         return false;
@@ -680,36 +951,52 @@ bool allocate_metadata_bytes(neufs::NeufsVolume& volume,
                              size_t size,
                              uint64_t& out_offset) {
     size = static_cast<size_t>(align_up(size, 8));
-    // Try bitmap allocation first
+
     if (volume.has_bitmaps && volume.meta_bitmap_size_bytes > 0) {
         uint64_t blocks_needed = (size + 7) / 8;
-        uint64_t meta_bits = (volume.meta_bitmap_size_bytes * 8);
+        uint64_t meta_bits = volume.meta_size / 8;
         uint64_t start_bit = 0;
-        if (bitmap_find_run(volume.device, volume.meta_bitmap_offset, meta_bits, blocks_needed, start_bit)) {
-            // mark bits and return offset
-            if (!bitmap_set_range(volume.device, volume.meta_bitmap_offset, start_bit, blocks_needed)) {
-                return false;
-            }
-            out_offset = start_bit * 8;
-            return true;
-        }
-        // else fallthrough to linear allocation
-    }
-
-    // Linear allocation fallback
-    if (volume.next_free_metadata + size > volume.meta_size) {
-        return false;
-    }
-    out_offset = volume.next_free_metadata;
-    volume.next_free_metadata += size;
-    if (volume.has_bitmaps && volume.meta_bitmap_size_bytes > 0) {
-        uint64_t start_block = out_offset / 8;
-        uint64_t block_count = (size + 7) / 8;
-        if (!bitmap_set_range(volume.device, volume.meta_bitmap_offset, start_block, block_count)) {
+        uint64_t cursor_bit = volume.next_free_metadata / 8;
+        if (!bitmap_find_run_from(volume.device,
+                                  volume.meta_bitmap_offset,
+                                  meta_bits,
+                                  cursor_bit,
+                                  blocks_needed,
+                                  start_bit) &&
+            !bitmap_find_run(volume.device,
+                             volume.meta_bitmap_offset,
+                             meta_bits,
+                             blocks_needed,
+                             start_bit)) {
             return false;
         }
+        if (!bitmap_set_range(volume.device,
+                              volume.meta_bitmap_offset,
+                              start_bit,
+                              blocks_needed)) {
+            return false;
+        }
+        out_offset = start_bit * 8;
+        uint64_t next_clear = 0;
+        if (bitmap_find_first_clear_from(volume.device,
+                                         volume.meta_bitmap_offset,
+                                         meta_bits,
+                                         start_bit + blocks_needed,
+                                         next_clear)) {
+            volume.next_free_metadata = next_clear * 8;
+        } else {
+            volume.next_free_metadata = volume.meta_size;
+        }
+        return true;
     }
-    return true;
+
+    if (volume.next_free_metadata + size <= volume.meta_size) {
+        out_offset = volume.next_free_metadata;
+        volume.next_free_metadata += size;
+        return true;
+    }
+
+    return false;
 }
 
 bool allocate_data_bytes(neufs::NeufsVolume& volume,
@@ -721,32 +1008,52 @@ bool allocate_data_bytes(neufs::NeufsVolume& volume,
     }
     size = static_cast<size_t>(align_up(size, volume.device.sector_size));
     uint64_t sector_count_needed = size / volume.device.sector_size;
-    // Try bitmap allocation first
+
+    uint64_t total_bytes = volume.device.sector_size * volume.device.sector_count;
     if (volume.has_bitmaps && volume.data_bitmap_size_bytes > 0) {
         uint64_t data_bits = volume.device.sector_count;
         uint64_t start_bit = 0;
-        if (bitmap_find_run(volume.device, volume.data_bitmap_offset, data_bits, sector_count_needed, start_bit)) {
-            if (!bitmap_set_range(volume.device, volume.data_bitmap_offset, start_bit, sector_count_needed)) {
-                return false;
-            }
-            out_offset = start_bit * volume.device.sector_size;
-            return true;
-        }
-        // else fallthrough to linear allocation
-    }
-
-    if (volume.next_free_data + size > volume.device.sector_size * volume.device.sector_count) {
-        return false;
-    }
-    out_offset = volume.next_free_data;
-    volume.next_free_data += size;
-    if (volume.has_bitmaps && volume.data_bitmap_size_bytes > 0) {
-        uint64_t start_sector = out_offset / volume.device.sector_size;
-        if (!bitmap_set_range(volume.device, volume.data_bitmap_offset, start_sector, sector_count_needed)) {
+        uint64_t cursor_bit = volume.next_free_data / volume.device.sector_size;
+        if (!bitmap_find_run_from(volume.device,
+                                  volume.data_bitmap_offset,
+                                  data_bits,
+                                  cursor_bit,
+                                  sector_count_needed,
+                                  start_bit) &&
+            !bitmap_find_run(volume.device,
+                             volume.data_bitmap_offset,
+                             data_bits,
+                             sector_count_needed,
+                             start_bit)) {
             return false;
         }
+        if (!bitmap_set_range(volume.device,
+                              volume.data_bitmap_offset,
+                              start_bit,
+                              sector_count_needed)) {
+            return false;
+        }
+        out_offset = start_bit * volume.device.sector_size;
+        uint64_t next_clear = 0;
+        if (bitmap_find_first_clear_from(volume.device,
+                                         volume.data_bitmap_offset,
+                                         data_bits,
+                                         start_bit + sector_count_needed,
+                                         next_clear)) {
+            volume.next_free_data = next_clear * volume.device.sector_size;
+        } else {
+            volume.next_free_data = total_bytes;
+        }
+        return true;
     }
-    return true;
+
+    if (volume.next_free_data + size <= total_bytes) {
+        out_offset = volume.next_free_data;
+        volume.next_free_data += size;
+        return true;
+    }
+
+    return false;
 }
 
 bool ensure_name(char* dest, size_t dest_size, const char* source) {
@@ -1228,6 +1535,92 @@ bool free_file_storage(neufs::NeufsVolume& volume, const NeufsFile& file) {
     return ok;
 }
 
+bool load_single_extent(const neufs::NeufsVolume& volume,
+                        const NeufsFile& file,
+                        uint64_t& out_dcptr_offset,
+                        NeufsDcptr& out_dcptr) {
+    if (file.content[0] == 0) {
+        return false;
+    }
+    for (size_t index = 1; index < 512; ++index) {
+        if (file.content[index] != 0) {
+            return false;
+        }
+    }
+
+    NeufsDcblk dcblk{};
+    if (!load_dcblk(volume, file.content[0], dcblk)) {
+        return false;
+    }
+    if (dcblk.dcptrs[0] == 0) {
+        return false;
+    }
+    for (size_t index = 1; index < 512; ++index) {
+        if (dcblk.dcptrs[index] != 0) {
+            return false;
+        }
+    }
+
+    NeufsDcptr dcptr{};
+    if (!load_dcptr(volume, dcblk.dcptrs[0], dcptr)) {
+        return false;
+    }
+    if (dcptr.len != file.size) {
+        return false;
+    }
+
+    out_dcptr_offset = dcblk.dcptrs[0];
+    out_dcptr = dcptr;
+    return true;
+}
+
+bool write_single_extent_file(neufs::NeufsVolume& volume,
+                              uint64_t file_offset,
+                              NeufsFile& file,
+                              uint64_t write_offset,
+                              const void* buffer,
+                              size_t buffer_size,
+                              size_t& out_size) {
+    uint64_t target_end = write_offset + buffer_size;
+    if (target_end < write_offset) {
+        return false;
+    }
+
+    uint64_t dcptr_offset = 0;
+    NeufsDcptr dcptr{};
+    if (!load_single_extent(volume, file, dcptr_offset, dcptr)) {
+        return false;
+    }
+
+    if (target_end > file.size) {
+        if (write_offset != file.size) {
+            return false;
+        }
+        if (!extend_data_bytes(volume,
+                               dcptr.start,
+                               static_cast<size_t>(file.size),
+                               static_cast<size_t>(target_end))) {
+            return false;
+        }
+    }
+
+    if (!write_bytes(volume.device, dcptr.start + write_offset, buffer, buffer_size)) {
+        return false;
+    }
+
+    if (target_end > file.size) {
+        dcptr.len = target_end;
+        file.size = target_end;
+        if (!persist_dcptr(volume, dcptr_offset, dcptr) ||
+            !persist_file(volume, file_offset, file)) {
+            return false;
+        }
+    }
+
+    out_size = buffer_size;
+    return true;
+}
+
 bool write_file_contents(neufs::NeufsVolume& volume,
                          uint64_t file_offset,
                          NeufsFile& file,
@@ -1256,6 +1649,17 @@ bool write_file_contents(neufs::NeufsVolume& volume,
 
     if (new_size > static_cast<uint64_t>(static_cast<size_t>(new_size))) {
         return false;
+    }
+
+    if (current_size != 0 &&
+        write_single_extent_file(volume,
+                                 file_offset,
+                                 file,
+                                 write_offset,
+                                 buffer,
+                                 buffer_size,
+                                 out_size)) {
+        return true;
     }
 
     uint64_t data_offset = 0;
@@ -1762,23 +2166,23 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
     }
 
     const uint64_t total_bytes = device.sector_size * device.sector_count;
-    uint64_t default_meta_size = total_bytes;
     uint64_t suggested_meta = (total_bytes * 225) / 10000;
     const uint64_t min_meta = 256ull * 1024ull * 1024ull;
     const uint64_t max_meta = 16ull * 1024ull * 1024ull * 1024ull;
-    if (suggested_meta < min_meta) {
-        suggested_meta = (total_bytes < min_meta) ? total_bytes : min_meta;
+    if (suggested_meta < min_meta && total_bytes >= min_meta * 2) {
+        suggested_meta = min_meta;
     }
     if (suggested_meta > max_meta) {
         suggested_meta = max_meta;
     }
-    if (suggested_meta > total_bytes) {
+    if (device.sector_size != 0 && suggested_meta > total_bytes - device.sector_size) {
+        suggested_meta = total_bytes - device.sector_size;
+    } else if (device.sector_size == 0 && suggested_meta > total_bytes) {
         suggested_meta = total_bytes;
     }
-    default_meta_size = align_up(suggested_meta, device.sector_size);
 
     volume.root_offset = rvt.root;
-    volume.meta_size = default_meta_size;
+    volume.meta_size = align_up(suggested_meta, device.sector_size);
     if (volume.meta_size > total_bytes) {
         return false;
     }
@@ -1837,16 +2241,46 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
         volume.has_bitmaps = true;
     }
 
-    if (!mark_existing_directory_tree(volume, volume.root_offset)) {
-        return false;
-    }
-
     NeufsNdir root_dir{};
     if (!load_ndir(volume, volume.root_offset, root_dir)) {
         return false;
     }
     if (root_dir.type != kTypeNdir) {
         return false;
+    }
+
+    if (volume.has_bitmaps && bitmap_reserved_ranges_valid(volume)) {
+        uint64_t next_meta_bit = 0;
+        uint64_t meta_bits = volume.meta_size / 8;
+        if (bitmap_find_first_clear_from(volume.device,
+                                         volume.meta_bitmap_offset,
+                                         meta_bits,
+                                         0,
+                                         next_meta_bit)) {
+            volume.next_free_metadata = next_meta_bit * 8;
+        } else {
+            volume.next_free_metadata = volume.meta_size;
+        }
+
+        uint64_t next_data_bit = 0;
+        if (bitmap_find_first_clear_from(volume.device,
+                                         volume.data_bitmap_offset,
+                                         device.sector_count,
+                                         0,
+                                         next_data_bit)) {
+            volume.next_free_data = next_data_bit * device.sector_size;
+        } else {
+            volume.next_free_data = total_bytes;
+        }
+    } else {
+        volume.has_bitmaps = false;
+        volume.data_bitmap_offset = 0;
+        volume.data_bitmap_size_bytes = 0;
+        volume.meta_bitmap_offset = 0;
+        volume.meta_bitmap_size_bytes = 0;
+        if (!mark_existing_directory_tree(volume, volume.root_offset)) {
+            return false;
+        }
     }
 
     volume.mounted = true;

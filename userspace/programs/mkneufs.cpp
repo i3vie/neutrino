@@ -163,13 +163,15 @@ uint64_t default_meta_size(uint64_t total_bytes, uint64_t sector_size) {
     uint64_t suggested = (total_bytes * 225) / 10000;
     const uint64_t min_meta = 256ull * 1024ull * 1024ull;
     const uint64_t max_meta = 16ull * 1024ull * 1024ull * 1024ull;
-    if (suggested < min_meta) {
-        suggested = (total_bytes < min_meta) ? total_bytes : min_meta;
+    if (suggested < min_meta && total_bytes >= min_meta * 2) {
+        suggested = min_meta;
     }
     if (suggested > max_meta) {
         suggested = max_meta;
     }
-    if (suggested > total_bytes) {
+    if (sector_size != 0 && suggested > total_bytes - sector_size) {
+        suggested = total_bytes - sector_size;
+    } else if (sector_size == 0 && suggested > total_bytes) {
         suggested = total_bytes;
     }
     return align_up(suggested, sector_size);
@@ -346,7 +348,7 @@ bool format_neufs(long console,
         return false;
     }
 
-    uint64_t sectors_per_write = 32;
+    uint64_t sectors_per_write = 255;
     uint64_t scratch_size = geom.sector_size * sectors_per_write;
     uint8_t* sector = static_cast<uint8_t*>(
         map_anonymous(static_cast<size_t>(scratch_size), MAP_WRITE));
