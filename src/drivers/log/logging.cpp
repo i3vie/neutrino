@@ -19,6 +19,7 @@ size_t g_write_pos = 0;
 size_t g_start_pos = 0;
 size_t g_size = 0;
 bool g_initialized = false;
+bool g_console_enabled = true;
 
 const char* level_tag(LogLevel level) {
     switch (level) {
@@ -347,7 +348,7 @@ void store_log_line(const char* tag, const char* message) {
 }
 
 void emit_to_console(LogLevel level, const char* tag, const char* message) {
-    if (kconsole == nullptr) {
+    if (kconsole == nullptr || !g_console_enabled) {
         return;
     }
 
@@ -394,6 +395,16 @@ void log_message(LogLevel level, const char* fmt, ...) {
     emit_to_console(level, tag, buffer);
     store_log_line(tag, buffer);
     unlock_console();
+}
+
+void log_set_console_enabled(bool enabled) {
+    lock_console();
+    g_console_enabled = enabled;
+    unlock_console();
+}
+
+bool log_console_enabled() {
+    return g_console_enabled;
 }
 
 size_t log_copy_recent(char* out, size_t max_len) {

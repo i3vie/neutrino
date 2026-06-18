@@ -1,6 +1,7 @@
 #include "../descriptor.hpp"
 
 #include "../../drivers/console/console.hpp"
+#include "../../drivers/log/logging.hpp"
 #include "../process.hpp"
 
 namespace descriptor {
@@ -71,7 +72,9 @@ int console_set_property(DescriptorEntry& entry,
             property ==
                 static_cast<uint32_t>(descriptor_defs::Property::ConsoleColor) ||
             property ==
-                static_cast<uint32_t>(descriptor_defs::Property::ConsoleTextFlags)) {
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleTextFlags) ||
+            property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleKernelLog)) {
             return 0;
         }
         return -1;
@@ -146,6 +149,15 @@ int console_set_property(DescriptorEntry& entry,
                 in,
                 size);
         }
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleKernelLog)) {
+        if (in == nullptr || size < sizeof(uint8_t)) {
+            return -1;
+        }
+        uint8_t enabled = *reinterpret_cast<const uint8_t*>(in);
+        log_set_console_enabled(enabled != 0);
         return 0;
     }
     return -1;
