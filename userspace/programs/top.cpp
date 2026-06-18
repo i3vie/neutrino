@@ -275,11 +275,11 @@ void wait_for_next_second() {
     NeutrinoWallTime now{};
     NeutrinoWallTime later{};
     if (!neutrino_get_time(&now)) {
-        sleep_ticks(100);
+        sleep_seconds(1);
         return;
     }
     for (;;) {
-        sleep_ticks(1);
+        sleep_ms(1);
         if (!neutrino_get_time(&later)) {
             return;
         }

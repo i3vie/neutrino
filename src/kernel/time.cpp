@@ -325,4 +325,42 @@ uint64_t tick_count() {
     }
 }
 
+uint64_t ticks_for_duration_ns(uint64_t duration_ns) {
+    if (duration_ns == 0 ||
+        !__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
+        return 0;
+    }
+
+    uint32_t tick_hz = 0;
+    for (;;) {
+        uint32_t seq_before = __atomic_load_n(&g_time_seq, __ATOMIC_ACQUIRE);
+        if ((seq_before & 1u) != 0) {
+            continue;
+        }
+        tick_hz = __atomic_load_n(&g_tick_hz, __ATOMIC_RELAXED);
+        uint32_t seq_after = __atomic_load_n(&g_time_seq, __ATOMIC_ACQUIRE);
+        if (seq_before == seq_after) {
+            break;
+        }
+    }
+
+    if (tick_hz == 0) {
+        return 0;
+    }
+
+    uint64_t whole_seconds = duration_ns / kNanosecondsPerSecond;
+    uint64_t remainder_ns = duration_ns % kNanosecondsPerSecond;
+    if (whole_seconds >
+        UINT64_MAX / static_cast<uint64_t>(tick_hz)) {
+        return UINT64_MAX;
+    }
+    uint64_t ticks = whole_seconds * static_cast<uint64_t>(tick_hz);
+    if (remainder_ns != 0) {
+        ticks += (remainder_ns * static_cast<uint64_t>(tick_hz) +
+                  kNanosecondsPerSecond - 1u) /
+                 kNanosecondsPerSecond;
+    }
+    return ticks == 0 ? 1 : ticks;
+}
+
 }  // namespace timekeeping

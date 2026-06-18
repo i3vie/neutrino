@@ -21,8 +21,8 @@ namespace syscall {
 
 namespace {
 
-constexpr uint64_t kAbiMajor = 0;
-constexpr uint64_t kAbiMinor = 6;
+constexpr uint64_t kAbiMajor = 1;
+constexpr uint64_t kAbiMinor = 0;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
@@ -342,6 +342,29 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::Yield: {
             return Result::Reschedule;
         }
+        case SystemCall::Sleep: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            uint64_t duration_ns = frame.rdi;
+            uint64_t ticks = timekeeping::ticks_for_duration_ns(duration_ns);
+            if (ticks == 0) {
+                frame.rax = 0;
+                return Result::Continue;
+            }
+
+            uint64_t now_ticks = timekeeping::tick_count();
+            proc->sleep_until_tick =
+                ticks > UINT64_MAX - now_ticks ? UINT64_MAX
+                                                : now_ticks + ticks;
+            proc->waiting_on = nullptr;
+            proc->state = process::State::Blocked;
+            frame.rax = 0;
+            return Result::Reschedule;
+        }
         case SystemCall::DescriptorOpen: {
             process::Process* proc = process::current();
             if (proc == nullptr) {
@@ -575,6 +598,23 @@ Result handle_syscall(SyscallFrame& frame) {
             }
 
             bool ok = fs::mount_block_device(device, mount_name_ptr);
+            frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::RescanBlockDevices: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::HardwareAccess,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            size_t mounted = 0;
+            bool ok = fs::mount_requested_filesystems(nullptr, nullptr, 0, mounted);
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
@@ -1090,25 +1130,6 @@ Result handle_syscall(SyscallFrame& frame) {
 
             frame.rax = 0;
             return Result::Continue;
-        }
-        case SystemCall::TimeSleepTicks: {
-            process::Process* proc = process::current();
-            if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-
-            uint64_t ticks = frame.rdi;
-            if (ticks == 0) {
-                frame.rax = 0;
-                return Result::Continue;
-            }
-
-            proc->sleep_until_tick = timekeeping::tick_count() + ticks;
-            proc->waiting_on = nullptr;
-            proc->state = process::State::Blocked;
-            frame.rax = 0;
-            return Result::Reschedule;
         }
         case SystemCall::MapAnonymous: {
             process::Process* proc = process::current();

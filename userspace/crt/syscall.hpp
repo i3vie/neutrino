@@ -7,55 +7,56 @@
 #include "neutrino_time.h"
 
 enum class SystemCall : long {
-    AbiMajor         = 0,
-    AbiMinor         = 1,
-    Exit             = 2,
-    Yield            = 3,
-    DescriptorOpen   = 4,
-    DescriptorRead   = 5,
-    DescriptorWrite      = 6,
-    DescriptorClose      = 7,
-    DescriptorGetType    = 8,
-    DescriptorTestFlag   = 9,
-    DescriptorGetFlags   = 10,
-    DescriptorGetProperty= 11,
-    DescriptorSetProperty= 12,
-    FileOpen             = 13,
-    FileClose            = 14,
-    FileRead             = 15,
-    FileWrite            = 16,
-    FileCreate           = 17,
-    ProcessExec          = 18,
-    Child                = 19,
-    ProcessSetCwd        = 20,
-    ProcessGetCwd        = 21,
-    DirectoryOpen        = 22,
-    DirectoryRead        = 23,
-    DirectoryClose       = 24,
-    MapAnonymous         = 25,
-    MapAt                = 26,
-    Unmap                = 27,
-    ChangeSlot           = 28,
-    DirectoryOpenRoot    = 29,
-    DirectoryOpenAt      = 30,
-    FileOpenAt           = 31,
-    FileCreateAt         = 32,
-    PrincipalCreate      = 33,
-    PrincipalSet         = 34,
-    CapabilityGrant      = 35,
-    CapabilityPass       = 36,
-    UserCreate           = 37,
-    UserFind             = 38,
-    UserBumpGeneration   = 39,
-    UserSetPassword      = 40,
-    DirectoryCreate      = 41,
-    FileRemove           = 42,
-    DirectoryRemove      = 43,
-    TimeGet              = 44,
-    TimeSleepTicks       = 45,
-    DescriptorWait       = 46,
-    UserInfo             = 47,
-    Mount                = 48,
+    AbiMajor             = 0,
+    AbiMinor             = 1,
+    Exit                 = 2,
+    Yield                = 3,
+    Sleep                = 4,
+    DescriptorOpen       = 5,
+    DescriptorRead       = 6,
+    DescriptorWrite      = 7,
+    DescriptorClose      = 8,
+    DescriptorGetType    = 9,
+    DescriptorTestFlag   = 10,
+    DescriptorGetFlags   = 11,
+    DescriptorGetProperty= 12,
+    DescriptorSetProperty= 13,
+    DescriptorWait       = 14,
+    FileOpen             = 15,
+    FileClose            = 16,
+    FileRead             = 17,
+    FileWrite            = 18,
+    FileCreate           = 19,
+    FileOpenAt           = 20,
+    FileCreateAt         = 21,
+    FileRemove           = 22,
+    DirectoryOpen        = 23,
+    DirectoryRead        = 24,
+    DirectoryClose       = 25,
+    DirectoryOpenRoot    = 26,
+    DirectoryOpenAt      = 27,
+    DirectoryCreate      = 28,
+    DirectoryRemove      = 29,
+    ProcessExec          = 30,
+    Child                = 31,
+    ProcessSetCwd        = 32,
+    ProcessGetCwd        = 33,
+    MapAnonymous         = 34,
+    MapAt                = 35,
+    Unmap                = 36,
+    ChangeSlot           = 37,
+    TimeGet              = 38,
+    Mount                = 39,
+    RescanBlockDevices   = 40,
+    PrincipalCreate      = 41,
+    PrincipalSet         = 42,
+    CapabilityGrant      = 43,
+    CapabilityPass       = 44,
+    UserCreate           = 45,
+    UserFind             = 46,
+    UserBumpGeneration   = 47,
+    UserSetPassword      = 48,
+    UserInfo             = 49,
 };
 
 enum : uint32_t {
@@ -178,6 +179,19 @@ static inline long yield() {
     return raw_syscall0(SystemCall::Yield);
 }
 
+static inline long sleep_ns(uint64_t duration_ns) {
+    return raw_syscall1(SystemCall::Sleep,
+                        static_cast<long>(duration_ns));
+}
+
+static inline long sleep_ms(uint64_t duration_ms) {
+    return sleep_ns(duration_ms * 1000000ull);
+}
+
+static inline long sleep_seconds(uint64_t duration_seconds) {
+    return sleep_ns(duration_seconds * 1000000000ull);
+}
+
 static inline long time_get(NeutrinoWallTime* out_time) {
     if (out_time == nullptr) {
         return -1;
@@ -185,11 +199,6 @@ static inline long time_get(NeutrinoWallTime* out_time) {
     return raw_syscall2(SystemCall::TimeGet,
                         static_cast<long>(reinterpret_cast<uintptr_t>(out_time)),
                         static_cast<long>(sizeof(*out_time)));
-}
-
-static inline long sleep_ticks(uint64_t ticks) {
-    return raw_syscall1(SystemCall::TimeSleepTicks,
-                        static_cast<long>(ticks));
 }
 
 static inline long descriptor_wait(descriptor_defs::DescriptorWait* items,
@@ -407,6 +416,10 @@ static inline long mount_descriptor(uint32_t block_handle,
                         static_cast<long>(block_handle),
                         static_cast<long>(
                             reinterpret_cast<uintptr_t>(mount_name)));
+}
+
+static inline long rescan_block_devices() {
+    return raw_syscall0(SystemCall::RescanBlockDevices);
 }
 
 static inline long shared_memory_open(const char* name, size_t length) {
