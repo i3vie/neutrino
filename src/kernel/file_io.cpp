@@ -8,8 +8,23 @@
 #include "lib/mem.hpp"
 #include "path_util.hpp"
 #include "string_util.hpp"
+#include "vm.hpp"
 
 namespace {
+
+constexpr size_t kFileIoBounceSize = 4096;
+alignas(4096) uint8_t g_file_io_bounce[kFileIoBounceSize];
+volatile int g_file_io_bounce_lock = 0;
+
+void lock_file_io_bounce() {
+    while (__atomic_test_and_set(&g_file_io_bounce_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_file_io_bounce() {
+    __atomic_clear(&g_file_io_bounce_lock, __ATOMIC_RELEASE);
+}
 
 process::FileHandle* get_file_handle(process::Process& proc, uint32_t handle) {
     if (handle >= process::kMaxFileHandles) {
@@ -167,17 +182,47 @@ int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
         (length > static_cast<uint64_t>(SIZE_MAX))
             ? static_cast<size_t>(SIZE_MAX)
             : static_cast<size_t>(length);
-    void* buffer = reinterpret_cast<void*>(user_addr);
-    size_t out_size = 0;
-    if (!vfs::read_file(entry->handle,
-                        entry->position,
-                        buffer,
-                        requested,
-                        out_size)) {
+    if (user_addr == 0) {
         return -1;
     }
-    entry->position += static_cast<uint64_t>(out_size);
-    return static_cast<int64_t>(out_size);
+
+    size_t total_read = 0;
+    while (total_read < requested) {
+        size_t chunk = requested - total_read;
+        if (chunk > kFileIoBounceSize) {
+            chunk = kFileIoBounceSize;
+        }
+
+        size_t out_size = 0;
+        lock_file_io_bounce();
+        if (!vfs::read_file(entry->handle,
+                            entry->position + total_read,
+                            g_file_io_bounce,
+                            chunk,
+                            out_size)) {
+            unlock_file_io_bounce();
+            return total_read == 0 ? -1 : static_cast<int64_t>(total_read);
+        }
+        if (out_size == 0) {
+            unlock_file_io_bounce();
+            break;
+        }
+        if (!vm::copy_to_user(proc.cr3,
+                              user_addr + total_read,
+                              g_file_io_bounce,
+                              out_size)) {
+            unlock_file_io_bounce();
+            return total_read == 0 ? -1 : static_cast<int64_t>(total_read);
+        }
+        unlock_file_io_bounce();
+        total_read += out_size;
+        if (out_size < chunk) {
+            break;
+        }
+    }
+
+    entry->position += static_cast<uint64_t>(total_read);
+    return static_cast<int64_t>(total_read);
 }
 
 int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
@@ -194,18 +239,48 @@ int64_t write_file(process::Process& proc, uint32_t handle, uint64_t user_addr,
         (length > static_cast<uint64_t>(SIZE_MAX))
             ? static_cast<size_t>(SIZE_MAX)
             : static_cast<size_t>(length);
-    const void* buffer = reinterpret_cast<const void*>(user_addr);
-    size_t out_size = 0;
-    if (!vfs::write_file(entry->handle,
-                         entry->position,
-                         buffer,
-                         requested,
-                         out_size)) {
+    if (user_addr == 0) {
         return -1;
     }
 
-    entry->position += static_cast<uint64_t>(out_size);
-    return static_cast<int64_t>(out_size);
+    size_t total_written = 0;
+    while (total_written < requested) {
+        size_t chunk = requested - total_written;
+        if (chunk > kFileIoBounceSize) {
+            chunk = kFileIoBounceSize;
+        }
+
+        lock_file_io_bounce();
+        if (!vm::copy_from_user(proc.cr3,
+                                g_file_io_bounce,
+                                user_addr + total_written,
+                                chunk)) {
+            unlock_file_io_bounce();
+            return total_written == 0 ? -1 : static_cast<int64_t>(total_written);
+        }
+
+        size_t out_size = 0;
+        if (!vfs::write_file(entry->handle,
+                             entry->position + total_written,
+                             g_file_io_bounce,
+                             chunk,
+                             out_size)) {
+            unlock_file_io_bounce();
+            return total_written == 0 ? -1 : static_cast<int64_t>(total_written);
+        }
+        if (out_size == 0) {
+            unlock_file_io_bounce();
+            break;
+        }
+        unlock_file_io_bounce();
+        total_written += out_size;
+        if (out_size < chunk) {
+            break;
+        }
+    }
+
+    entry->position += static_cast<uint64_t>(total_written);
+    return static_cast<int64_t>(total_written);
 }
 
 int32_t open_directory(process::Process& proc, const char* path) {
@@ -408,8 +483,9 @@ int64_t read_directory(process::Process& proc, uint32_t handle,
         return 0;
     }
 
-    auto* dest = reinterpret_cast<vfs::DirEntry*>(user_addr);
-    memcpy(dest, &result, sizeof(vfs::DirEntry));
+    if (!vm::copy_to_user(proc.cr3, user_addr, &result, sizeof(vfs::DirEntry))) {
+        return -1;
+    }
     return 1;
 }
 
