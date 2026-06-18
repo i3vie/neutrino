@@ -78,7 +78,10 @@ TARGET_DISK_SIZE ?= 128M
 
 TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
-RAMFS_TRUNCATE_SIZE ?= 64M
+LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
+LIVE_ROOTFS_SIZE ?= 128M
+LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
+LIVE_ESP_SIZE ?= 64M
 
 # === Source discovery ===
 SRC_CPP := $(shell find $(SRC_DIR) -type f -name '*.cpp')
@@ -118,13 +121,14 @@ $(LIMINE_DIR):
 # === Build bootable UEFI ISO ===
 ISO_ROOT := $(OUT_DIR)/iso_root
 
-$(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
+$(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-esp
 	@echo "[ISO] Building $@"
 
 	rm -rf $(ISO_ROOT)
 	mkdir -p $(ISO_ROOT)/boot
 	cp -v out/kernel.elf $(ISO_ROOT)/boot/kernel.elf
-	cp -v hdd.img $(ISO_ROOT)/boot/rootfs.img
+	cp -v $(LIVE_ROOTFS_IMG) $(ISO_ROOT)/boot/rootfs.img
+	cp -v $(LIVE_ESP_IMG) $(ISO_ROOT)/boot/esp.img
 	mkdir -p $(ISO_ROOT)/boot/limine
 	cp -v $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	
@@ -138,7 +142,9 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
 	printf '    cmdline: ROOT=MEMDISK_0_0\n' >> $(ISO_ROOT)/limine.conf
 	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT)/limine.conf
-	printf '    module_cmdline: rootfs\n\n' >> $(ISO_ROOT)/limine.conf
+	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT)/limine.conf
+	printf '    module_path: boot():/boot/esp.img\n' >> $(ISO_ROOT)/limine.conf
+	printf '    module_cmdline: esp\n\n' >> $(ISO_ROOT)/limine.conf
 
 	mkdir -p $(ISO_ROOT)/EFI/BOOT
 	cp -v $(LIMINE_DIR)/BOOTX64.EFI $(ISO_ROOT)/EFI/BOOT/
@@ -152,7 +158,7 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO)
 
-$(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
+$(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-esp
 	@echo "[ISO] Building $@ (RAMFS)"
 
 	rm -rf $(ISO_ROOT_RAMFS)
@@ -161,8 +167,8 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	mkdir -p $(ISO_ROOT_RAMFS)/boot/limine
 	cp -v $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT_RAMFS)/boot/limine/
 
-	cp -v hdd.img $(ISO_ROOT_RAMFS)/boot/rootfs.img
-	truncate -s $(RAMFS_TRUNCATE_SIZE) $(ISO_ROOT_RAMFS)/boot/rootfs.img
+	cp -v $(LIVE_ROOTFS_IMG) $(ISO_ROOT_RAMFS)/boot/rootfs.img
+	cp -v $(LIVE_ESP_IMG) $(ISO_ROOT_RAMFS)/boot/esp.img
 
 	printf 'timeout: 1\n\n' > $(ISO_ROOT_RAMFS)/limine.conf
 	printf '/Neutrino\n' >> $(ISO_ROOT_RAMFS)/limine.conf
@@ -175,6 +181,8 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) hdd.img userspace-rootfs
 	printf '    cmdline: ROOT=MEMDISK_0_0\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    module_path: boot():/boot/esp.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '    module_cmdline: esp\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 
 	mkdir -p $(ISO_ROOT_RAMFS)/EFI/BOOT
@@ -214,6 +222,39 @@ iso-ramfs: $(TARGET_ISO_RAMFS)
 userspace-rootfs: hdd.img
 	$(MAKE) -C userspace install
 
+.PHONY: live-rootfs
+live-rootfs: $(LIVE_ROOTFS_IMG)
+	@echo "Live rootfs ready at $(LIVE_ROOTFS_IMG)"
+
+.PHONY: live-esp
+live-esp: $(LIVE_ESP_IMG)
+	@echo "Installer ESP image ready at $(LIVE_ESP_IMG)"
+
+.PHONY: force-live-esp
+force-live-esp: $(LIVE_ESP_IMG)
+
+$(LIVE_ROOTFS_IMG): userspace/Makefile $(shell find userspace/programs userspace/crt userspace/libc userspace/config -type f 2>/dev/null)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	truncate -s $(LIVE_ROOTFS_SIZE) $@
+	mkfs.fat -F 32 --mbr=y $@
+	$(MAKE) -C userspace install HDD_IMAGE=$(abspath $@)
+
+$(LIVE_ESP_IMG): $(TARGET_ELF) $(LIMINE_DIR)
+	@mkdir -p $(dir $@)
+	rm -f $@ $(OUT_DIR)/esp-limine.conf
+	truncate -s $(LIVE_ESP_SIZE) $@
+	mformat -i $@ -F ::
+	mmd -i $@ ::/EFI ::/EFI/BOOT ::/boot
+	mcopy -i $@ $(LIMINE_DIR)/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $@ $(TARGET_ELF) ::/boot/kernel.elf
+	printf 'timeout: 1\n\n' > $(OUT_DIR)/esp-limine.conf
+	printf '/Neutrino\n' >> $(OUT_DIR)/esp-limine.conf
+	printf '    protocol: limine\n' >> $(OUT_DIR)/esp-limine.conf
+	printf '    path: boot():/boot/kernel.elf\n' >> $(OUT_DIR)/esp-limine.conf
+	printf '    cmdline: ROOT=EMMC_0_1\n' >> $(OUT_DIR)/esp-limine.conf
+	mcopy -i $@ $(OUT_DIR)/esp-limine.conf ::/limine.conf
+
 .PHONY: target-disk
 target-disk: $(TARGET_DISK_IMG)
 	@echo "Target disk ready at $(TARGET_DISK_IMG)"
@@ -222,4 +263,4 @@ $(TARGET_DISK_IMG):
 	truncate -s $(TARGET_DISK_SIZE) $(TARGET_DISK_IMG)
 	mkfs.fat -F 32 --mbr=y $(TARGET_DISK_IMG)
 
-.PHONY: all clean iso iso-ramfs run userspace-rootfs
+.PHONY: all clean iso iso-ramfs run userspace-rootfs live-rootfs live-esp

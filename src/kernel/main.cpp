@@ -46,10 +46,162 @@ static void hcf(void) {
     for (;;) asm("hlt");
 }
 
+constexpr size_t kMaxCmdline = 256;
+constexpr size_t kMaxMountSpecs = 16;
+constexpr size_t kMaxSpecLen = 32;
+
 constexpr size_t BOOTSTRAP_STACK_SIZE = 0x8000;
 alignas(16) static uint8_t bootstrap_stack[BOOTSTRAP_STACK_SIZE];
 
 static void kernel_main_stage2();
+
+static void parse_boot_specs(const char* cmdline,
+                             char (&root_spec)[kMaxSpecLen],
+                             char (&mount_buffers)[kMaxMountSpecs][kMaxSpecLen],
+                             const char* (&mount_specs)[kMaxMountSpecs],
+                             size_t& mount_spec_count) {
+    if (cmdline == nullptr) {
+        return;
+    }
+
+    char buffer[kMaxCmdline];
+    size_t len = string_util::length(cmdline);
+    if (len >= sizeof(buffer)) {
+        len = sizeof(buffer) - 1;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        buffer[i] = cmdline[i];
+    }
+    buffer[len] = '\0';
+
+    char* ptr = buffer;
+    while (*ptr != '\0') {
+        while (*ptr == ' ' || *ptr == '\t' || *ptr == '\n' || *ptr == '\r') {
+            ++ptr;
+        }
+        if (*ptr == '\0') {
+            break;
+        }
+        char* token = ptr;
+        while (*ptr != '\0' && *ptr != ' ' && *ptr != '\t' &&
+               *ptr != '\n' && *ptr != '\r') {
+            ++ptr;
+        }
+        if (*ptr != '\0') {
+            *ptr++ = '\0';
+        }
+
+        if (string_util::starts_with(token, "ROOT=")) {
+            const char* value = token + 5;
+            if (*value != '\0') {
+                string_util::copy(root_spec, kMaxSpecLen, value);
+            }
+        } else if (string_util::starts_with(token, "MOUNT=")) {
+            const char* value = token + 6;
+            if (*value == '\0') {
+                continue;
+            }
+            bool duplicate = (root_spec[0] != '\0' &&
+                              string_util::equals(root_spec, value));
+            for (size_t i = 0; i < mount_spec_count && !duplicate; ++i) {
+                if (string_util::equals(mount_buffers[i], value)) {
+                    duplicate = true;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+            if (mount_spec_count < kMaxMountSpecs) {
+                string_util::copy(mount_buffers[mount_spec_count],
+                                  kMaxSpecLen,
+                                  value);
+                mount_specs[mount_spec_count] = mount_buffers[mount_spec_count];
+                ++mount_spec_count;
+            } else {
+                log_message(LogLevel::Warn,
+                            "Boot: ignoring extra MOUNT=%s (limit %zu)",
+                            value,
+                            static_cast<size_t>(kMaxMountSpecs));
+            }
+        }
+    }
+}
+
+static bool append_decimal(char* out, size_t out_size, size_t& index, size_t value) {
+    char digits[20];
+    size_t digit_count = 0;
+    do {
+        digits[digit_count++] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value != 0 && digit_count < sizeof(digits));
+
+    if (index + digit_count >= out_size) {
+        return false;
+    }
+    for (size_t i = 0; i < digit_count; ++i) {
+        out[index++] = digits[digit_count - 1 - i];
+    }
+    return true;
+}
+
+static bool ends_with(const char* text, const char* suffix) {
+    if (text == nullptr || suffix == nullptr) {
+        return false;
+    }
+    size_t text_len = string_util::length(text);
+    size_t suffix_len = string_util::length(suffix);
+    if (suffix_len > text_len) {
+        return false;
+    }
+    return string_util::equals(text + text_len - suffix_len, suffix);
+}
+
+static bool default_root_from_rootfs_module(char (&root_spec)[kMaxSpecLen]) {
+    const volatile struct limine_module_response* response =
+        module_request.response;
+    if (response == nullptr || response->modules == nullptr) {
+        return false;
+    }
+    for (uint64_t i = 0; i < response->module_count; ++i) {
+        volatile struct limine_file* file = response->modules[i];
+        if (file == nullptr) {
+            continue;
+        }
+#if LIMINE_API_REVISION >= 3
+        const char* module_string = file->string;
+#else
+        const char* module_string = file->cmdline;
+#endif
+        const char* module_path = file->path;
+        bool is_rootfs_module =
+            (module_string != nullptr &&
+             string_util::equals(module_string, "rootfs")) ||
+            ends_with(module_path, "rootfs.img");
+        if (!is_rootfs_module) {
+            continue;
+        }
+
+        const char prefix[] = "MEMDISK_";
+        size_t index = 0;
+        for (size_t j = 0; prefix[j] != '\0'; ++j) {
+            if (index + 1 >= kMaxSpecLen) {
+                return false;
+            }
+            root_spec[index++] = prefix[j];
+        }
+        if (!append_decimal(root_spec, kMaxSpecLen, index, static_cast<size_t>(i))) {
+            return false;
+        }
+        if (index + 3 >= kMaxSpecLen) {
+            return false;
+        }
+        root_spec[index++] = '_';
+        root_spec[index++] = '0';
+        root_spec[index] = '\0';
+        return true;
+    }
+    return false;
+}
 
 extern "C" void kernel_main(void) {
     uint8_t* stack_top = bootstrap_stack + BOOTSTRAP_STACK_SIZE;
@@ -237,6 +389,18 @@ static void kernel_main_stage2() {
         cmdline_request.response->cmdline != nullptr) {
         cmdline = cmdline_request.response->cmdline;
     }
+    if (cmdline == nullptr &&
+        kernel_file_request.response != nullptr) {
+#if LIMINE_API_REVISION >= 3
+        if (kernel_file_request.response->executable_file != nullptr) {
+            cmdline = kernel_file_request.response->executable_file->string;
+        }
+#else
+        if (kernel_file_request.response->kernel_file != nullptr) {
+            cmdline = kernel_file_request.response->kernel_file->cmdline;
+        }
+#endif
+    }
     net::init(cmdline);
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
@@ -249,10 +413,6 @@ static void kernel_main_stage2() {
 
     vfs::init();
 
-    constexpr size_t kMaxCmdline = 256;
-    constexpr size_t kMaxMountSpecs = 16;
-    constexpr size_t kMaxSpecLen = 32;
-
     char root_spec[kMaxSpecLen] = {0};
     char mount_buffers[kMaxMountSpecs][kMaxSpecLen] = {{0}};
     const char* mount_specs[kMaxMountSpecs];
@@ -261,67 +421,15 @@ static void kernel_main_stage2() {
     }
     size_t mount_spec_count = 0;
 
-    if (cmdline != nullptr) {
-        char buffer[kMaxCmdline];
-        size_t len = string_util::length(cmdline);
-        if (len >= sizeof(buffer)) {
-            len = sizeof(buffer) - 1;
-        }
-        for (size_t i = 0; i < len; ++i) {
-            buffer[i] = cmdline[i];
-        }
-        buffer[len] = '\0';
-
-        char* ptr = buffer;
-        while (*ptr != '\0') {
-            while (*ptr == ' ') {
-                ++ptr;
-            }
-            if (*ptr == '\0') {
-                break;
-            }
-            char* token = ptr;
-            while (*ptr != '\0' && *ptr != ' ') {
-                ++ptr;
-            }
-            if (*ptr == ' ') {
-                *ptr++ = '\0';
-            }
-
-            if (string_util::starts_with(token, "ROOT=")) {
-                const char* value = token + 5;
-                if (*value != '\0') {
-                    string_util::copy(root_spec, sizeof(root_spec), value);
-                }
-            } else if (string_util::starts_with(token, "MOUNT=")) {
-                const char* value = token + 6;
-                if (*value == '\0') {
-                    continue;
-                }
-                bool duplicate = (root_spec[0] != '\0' &&
-                                  string_util::equals(root_spec, value));
-                for (size_t i = 0; i < mount_spec_count && !duplicate; ++i) {
-                    if (string_util::equals(mount_buffers[i], value)) {
-                        duplicate = true;
-                    }
-                }
-                if (duplicate) {
-                    continue;
-                }
-                if (mount_spec_count < kMaxMountSpecs) {
-                    string_util::copy(mount_buffers[mount_spec_count],
-                                      sizeof(mount_buffers[mount_spec_count]),
-                                      value);
-                    mount_specs[mount_spec_count] =
-                        mount_buffers[mount_spec_count];
-                    ++mount_spec_count;
-                } else {
-                    log_message(LogLevel::Warn,
-                                "Boot: ignoring extra MOUNT=%s (limit %zu)",
-                                value, static_cast<size_t>(kMaxMountSpecs));
-                }
-            }
-        }
+    parse_boot_specs(cmdline,
+                     root_spec,
+                     mount_buffers,
+                     mount_specs,
+                     mount_spec_count);
+    if (root_spec[0] == '\0' && default_root_from_rootfs_module(root_spec)) {
+        log_message(LogLevel::Warn,
+                    "boot: ROOT= missing, defaulting to %s from rootfs module",
+                    root_spec);
     }
 
     if (root_spec[0] == '\0') {

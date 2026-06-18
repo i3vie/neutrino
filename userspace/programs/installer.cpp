@@ -18,12 +18,67 @@ constexpr uint32_t kDescBlock =
 constexpr uint32_t kDefaultFg = 0xFFFFFFFF;
 constexpr uint32_t kDefaultBg = 0x00000000;
 constexpr long kWouldBlock = -2;
+constexpr const char* kInstallerPath = "binary/installer.elf";
+constexpr uint8_t kNeufsMagic[8] = {
+    0x4E, 0x45, 0x55, 0x46, 0x53, 0x00, 0x77, 0x42};
+constexpr int32_t kNeufsVersion = 1;
+constexpr uint8_t kTypeNdir = 0;
+constexpr const char* kEspModuleDevice = "MEMDISK_1_0";
+constexpr uint64_t kGptEntryCount = 128;
+constexpr uint64_t kGptEntrySize = 128;
+constexpr uint64_t kGptEntrySectors = 32;
+constexpr uint64_t kInstallEspFirstLba = 2048;
+
+#pragma pack(push, 1)
+struct NeufsRvt {
+    char magic[8];
+    int32_t version;
+    char name[16];
+    uint64_t root;
+};
+
+struct NeufsNdir {
+    uint8_t type;
+    uint8_t reserved[7];
+    char name[256];
+    int64_t ctime;
+    int64_t utime;
+    uint64_t acl[32];
+    uint64_t parent;
+    uint64_t contents[64];
+    uint64_t next;
+    uint64_t last;
+};
+
+struct GptLayout {
+    uint64_t esp_first_lba;
+    uint64_t esp_last_lba;
+    uint64_t root_first_lba;
+    uint64_t root_last_lba;
+};
+#pragma pack(pop)
+
+enum class InstallFs {
+    Neufs,
+    Fat32,
+};
 
 struct Device {
     char name[64];
     descriptor_defs::BlockGeometry geom;
     bool writable;
     bool is_memdisk;
+};
+
+struct CopyProgress {
+    long console;
+    uint64_t total_files;
+    uint64_t total_bytes;
+    uint64_t copied_files;
+    uint64_t copied_bytes;
+    uint64_t last_percent;
+    uint64_t next_byte_report;
+    char current[160];
 };
 
 bool set_cursor(long console, uint32_t x, uint32_t y) {
@@ -52,6 +107,16 @@ bool set_console_color(long console, uint32_t fg, uint32_t bg) {
     return res == 0;
 }
 
+bool set_kernel_log_console(long console, bool enabled) {
+    uint8_t value = enabled ? 1 : 0;
+    long res = descriptor_set_property(
+        static_cast<uint32_t>(console),
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleKernelLog),
+        &value,
+        sizeof(value));
+    return res == 0;
+}
+
 void print(long console, const char* text) {
     if (console < 0 || text == nullptr) {
         return;
@@ -64,6 +129,25 @@ void print(long console, const char* text) {
 void print_line(long console, const char* text) {
     print(console, text);
     descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+}
+
+char digit(uint64_t value) {
+    return static_cast<char>('0' + value);
+}
+
+void print_u64(long console, uint64_t value) {
+    char buffer[32];
+    size_t pos = sizeof(buffer);
+    buffer[--pos] = '\0';
+    if (value == 0) {
+        buffer[--pos] = '0';
+    } else {
+        while (value != 0 && pos > 0) {
+            buffer[--pos] = digit(value % 10);
+            value /= 10;
+        }
+    }
+    print(console, &buffer[pos]);
 }
 
 char read_char_blocking(uint32_t keyboard) {
@@ -152,6 +236,145 @@ bool parse_uint(const char* text, size_t& out_value) {
     return true;
 }
 
+uint64_t align_up(uint64_t value, uint64_t alignment) {
+    if (alignment == 0) {
+        return value;
+    }
+    uint64_t rem = value % alignment;
+    return rem == 0 ? value : value + (alignment - rem);
+}
+
+void store_u16_le(uint8_t* out, uint16_t value) {
+    out[0] = static_cast<uint8_t>(value);
+    out[1] = static_cast<uint8_t>(value >> 8);
+}
+
+void store_u32_le(uint8_t* out, uint32_t value) {
+    out[0] = static_cast<uint8_t>(value);
+    out[1] = static_cast<uint8_t>(value >> 8);
+    out[2] = static_cast<uint8_t>(value >> 16);
+    out[3] = static_cast<uint8_t>(value >> 24);
+}
+
+void store_u64_le(uint8_t* out, uint64_t value) {
+    out[0] = static_cast<uint8_t>(value);
+    out[1] = static_cast<uint8_t>(value >> 8);
+    out[2] = static_cast<uint8_t>(value >> 16);
+    out[3] = static_cast<uint8_t>(value >> 24);
+    out[4] = static_cast<uint8_t>(value >> 32);
+    out[5] = static_cast<uint8_t>(value >> 40);
+    out[6] = static_cast<uint8_t>(value >> 48);
+    out[7] = static_cast<uint8_t>(value >> 56);
+}
+
+uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t size) {
+    crc = ~crc;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (size_t bit = 0; bit < 8; ++bit) {
+            uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+uint32_t crc32(const uint8_t* data, size_t size) {
+    return crc32_update(0, data, size);
+}
+
+bool suffix_is_decimal(const char* text, size_t begin, size_t end) {
+    if (text == nullptr || begin >= end) {
+        return false;
+    }
+    for (size_t i = begin; i < end; ++i) {
+        if (text[i] < '0' || text[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_partition_device_name(const char* name) {
+    if (name == nullptr) {
+        return false;
+    }
+    size_t len = strlen(name);
+    if (len == 0) {
+        return false;
+    }
+
+    size_t last_sep = len;
+    while (last_sep > 0 && name[last_sep - 1] != '_') {
+        --last_sep;
+    }
+    if (last_sep == 0 || !suffix_is_decimal(name, last_sep, len)) {
+        return false;
+    }
+    --last_sep;
+
+    size_t prev_sep = last_sep;
+    while (prev_sep > 0 && name[prev_sep - 1] != '_') {
+        --prev_sep;
+    }
+    return prev_sep != 0 && suffix_is_decimal(name, prev_sep, last_sep);
+}
+
+bool is_install_target(const Device& dev) {
+    return !dev.is_memdisk && !is_partition_device_name(dev.name);
+}
+
+size_t collect_install_targets(const Device* devices,
+                               size_t device_count,
+                               Device* targets,
+                               size_t target_capacity) {
+    if (devices == nullptr || targets == nullptr) {
+        return 0;
+    }
+    size_t target_count = 0;
+    for (size_t i = 0; i < device_count && target_count < target_capacity; ++i) {
+        if (!is_install_target(devices[i])) {
+            continue;
+        }
+        targets[target_count++] = devices[i];
+    }
+    return target_count;
+}
+
+bool append_partition_suffix(const char* disk_name,
+                             uint32_t partition_index,
+                             char* out,
+                             size_t out_size) {
+    if (disk_name == nullptr || out == nullptr || out_size == 0) {
+        return false;
+    }
+    size_t idx = 0;
+    for (size_t i = 0; disk_name[i] != '\0'; ++i) {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = disk_name[i];
+    }
+    if (idx + 1 >= out_size) {
+        return false;
+    }
+    out[idx++] = '_';
+    char digits[10];
+    size_t digit_count = 0;
+    do {
+        digits[digit_count++] = static_cast<char>('0' + partition_index % 10);
+        partition_index /= 10;
+    } while (partition_index != 0 && digit_count < sizeof(digits));
+    if (idx + digit_count >= out_size) {
+        return false;
+    }
+    for (size_t i = 0; i < digit_count; ++i) {
+        out[idx++] = digits[digit_count - 1 - i];
+    }
+    out[idx] = '\0';
+    return true;
+}
+
 void format_size(uint64_t bytes, char* out, size_t out_cap) {
     if (out == nullptr || out_cap == 0) {
         return;
@@ -229,6 +452,24 @@ void format_size(uint64_t bytes, char* out, size_t out_cap) {
     out[copy_len] = '\0';
 }
 
+uint64_t default_neufs_meta_size(uint64_t total_bytes, uint64_t sector_size) {
+    uint64_t suggested = (total_bytes * 225) / 10000;
+    const uint64_t min_meta = 256ull * 1024ull * 1024ull;
+    const uint64_t max_meta = 16ull * 1024ull * 1024ull * 1024ull;
+    if (suggested < min_meta && total_bytes >= min_meta * 2) {
+        suggested = min_meta;
+    }
+    if (suggested > max_meta) {
+        suggested = max_meta;
+    }
+    if (sector_size != 0 && suggested > total_bytes - sector_size) {
+        suggested = total_bytes - sector_size;
+    } else if (sector_size == 0 && suggested > total_bytes) {
+        suggested = total_bytes;
+    }
+    return align_up(suggested, sector_size);
+}
+
 bool fetch_devices(Device* devices, size_t capacity, size_t& count) {
     if (devices == nullptr || capacity == 0) {
         return false;
@@ -293,6 +534,219 @@ long write_with_retry(uint32_t handle,
         }
         return r;
     }
+}
+
+bool copy_block_device(uint32_t src_handle,
+                       uint32_t dst_handle,
+                       uint64_t src_offset,
+                       uint64_t dst_offset,
+                       uint64_t byte_count,
+                       uint8_t* buffer,
+                       uint64_t buffer_size) {
+    while (byte_count > 0) {
+        uint64_t chunk = byte_count < buffer_size ? byte_count : buffer_size;
+        long read = read_with_retry(src_handle,
+                                    buffer,
+                                    static_cast<size_t>(chunk),
+                                    src_offset);
+        if (read != static_cast<long>(chunk)) {
+            return false;
+        }
+        long written = write_with_retry(dst_handle,
+                                        buffer,
+                                        static_cast<size_t>(chunk),
+                                        dst_offset);
+        if (written != static_cast<long>(chunk)) {
+            return false;
+        }
+        src_offset += chunk;
+        dst_offset += chunk;
+        byte_count -= chunk;
+    }
+    return true;
+}
+
+void write_utf16_name(uint8_t* entry, const char* name) {
+    uint8_t* out = entry + 56;
+    for (size_t i = 0; i < 36; ++i) {
+        uint16_t ch = 0;
+        if (name != nullptr && name[i] != '\0') {
+            ch = static_cast<uint8_t>(name[i]);
+        }
+        store_u16_le(out + i * 2, ch);
+        if (ch == 0) {
+            break;
+        }
+    }
+}
+
+void write_gpt_entry(uint8_t* table,
+                     size_t index,
+                     const uint8_t type_guid[16],
+                     const uint8_t unique_guid[16],
+                     uint64_t first_lba,
+                     uint64_t last_lba,
+                     const char* name) {
+    uint8_t* entry = table + index * kGptEntrySize;
+    memcpy(entry, type_guid, 16);
+    memcpy(entry + 16, unique_guid, 16);
+    store_u64_le(entry + 32, first_lba);
+    store_u64_le(entry + 40, last_lba);
+    store_u64_le(entry + 48, 0);
+    write_utf16_name(entry, name);
+}
+
+void write_gpt_header(uint8_t* sector,
+                      uint64_t current_lba,
+                      uint64_t backup_lba,
+                      uint64_t first_usable_lba,
+                      uint64_t last_usable_lba,
+                      uint64_t entries_lba,
+                      uint32_t entries_crc,
+                      const uint8_t disk_guid[16]) {
+    memset(sector, 0, 512);
+    const uint8_t signature[8] = {'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'};
+    memcpy(sector, signature, sizeof(signature));
+    store_u32_le(sector + 8, 0x00010000u);
+    store_u32_le(sector + 12, 92);
+    store_u64_le(sector + 24, current_lba);
+    store_u64_le(sector + 32, backup_lba);
+    store_u64_le(sector + 40, first_usable_lba);
+    store_u64_le(sector + 48, last_usable_lba);
+    memcpy(sector + 56, disk_guid, 16);
+    store_u64_le(sector + 72, entries_lba);
+    store_u32_le(sector + 80, static_cast<uint32_t>(kGptEntryCount));
+    store_u32_le(sector + 84, static_cast<uint32_t>(kGptEntrySize));
+    store_u32_le(sector + 88, entries_crc);
+    store_u32_le(sector + 16, 0);
+    uint32_t header_crc = crc32(sector, 92);
+    store_u32_le(sector + 16, header_crc);
+}
+
+bool write_protective_mbr(uint32_t handle, uint64_t total_sectors, uint8_t* sector) {
+    memset(sector, 0, 512);
+    sector[446 + 4] = 0xEE;
+    store_u32_le(sector + 446 + 8, 1);
+    uint64_t protected_sectors = total_sectors > 0 ? total_sectors - 1 : 0;
+    if (protected_sectors > 0xFFFFFFFFull) {
+        protected_sectors = 0xFFFFFFFFull;
+    }
+    store_u32_le(sector + 446 + 12, static_cast<uint32_t>(protected_sectors));
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+    return write_with_retry(handle, sector, 512, 0) == 512;
+}
+
+bool write_gpt(uint32_t handle,
+               uint64_t total_sectors,
+               uint64_t esp_sectors,
+               GptLayout& layout,
+               uint8_t* scratch,
+               uint64_t scratch_size,
+               long console) {
+    if (scratch == nullptr || scratch_size < 512 ||
+        total_sectors < 4096 || esp_sectors == 0) {
+        return false;
+    }
+
+    layout.esp_first_lba = kInstallEspFirstLba;
+    layout.esp_last_lba = layout.esp_first_lba + esp_sectors - 1;
+    layout.root_first_lba = align_up(layout.esp_last_lba + 1, 2048);
+    uint64_t backup_header_lba = total_sectors - 1;
+    uint64_t backup_entries_lba = backup_header_lba - kGptEntrySectors;
+    layout.root_last_lba = backup_entries_lba - 1;
+    if (layout.root_first_lba >= layout.root_last_lba) {
+        print_line(console, "target too small for ESP + NEUFS GPT layout");
+        return false;
+    }
+
+    if (!write_protective_mbr(handle, total_sectors, scratch)) {
+        return false;
+    }
+
+    uint64_t entries_bytes = kGptEntryCount * kGptEntrySize;
+    if (scratch_size < entries_bytes) {
+        return false;
+    }
+    memset(scratch, 0, static_cast<size_t>(entries_bytes));
+
+    const uint8_t esp_type[16] = {
+        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
+        0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B};
+    const uint8_t linux_type[16] = {
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
+        0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4};
+    const uint8_t disk_guid[16] = {
+        0x4E, 0x54, 0x52, 0x4E, 0x49, 0x4E, 0x4F, 0x00,
+        0x90, 0x01, 0x12, 0x34, 0x56, 0x78, 0x00, 0x01};
+    const uint8_t esp_guid[16] = {
+        0x4E, 0x54, 0x52, 0x4E, 0x45, 0x53, 0x50, 0x00,
+        0x90, 0x01, 0x12, 0x34, 0x56, 0x78, 0x00, 0x02};
+    const uint8_t root_guid[16] = {
+        0x4E, 0x54, 0x52, 0x4E, 0x52, 0x4F, 0x4F, 0x54,
+        0x90, 0x01, 0x12, 0x34, 0x56, 0x78, 0x00, 0x03};
+
+    write_gpt_entry(scratch,
+                    0,
+                    esp_type,
+                    esp_guid,
+                    layout.esp_first_lba,
+                    layout.esp_last_lba,
+                    "EFI System");
+    write_gpt_entry(scratch,
+                    1,
+                    linux_type,
+                    root_guid,
+                    layout.root_first_lba,
+                    layout.root_last_lba,
+                    "Neutrino Root");
+
+    uint32_t entries_crc = crc32(scratch, static_cast<size_t>(entries_bytes));
+    uint64_t primary_entries_lba = 2;
+    uint64_t sector_size = 512;
+    if (write_with_retry(handle,
+                         scratch,
+                         static_cast<size_t>(entries_bytes),
+                         primary_entries_lba * sector_size) !=
+        static_cast<long>(entries_bytes)) {
+        return false;
+    }
+    if (write_with_retry(handle,
+                         scratch,
+                         static_cast<size_t>(entries_bytes),
+                         backup_entries_lba * sector_size) !=
+        static_cast<long>(entries_bytes)) {
+        return false;
+    }
+
+    write_gpt_header(scratch,
+                     1,
+                     backup_header_lba,
+                     34,
+                     layout.root_last_lba,
+                     primary_entries_lba,
+                     entries_crc,
+                     disk_guid);
+    if (write_with_retry(handle, scratch, 512, 512) != 512) {
+        return false;
+    }
+
+    write_gpt_header(scratch,
+                     backup_header_lba,
+                     1,
+                     34,
+                     layout.root_last_lba,
+                     backup_entries_lba,
+                     entries_crc,
+                     disk_guid);
+    if (write_with_retry(handle,
+                         scratch,
+                         512,
+                         backup_header_lba * sector_size) != 512) {
+        return false;
+    }
+
+    return true;
 }
 
 void render_table(long console,
@@ -451,6 +905,744 @@ bool copy_image(const char* src_name,
     return true;
 }
 
+bool zero_region(uint32_t handle,
+                 uint64_t offset,
+                 uint64_t size,
+                 uint8_t* scratch,
+                 uint64_t scratch_size,
+                 long console) {
+    memset(scratch, 0, static_cast<size_t>(scratch_size));
+    uint64_t done = 0;
+    uint64_t total = size;
+    uint64_t next_mib = 1024ull * 1024ull;
+    while (size > 0) {
+        uint64_t chunk = size < scratch_size ? size : scratch_size;
+        long written = write_with_retry(handle,
+                                        scratch,
+                                        static_cast<size_t>(chunk),
+                                        offset);
+        if (written != static_cast<long>(chunk)) {
+            return false;
+        }
+        offset += chunk;
+        size -= chunk;
+        done += chunk;
+        if (done >= next_mib || size == 0) {
+            set_cursor(console, 0, 6);
+            print(console, "Formatting NEUFS... ");
+            char size_buf[32];
+            format_size(done, size_buf, sizeof(size_buf));
+            print(console, size_buf);
+            print(console, " / ");
+            format_size(total, size_buf, sizeof(size_buf));
+            print(console, size_buf);
+            print(console, "       ");
+            while (next_mib <= done) {
+                next_mib += 1024ull * 1024ull;
+            }
+        }
+    }
+    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+    return true;
+}
+
+bool write_bytes(uint32_t handle,
+                 uint64_t offset,
+                 const void* data,
+                 size_t size,
+                 uint8_t* sector,
+                 uint64_t sector_size) {
+    const uint8_t* src = static_cast<const uint8_t*>(data);
+    while (size > 0) {
+        uint64_t sector_offset = (offset / sector_size) * sector_size;
+        size_t in_sector = static_cast<size_t>(offset - sector_offset);
+        size_t chunk = static_cast<size_t>(sector_size) - in_sector;
+        if (chunk > size) {
+            chunk = size;
+        }
+        if (read_with_retry(handle,
+                            sector,
+                            static_cast<size_t>(sector_size),
+                            sector_offset) != static_cast<long>(sector_size)) {
+            return false;
+        }
+        memcpy(sector + in_sector, src, chunk);
+        if (write_with_retry(handle,
+                             sector,
+                             static_cast<size_t>(sector_size),
+                             sector_offset) != static_cast<long>(sector_size)) {
+            return false;
+        }
+        offset += chunk;
+        src += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+bool bitmap_set_range(uint8_t* sector,
+                      uint32_t handle,
+                      uint64_t bitmap_offset,
+                      uint64_t start_bit,
+                      uint64_t count,
+                      uint64_t sector_size) {
+    uint64_t end_bit = start_bit + count;
+    uint64_t current_bit = start_bit;
+    while (current_bit < end_bit) {
+        uint64_t byte_offset = bitmap_offset + (current_bit / 8);
+        uint64_t sector_offset = (byte_offset / sector_size) * sector_size;
+        if (read_with_retry(handle,
+                            sector,
+                            static_cast<size_t>(sector_size),
+                            sector_offset) != static_cast<long>(sector_size)) {
+            return false;
+        }
+        while (current_bit < end_bit) {
+            uint64_t current_byte = bitmap_offset + (current_bit / 8);
+            if ((current_byte / sector_size) * sector_size != sector_offset) {
+                break;
+            }
+            size_t in_sector = static_cast<size_t>(current_byte - sector_offset);
+            uint8_t bit_in_byte = static_cast<uint8_t>(current_bit % 8);
+            uint8_t mask = 0;
+            while (bit_in_byte < 8 && current_bit < end_bit) {
+                mask |= static_cast<uint8_t>(1u << bit_in_byte);
+                ++bit_in_byte;
+                ++current_bit;
+            }
+            sector[in_sector] |= mask;
+        }
+        if (write_with_retry(handle,
+                             sector,
+                             static_cast<size_t>(sector_size),
+                             sector_offset) != static_cast<long>(sector_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool format_neufs_device(const Device& dst, long console) {
+    if (dst.geom.sector_size == 0 || dst.geom.sector_count == 0 ||
+        dst.geom.sector_size > 4096) {
+        print_line(console, "unsupported geometry for NEUFS");
+        return false;
+    }
+    uint64_t total_bytes = dst.geom.sector_size * dst.geom.sector_count;
+    uint64_t meta_size =
+        default_neufs_meta_size(total_bytes, dst.geom.sector_size);
+    if (meta_size >= total_bytes) {
+        print_line(console, "target too small for NEUFS metadata area");
+        return false;
+    }
+
+    uint64_t data_bitmap_offset = align_up(sizeof(NeufsRvt), 8);
+    uint64_t data_bitmap_size = (dst.geom.sector_count + 7) / 8;
+    uint64_t meta_blocks = meta_size / 8;
+    uint64_t meta_bitmap_offset =
+        align_up(data_bitmap_offset + data_bitmap_size, 8);
+    uint64_t meta_bitmap_size = (meta_blocks + 7) / 8;
+    uint64_t root_offset =
+        align_up(meta_bitmap_offset + meta_bitmap_size, dst.geom.sector_size);
+    if (root_offset + sizeof(NeufsNdir) > meta_size) {
+        print_line(console, "metadata area cannot fit NEUFS root directory");
+        return false;
+    }
+
+    long handle = descriptor_open(
+        kDescBlock,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst.name)),
+        0,
+        0);
+    if (handle < 0) {
+        print_line(console, "failed to open target for formatting");
+        return false;
+    }
+
+    uint64_t scratch_size = dst.geom.sector_size * 255;
+    uint8_t* sector = static_cast<uint8_t*>(
+        map_anonymous(static_cast<size_t>(scratch_size), MAP_WRITE));
+    if (sector == nullptr) {
+        descriptor_close(static_cast<uint32_t>(handle));
+        print_line(console, "failed to allocate format buffer");
+        return false;
+    }
+
+    bool ok = zero_region(static_cast<uint32_t>(handle),
+                          0,
+                          meta_size,
+                          sector,
+                          scratch_size,
+                          console);
+    if (ok) {
+        NeufsRvt rvt{};
+        for (size_t i = 0; i < sizeof(kNeufsMagic); ++i) {
+            rvt.magic[i] = static_cast<char>(kNeufsMagic[i]);
+        }
+        rvt.version = kNeufsVersion;
+        memcpy(rvt.name, "neutrino", 8);
+        rvt.root = root_offset;
+        ok = write_bytes(static_cast<uint32_t>(handle),
+                         0,
+                         &rvt,
+                         sizeof(rvt),
+                         sector,
+                         dst.geom.sector_size);
+    }
+    if (ok) {
+        NeufsNdir root{};
+        root.type = kTypeNdir;
+        root.name[0] = '/';
+        ok = write_bytes(static_cast<uint32_t>(handle),
+                         root_offset,
+                         &root,
+                         sizeof(root),
+                         sector,
+                         dst.geom.sector_size);
+    }
+    if (ok) {
+        uint64_t used_data_sectors = align_up(meta_size, dst.geom.sector_size) /
+                                     dst.geom.sector_size;
+        ok = bitmap_set_range(sector,
+                              static_cast<uint32_t>(handle),
+                              data_bitmap_offset,
+                              0,
+                              used_data_sectors,
+                              dst.geom.sector_size);
+    }
+    if (ok) {
+        uint64_t rvt_blocks = align_up(sizeof(NeufsRvt), 8) / 8;
+        uint64_t data_bitmap_blocks = align_up(data_bitmap_size, 8) / 8;
+        uint64_t meta_bitmap_blocks = align_up(meta_bitmap_size, 8) / 8;
+        uint64_t root_blocks = align_up(sizeof(NeufsNdir), 8) / 8;
+        ok = bitmap_set_range(sector,
+                              static_cast<uint32_t>(handle),
+                              meta_bitmap_offset,
+                              0,
+                              rvt_blocks,
+                              dst.geom.sector_size) &&
+             bitmap_set_range(sector,
+                              static_cast<uint32_t>(handle),
+                              meta_bitmap_offset,
+                              data_bitmap_offset / 8,
+                              data_bitmap_blocks,
+                              dst.geom.sector_size) &&
+             bitmap_set_range(sector,
+                              static_cast<uint32_t>(handle),
+                              meta_bitmap_offset,
+                              meta_bitmap_offset / 8,
+                              meta_bitmap_blocks,
+                              dst.geom.sector_size) &&
+             bitmap_set_range(sector,
+                              static_cast<uint32_t>(handle),
+                              meta_bitmap_offset,
+                              root_offset / 8,
+                              root_blocks,
+                              dst.geom.sector_size);
+    }
+
+    unmap(sector, static_cast<size_t>(scratch_size));
+    descriptor_close(static_cast<uint32_t>(handle));
+    if (!ok) {
+        print_line(console, "NEUFS format failed");
+    }
+    return ok;
+}
+
+bool append_path(const char* base,
+                 const char* name,
+                 char* out,
+                 size_t out_size) {
+    if (base == nullptr || name == nullptr || out == nullptr || out_size == 0) {
+        return false;
+    }
+    size_t idx = 0;
+    for (size_t i = 0; base[i] != '\0'; ++i) {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = base[i];
+    }
+    if (idx > 0 && out[idx - 1] != '/') {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = '/';
+    }
+    for (size_t i = 0; name[i] != '\0'; ++i) {
+        if (idx + 1 >= out_size) {
+            return false;
+        }
+        out[idx++] = name[i];
+    }
+    out[idx] = '\0';
+    return true;
+}
+
+bool ends_with(const char* text, const char* suffix) {
+    if (text == nullptr || suffix == nullptr) {
+        return false;
+    }
+    size_t text_len = strlen(text);
+    size_t suffix_len = strlen(suffix);
+    if (suffix_len > text_len) {
+        return false;
+    }
+    return strcmp(text + text_len - suffix_len, suffix) == 0;
+}
+
+bool is_dot_dir_entry(const char* name) {
+    return name != nullptr &&
+           ((name[0] == '.' && name[1] == '\0') ||
+            (name[0] == '.' && name[1] == '.' && name[2] == '\0'));
+}
+
+void render_copy_progress(CopyProgress& progress, bool force) {
+    uint64_t percent = 0;
+    if (progress.total_bytes != 0) {
+        percent = (progress.copied_bytes * 100) / progress.total_bytes;
+    } else if (progress.total_files != 0) {
+        percent = (progress.copied_files * 100) / progress.total_files;
+    } else {
+        percent = 100;
+    }
+    if (percent > 100) {
+        percent = 100;
+    }
+    if (!force && percent == progress.last_percent) {
+        return;
+    }
+    progress.last_percent = percent;
+
+    set_cursor(progress.console, 0, 7);
+    print(progress.console, "Copying live system... ");
+    print_u64(progress.console, percent);
+    print(progress.console, "%  files ");
+    print_u64(progress.console, progress.copied_files);
+    print(progress.console, "/");
+    print_u64(progress.console, progress.total_files);
+    print(progress.console, "  bytes ");
+    char size_buf[32];
+    format_size(progress.copied_bytes, size_buf, sizeof(size_buf));
+    print(progress.console, size_buf);
+    print(progress.console, "/");
+    format_size(progress.total_bytes, size_buf, sizeof(size_buf));
+    print(progress.console, size_buf);
+    print(progress.console, "          ");
+
+    set_cursor(progress.console, 0, 8);
+    print(progress.console, "Current: ");
+    print(progress.console, progress.current);
+    print(progress.console,
+          "                                                            ");
+    yield();
+}
+
+void set_copy_status(CopyProgress* progress, const char* action, const char* path) {
+    if (progress == nullptr) {
+        return;
+    }
+    if (action == nullptr) {
+        action = "";
+    }
+    if (path == nullptr) {
+        path = "";
+    }
+
+    size_t idx = 0;
+    for (size_t i = 0; action[i] != '\0' && idx + 1 < sizeof(progress->current); ++i) {
+        progress->current[idx++] = action[i];
+    }
+    if (idx + 2 < sizeof(progress->current)) {
+        progress->current[idx++] = ':';
+        progress->current[idx++] = ' ';
+    }
+    for (size_t i = 0; path[i] != '\0' && idx + 1 < sizeof(progress->current); ++i) {
+        progress->current[idx++] = path[i];
+    }
+    progress->current[idx] = '\0';
+    render_copy_progress(*progress, true);
+}
+
+bool scan_tree(const char* source_dir,
+               uint64_t& total_files,
+               uint64_t& total_bytes,
+               long console,
+               size_t depth = 0) {
+    if (depth > 16) {
+        print_line(console, "copy depth exceeded while scanning");
+        return false;
+    }
+    long dir = directory_open(source_dir);
+    if (dir < 0) {
+        print(console, "directory scan failed: ");
+        print_line(console, source_dir);
+        return false;
+    }
+
+    DirEntry entry{};
+    bool ok = true;
+    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
+        if (entry.name[0] == '\0' || is_dot_dir_entry(entry.name)) {
+            continue;
+        }
+        char source_path[160];
+        if (!append_path(source_dir, entry.name, source_path, sizeof(source_path))) {
+            ok = false;
+            break;
+        }
+        if (ends_with(source_path, kInstallerPath)) {
+            continue;
+        }
+        if ((entry.flags & DIR_ENTRY_FLAG_DIRECTORY) != 0) {
+            if (!scan_tree(source_path,
+                           total_files,
+                           total_bytes,
+                           console,
+                           depth + 1)) {
+                ok = false;
+                break;
+            }
+        } else {
+            ++total_files;
+            total_bytes += entry.size;
+        }
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    return ok;
+}
+
+bool copy_file_path(const char* source,
+                    const char* dest,
+                    long console,
+                    CopyProgress* progress) {
+    set_copy_status(progress, "open", source);
+
+    long in = file_open(source);
+    if (in < 0) {
+        print(console, "open failed: ");
+        print_line(console, source);
+        return false;
+    }
+    long out = file_create(dest);
+    if (out < 0) {
+        file_close(static_cast<uint32_t>(in));
+        print(console, "create failed: ");
+        print_line(console, dest);
+        return false;
+    }
+    uint8_t buffer[4096];
+    bool ok = true;
+    while (true) {
+        set_copy_status(progress, "read", source);
+        long r = file_read(static_cast<uint32_t>(in), buffer, sizeof(buffer));
+        if (r < 0) {
+            ok = false;
+            break;
+        }
+        if (r == 0) {
+            break;
+        }
+        size_t written = 0;
+        while (written < static_cast<size_t>(r)) {
+            set_copy_status(progress, "write", dest);
+            long w = file_write(static_cast<uint32_t>(out),
+                                buffer + written,
+                                static_cast<size_t>(r) - written);
+            if (w <= 0) {
+                ok = false;
+                break;
+            }
+            written += static_cast<size_t>(w);
+        }
+        if (!ok) {
+            break;
+        }
+        if (progress != nullptr) {
+            progress->copied_bytes += static_cast<uint64_t>(r);
+            set_copy_status(progress, "copied", source);
+            bool force = progress->copied_bytes >= progress->next_byte_report;
+            if (force) {
+                constexpr uint64_t mib = 1024ull * 1024ull;
+                while (progress->next_byte_report <= progress->copied_bytes) {
+                    progress->next_byte_report += mib;
+                }
+            }
+            if (!force) {
+                render_copy_progress(*progress, false);
+            }
+        }
+    }
+    file_close(static_cast<uint32_t>(in));
+    file_close(static_cast<uint32_t>(out));
+    if (ok && progress != nullptr) {
+        ++progress->copied_files;
+        set_copy_status(progress, "done", source);
+    }
+    return ok;
+}
+
+bool copy_tree(const char* source_dir,
+               const char* dest_dir,
+               long console,
+               CopyProgress* progress,
+               size_t depth = 0) {
+    if (depth > 16) {
+        print_line(console, "copy depth exceeded");
+        return false;
+    }
+    long dir = directory_open(source_dir);
+    if (dir < 0) {
+        print(console, "directory open failed: ");
+        print_line(console, source_dir);
+        return false;
+    }
+    if (depth != 0) {
+        set_copy_status(progress, "mkdir", dest_dir);
+        if (directory_create(dest_dir) < 0) {
+            descriptor_close(static_cast<uint32_t>(dir));
+            print(console, "directory create failed: ");
+            print_line(console, dest_dir);
+            return false;
+        }
+    }
+
+    DirEntry entry{};
+    bool ok = true;
+    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
+        if (entry.name[0] == '\0' || is_dot_dir_entry(entry.name)) {
+            continue;
+        }
+        char source_path[160];
+        char dest_path[160];
+        if (!append_path(source_dir, entry.name, source_path, sizeof(source_path)) ||
+            !append_path(dest_dir, entry.name, dest_path, sizeof(dest_path))) {
+            ok = false;
+            break;
+        }
+        if (ends_with(source_path, kInstallerPath)) {
+            continue;
+        }
+        if ((entry.flags & DIR_ENTRY_FLAG_DIRECTORY) != 0) {
+            set_copy_status(progress, "enter", source_path);
+            if (!copy_tree(source_path,
+                           dest_path,
+                           console,
+                           progress,
+                           depth + 1)) {
+                ok = false;
+                break;
+            }
+        } else if (!copy_file_path(source_path, dest_path, console, progress)) {
+            ok = false;
+            break;
+        }
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    return ok;
+}
+
+bool install_neufs(const Device& src, const Device& dst, long console) {
+    clear_console(console);
+    set_cursor(console, 0, 0);
+    print_line(console, "Neutrino Installer");
+    print_line(console, "Installing to UEFI GPT + NEUFS target.");
+    print(console, "Target: ");
+    print_line(console, dst.name);
+
+    char root_name[64];
+    if (is_partition_device_name(dst.name) ||
+        !append_partition_suffix(dst.name, 1, root_name, sizeof(root_name))) {
+        print_line(console, "target name is not a whole-disk install target");
+        return false;
+    }
+
+    long esp = descriptor_open(
+        kDescBlock,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kEspModuleDevice)),
+        0,
+        0);
+    if (esp < 0) {
+        print_line(console, "missing installer ESP image module");
+        return false;
+    }
+    descriptor_defs::BlockGeometry esp_geom{};
+    if (descriptor_get_property(
+            static_cast<uint32_t>(esp),
+            static_cast<uint32_t>(descriptor_defs::Property::BlockGeometry),
+            &esp_geom,
+            sizeof(esp_geom)) != 0 ||
+        esp_geom.sector_size == 0 || esp_geom.sector_count == 0) {
+        descriptor_close(static_cast<uint32_t>(esp));
+        print_line(console, "invalid installer ESP image geometry");
+        return false;
+    }
+
+    long disk = descriptor_open(
+        kDescBlock,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst.name)),
+        0,
+        0);
+    if (disk < 0) {
+        descriptor_close(static_cast<uint32_t>(esp));
+        print_line(console, "failed to open target disk");
+        return false;
+    }
+
+    uint64_t scratch_size = dst.geom.sector_size * 255;
+    if (scratch_size < kGptEntryCount * kGptEntrySize) {
+        scratch_size = kGptEntryCount * kGptEntrySize;
+    }
+    uint8_t* scratch = static_cast<uint8_t*>(
+        map_anonymous(static_cast<size_t>(scratch_size), MAP_WRITE));
+    if (scratch == nullptr) {
+        descriptor_close(static_cast<uint32_t>(disk));
+        descriptor_close(static_cast<uint32_t>(esp));
+        print_line(console, "failed to allocate install buffer");
+        return false;
+    }
+
+    GptLayout layout{};
+    set_cursor(console, 0, 6);
+    print_line(console, "Writing GPT...");
+    bool ok = write_gpt(static_cast<uint32_t>(disk),
+                        dst.geom.sector_count,
+                        esp_geom.sector_count,
+                        layout,
+                        scratch,
+                        scratch_size,
+                        console);
+    if (ok) {
+        set_cursor(console, 0, 6);
+        print_line(console, "Writing EFI system partition...");
+        ok = copy_block_device(static_cast<uint32_t>(esp),
+                               static_cast<uint32_t>(disk),
+                               0,
+                               layout.esp_first_lba * dst.geom.sector_size,
+                               esp_geom.sector_count * esp_geom.sector_size,
+                               scratch,
+                               scratch_size);
+    }
+
+    unmap(scratch, static_cast<size_t>(scratch_size));
+    descriptor_close(static_cast<uint32_t>(disk));
+    descriptor_close(static_cast<uint32_t>(esp));
+    if (!ok) {
+        print_line(console, "failed to install GPT/ESP");
+        return false;
+    }
+
+    if (rescan_block_devices() != 0) {
+        print_line(console, "failed to rescan GPT partitions");
+        return false;
+    }
+
+    Device root{};
+    strlcpy(root.name, root_name, sizeof(root.name));
+    root.geom.sector_size = dst.geom.sector_size;
+    root.geom.sector_count = layout.root_last_lba - layout.root_first_lba + 1;
+    root.writable = true;
+    root.is_memdisk = false;
+
+    if (!format_neufs_device(root, console)) {
+        return false;
+    }
+    long target = descriptor_open(
+        kDescBlock,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(root.name)),
+        0,
+        0);
+    if (target < 0) {
+        print_line(console, "failed to open formatted target");
+        return false;
+    }
+    bool mounted = mount_descriptor(static_cast<uint32_t>(target), nullptr) == 0;
+    descriptor_close(static_cast<uint32_t>(target));
+    if (!mounted) {
+        print_line(console, "failed to mount formatted NEUFS target");
+        return false;
+    }
+    char source_root[80];
+    char target_root[80];
+    source_root[0] = '/';
+    source_root[1] = '\0';
+    strlcpy(source_root + 1, src.name, sizeof(source_root) - 1);
+    target_root[0] = '/';
+    target_root[1] = '\0';
+    strlcpy(target_root + 1, root.name, sizeof(target_root) - 1);
+
+    print_line(console, "Scanning live system...");
+    uint64_t total_files = 0;
+    uint64_t total_bytes = 0;
+    if (!scan_tree(source_root, total_files, total_bytes, console)) {
+        return false;
+    }
+
+    CopyProgress progress{};
+    progress.console = console;
+    progress.total_files = total_files;
+    progress.total_bytes = total_bytes;
+    progress.last_percent = UINT64_MAX;
+    progress.next_byte_report = 1024ull * 1024ull;
+    strlcpy(progress.current, source_root, sizeof(progress.current));
+    render_copy_progress(progress, true);
+
+    ok = copy_tree(source_root, target_root, console, &progress);
+    if (ok) {
+        progress.copied_files = progress.total_files;
+        if (progress.total_bytes > progress.copied_bytes) {
+            progress.copied_bytes = progress.total_bytes;
+        }
+        strlcpy(progress.current, "complete", sizeof(progress.current));
+        render_copy_progress(progress, true);
+        set_cursor(console, 0, 10);
+        print_line(console, "NEUFS install complete.");
+    }
+    return ok;
+}
+
+bool remove_installer_from_mounted_target(const Device& dst) {
+    long target = descriptor_open(
+        kDescBlock,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst.name)),
+        0,
+        0);
+    if (target < 0) {
+        return false;
+    }
+    bool mounted = mount_descriptor(static_cast<uint32_t>(target), nullptr) == 0;
+    descriptor_close(static_cast<uint32_t>(target));
+    if (!mounted) {
+        return false;
+    }
+    char path[96];
+    path[0] = '/';
+    path[1] = '\0';
+    strlcpy(path + 1, dst.name, sizeof(path) - 1);
+    size_t len = strlen(path);
+    if (len + 1 < sizeof(path)) {
+        path[len++] = '/';
+        path[len] = '\0';
+    }
+    strlcpy(path + len, kInstallerPath, sizeof(path) - len);
+    return file_remove(path) == 0;
+}
+
+InstallFs choose_filesystem(uint32_t keyboard, long console) {
+    print_line(console, "");
+    print_line(console, "Choose target filesystem:");
+    print_line(console, "  1. NEUFS (recommended)");
+    print_line(console, "  2. FAT32 (legacy image clone, discouraged)");
+    print(console, "Selection [1]: ");
+    char input[8];
+    drain_keyboard(keyboard);
+    size_t len = read_line(keyboard, console, input, sizeof(input));
+    if (len == 1 && input[0] == '2') {
+        return InstallFs::Fat32;
+    }
+    return InstallFs::Neufs;
+}
+
 }  // namespace
 
 int main(uint64_t, uint64_t) {
@@ -462,8 +1654,9 @@ int main(uint64_t, uint64_t) {
 
     clear_console(console);
     set_console_color(console, kDefaultFg, kDefaultBg);
+    set_kernel_log_console(console, false);
     print_line(console, "Neutrino Installer");
-    print_line(console, "Select a target drive to format as FAT32 and install Neutrino.");
+    print_line(console, "Live installer for MEMDISK boot sessions.");
 
     Device devices[16];
     size_t device_count = 0;
@@ -480,14 +1673,23 @@ int main(uint64_t, uint64_t) {
         }
     }
     if (source_index == device_count) {
-        print_line(console, "No MEMDISK image found; boot the live ISO.");
+        print_line(console, "Installer is only available from a live MEMDISK root.");
+        print_line(console, "This system appears to be running from an installed disk.");
+        return 1;
+    }
+
+    Device targets[16];
+    size_t target_count =
+        collect_install_targets(devices, device_count, targets, 16);
+    if (target_count == 0) {
+        print_line(console, "No installable whole disks detected.");
         return 1;
     }
 
     while (true) {
         set_cursor(console, 0, 3);
         print_line(console, "Available drives:");
-        render_table(console, devices, device_count, source_index, 4);
+        render_table(console, targets, target_count, target_count, 4);
 
         print_line(console, "");
         print(console, "Enter target index (or q to quit): ");
@@ -500,12 +1702,11 @@ int main(uint64_t, uint64_t) {
             return 0;
         }
         size_t choice = 0;
-        if (!parse_uint(input, choice) || choice >= device_count ||
-            devices[choice].is_memdisk) {
+        if (!parse_uint(input, choice) || choice >= target_count) {
             print_line(console, "Invalid selection.");
             continue;
         }
-        if (!devices[choice].writable) {
+        if (!targets[choice].writable) {
             print_line(console, "Drive is read-only.");
             continue;
         }
@@ -518,11 +1719,25 @@ int main(uint64_t, uint64_t) {
             continue;
         }
 
-        bool ok = copy_image(devices[source_index].name,
-                             devices[source_index],
-                             devices[choice].name,
-                             devices[choice],
-                             console);
+        InstallFs fs = choose_filesystem(static_cast<uint32_t>(keyboard),
+                                         console);
+        bool ok = false;
+        if (fs == InstallFs::Neufs) {
+            ok = install_neufs(devices[source_index], targets[choice], console);
+        } else {
+            clear_console(console);
+            set_cursor(console, 0, 0);
+            print_line(console, "Neutrino Installer");
+            print_line(console, "Installing FAT32 by cloning the live image...");
+            ok = copy_image(devices[source_index].name,
+                            devices[source_index],
+                            targets[choice].name,
+                            targets[choice],
+                            console);
+            if (ok) {
+                (void)remove_installer_from_mounted_target(targets[choice]);
+            }
+        }
         if (!ok) {
             print_line(console, "Install failed.");
         }
