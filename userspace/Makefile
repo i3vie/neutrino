@@ -18,7 +18,7 @@ SRC_PROG_DIR := programs
 OUT_DIR  := out
 BIN_DIR  := binary
 
-PROGRAMS := init shell ls cat mkdir rm cp mv mount lsdisk userctl hexedit installer mkneufs netctl networkd tcpd dhcp ping tcpecho netget browse netshell date top
+PROGRAMS := init shell ls cat mkdir rmdir rm cp mv mount lsdisk userctl hexedit installer mkneufs netctl networkd tcpd dhcp ping tcpecho netget browse netshell date top pwd echo touch sleep clear head wc write sheet
 PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
