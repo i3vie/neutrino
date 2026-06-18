@@ -21,7 +21,8 @@ struct AhciPartitionContext {
 
 constexpr size_t kMaxAhciDevices = 32;
 constexpr size_t kMaxPartitionsPerDevice = 4;
-constexpr size_t kMaxExportedDevices = kMaxAhciDevices * kMaxPartitionsPerDevice;
+constexpr size_t kMaxExportedDevices =
+    kMaxAhciDevices * (kMaxPartitionsPerDevice + 1);
 constexpr size_t kMaxNameLen = 24;
 
 alignas(512) uint8_t g_partition_buffer[512];
@@ -33,10 +34,6 @@ uint32_t read_u32_le(const uint8_t* data) {
            (static_cast<uint32_t>(data[1]) << 8) |
            (static_cast<uint32_t>(data[2]) << 16) |
            (static_cast<uint32_t>(data[3]) << 24);
-}
-
-bool is_fat32_partition(uint8_t type) {
-    return type == 0x0B || type == 0x0C || type == 0x1B || type == 0x1C;
 }
 
 size_t copy_string(char* dest, size_t dest_size, const char* src) {
@@ -148,14 +145,6 @@ size_t scan_partitions(size_t device_index,
         if (type == 0 || sectors == 0) {
             continue;
         }
-        if (!is_fat32_partition(type)) {
-            log_message(LogLevel::Info,
-                        "AHCI %s: partition %u type %02x unsupported",
-                        ahci::device_name(device_index),
-                        static_cast<unsigned int>(entry),
-                        static_cast<unsigned int>(type));
-            continue;
-        }
         if (count >= max_partitions) {
             break;
         }
@@ -185,22 +174,32 @@ size_t enumerate_ahci_devices(fs::BlockDevice* out_devices, size_t max_devices) 
             continue;
         }
 
+        AhciPartitionContext& disk_context = g_partition_contexts[exported_count];
+        disk_context.device_index = device_index;
+        disk_context.lba_base = 0;
+
+        fs::BlockDevice& disk = out_devices[exported_count];
+        disk.name = ahci::device_name(device_index);
+        disk.parent_name = nullptr;
+        disk.sector_size = 512;
+        disk.sector_count = identify.sector_count;
+        disk.start_lba = 0;
+        disk.partition_index = 0xFFFFFFFFu;
+        disk.partition_type = 0xFF;
+        disk.descriptor_handle = descriptor::kInvalidHandle;
+        disk.read = ahci_partition_read;
+        disk.write = ahci_partition_write;
+        disk.context = &disk_context;
+        ++exported_count;
+
         PartitionInfo partitions[kMaxPartitionsPerDevice]{};
         size_t partition_count =
             scan_partitions(device_index, partitions, kMaxPartitionsPerDevice);
 
-        bool use_whole_disk = false;
         if (partition_count == 0) {
             log_message(LogLevel::Info,
-                        "AHCI %s: no recognized partitions detected, using whole disk",
+                        "AHCI %s: no recognized partitions detected",
                         ahci::device_name(device_index));
-            uint64_t disk_sectors = identify.sector_count;
-            if (disk_sectors > 0xFFFFFFFFull) {
-                disk_sectors = 0xFFFFFFFFull;
-            }
-            partitions[0] = {0xFF, 0, 0, static_cast<uint32_t>(disk_sectors)};
-            partition_count = 1;
-            use_whole_disk = true;
         }
 
         for (size_t partition_index = 0; partition_index < partition_count;
@@ -211,13 +210,9 @@ size_t enumerate_ahci_devices(fs::BlockDevice* out_devices, size_t max_devices) 
                 break;
             }
 
-            uint32_t partition_ordinal =
-                use_whole_disk ? 0 : partitions[partition_index].ordinal;
-            uint64_t base_lba =
-                use_whole_disk ? 0 : partitions[partition_index].start_lba;
-            uint64_t sector_count =
-                use_whole_disk ? identify.sector_count
-                               : partitions[partition_index].sector_count;
+            uint32_t partition_ordinal = partitions[partition_index].ordinal;
+            uint64_t base_lba = partitions[partition_index].start_lba;
+            uint64_t sector_count = partitions[partition_index].sector_count;
 
             AhciPartitionContext& context = g_partition_contexts[exported_count];
             context.device_index = device_index;

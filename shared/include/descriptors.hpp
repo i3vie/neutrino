@@ -41,6 +41,7 @@ enum class Property : uint32_t {
     ConsoleClear      = 0x00000003,
     ConsoleColor      = 0x00000004,
     ConsoleTextFlags  = 0x00000005,
+    ConsoleKernelLog  = 0x00000006,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     BlockGeometry     = 0x00020001,
@@ -59,6 +60,10 @@ enum class Property : uint32_t {
     NetIpv4Config     = 0x00060002,
     NetDeviceDebug    = 0x00060003,
     NetEndpointInfo   = 0x00070001,
+};
+
+enum DiskFlag : uint32_t {
+    kDiskFlagRemovable = 1u << 0,
 };
 
 enum KeyboardEventFlag : uint8_t {
@@ -113,7 +118,7 @@ struct BlockGeometry {
 struct DiskInfo {
     char name[32];
     uint32_t partition_count;
-    uint32_t reserved;
+    uint32_t flags;
 };
 
 struct PartitionInfo {

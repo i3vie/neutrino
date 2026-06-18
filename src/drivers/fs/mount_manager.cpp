@@ -6,6 +6,7 @@
 #include "drivers/storage/ahci_provider.hpp"
 #include "drivers/storage/ide_provider.hpp"
 #include "drivers/storage/ramdisk_provider.hpp"
+#include "drivers/storage/sdhci_provider.hpp"
 #include "drivers/fs/fat32/driver.hpp"
 #include "drivers/fs/neufs/driver.hpp"
 #include "kernel/descriptor.hpp"
@@ -31,6 +32,7 @@ void ensure_builtins_registered() {
     }
     register_ramdisk_block_device_provider();
     register_ahci_block_device_provider();
+    register_sdhci_block_device_provider();
     register_ide_block_device_provider();
     register_neufs_filesystem_driver();
     register_fat32_filesystem_driver();
@@ -132,6 +134,14 @@ bool mount_requested_filesystems(const char* root_spec,
         }
         device_count += added;
         for (size_t j = 0; j < added; ++j) {
+            log_message(LogLevel::Info,
+                        "MountManager: discovered block device %s type=%02x start=%llu sectors=%llu",
+                        discovered[start_index + j].name != nullptr
+                            ? discovered[start_index + j].name
+                            : "(unnamed)",
+                        static_cast<unsigned int>(discovered[start_index + j].partition_type),
+                        static_cast<unsigned long long>(discovered[start_index + j].start_lba),
+                        static_cast<unsigned long long>(discovered[start_index + j].sector_count));
             // Allow user processes (e.g., installer) to access block devices,
             // so do not lock them to kernel-only.
             if (!descriptor::register_block_device(discovered[start_index + j], false)) {
@@ -155,6 +165,7 @@ bool mount_requested_filesystems(const char* root_spec,
 
     bool root_requested = root_spec != nullptr && root_spec[0] != '\0';
     bool root_mounted = !root_requested;
+    bool root_device_found = false;
     size_t mounted = 0;
 
     if (root_requested) {
@@ -176,6 +187,7 @@ bool mount_requested_filesystems(const char* root_spec,
 
         if (root_requested && strings_equal(device.name, root_spec)) {
             is_root = true;
+            root_device_found = true;
         } else {
             for (size_t i = 0; i < mount_count; ++i) {
                 if (mount_matched[i]) continue;
@@ -222,9 +234,15 @@ bool mount_requested_filesystems(const char* root_spec,
     }
 
     if (root_requested && !root_mounted) {
-        log_message(LogLevel::Warn,
-                    "MountManager: root filesystem '%s' not found",
-                    root_spec);
+        if (root_device_found) {
+            log_message(LogLevel::Warn,
+                        "MountManager: root block device '%s' was found but no filesystem driver accepted it",
+                        root_spec);
+        } else {
+            log_message(LogLevel::Warn,
+                        "MountManager: root block device '%s' not discovered",
+                        root_spec);
+        }
     }
 
     out_total_mounted = mounted;

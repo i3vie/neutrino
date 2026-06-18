@@ -1,0 +1,370 @@
+#include "drivers/storage/sdhci_provider.hpp"
+
+#include "drivers/fs/block_device.hpp"
+#include "drivers/fs/mount_manager.hpp"
+#include "drivers/log/logging.hpp"
+#include "drivers/storage/sdhci.hpp"
+
+namespace {
+
+struct PartitionInfo {
+    uint8_t type;
+    uint8_t ordinal;
+    uint64_t start_lba;
+    uint64_t sector_count;
+};
+
+struct SdhciPartitionContext {
+    size_t device_index;
+    uint64_t lba_base;
+};
+
+constexpr size_t kMaxSdhciDevices = 4;
+constexpr size_t kMaxPartitionsPerDevice = 4;
+constexpr size_t kMaxExportedDevices =
+    kMaxSdhciDevices * (kMaxPartitionsPerDevice + 1);
+constexpr size_t kMaxNameLen = 24;
+
+alignas(512) uint8_t g_partition_buffer[512];
+SdhciPartitionContext g_partition_contexts[kMaxExportedDevices];
+char g_name_storage[kMaxExportedDevices][kMaxNameLen];
+
+uint32_t read_u32_le(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) |
+           (static_cast<uint32_t>(data[1]) << 8) |
+           (static_cast<uint32_t>(data[2]) << 16) |
+           (static_cast<uint32_t>(data[3]) << 24);
+}
+
+uint64_t read_u64_le(const uint8_t* data) {
+    return static_cast<uint64_t>(data[0]) |
+           (static_cast<uint64_t>(data[1]) << 8) |
+           (static_cast<uint64_t>(data[2]) << 16) |
+           (static_cast<uint64_t>(data[3]) << 24) |
+           (static_cast<uint64_t>(data[4]) << 32) |
+           (static_cast<uint64_t>(data[5]) << 40) |
+           (static_cast<uint64_t>(data[6]) << 48) |
+           (static_cast<uint64_t>(data[7]) << 56);
+}
+
+bool guid_is_zero(const uint8_t* guid) {
+    if (guid == nullptr) {
+        return true;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (guid[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t copy_string(char* dest, size_t dest_size, const char* src) {
+    if (dest == nullptr || dest_size == 0) {
+        return 0;
+    }
+    size_t idx = 0;
+    while (idx + 1 < dest_size && src != nullptr && src[idx] != '\0') {
+        dest[idx] = src[idx];
+        ++idx;
+    }
+    dest[idx] = '\0';
+    return idx;
+}
+
+bool append_suffix(char* buffer, size_t buffer_size, uint32_t value) {
+    size_t len = 0;
+    while (len < buffer_size && buffer[len] != '\0') {
+        ++len;
+    }
+    if (len + 2 >= buffer_size) {
+        return false;
+    }
+    buffer[len++] = '_';
+
+    char digits[10];
+    size_t digit_count = 0;
+    do {
+        digits[digit_count++] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value > 0 && digit_count < sizeof(digits));
+
+    if (len + digit_count >= buffer_size) {
+        return false;
+    }
+    for (size_t i = 0; i < digit_count; ++i) {
+        buffer[len + i] = digits[digit_count - 1 - i];
+    }
+    buffer[len + digit_count] = '\0';
+    return true;
+}
+
+fs::BlockIoStatus sdhci_partition_read(void* context,
+                                       uint32_t lba,
+                                       uint8_t count,
+                                       void* buffer) {
+    auto* ctx = static_cast<SdhciPartitionContext*>(context);
+    sdhci::Status status =
+        sdhci::read_sectors(ctx->device_index, ctx->lba_base + lba, count, buffer);
+    switch (status) {
+        case sdhci::Status::Ok:
+            return fs::BlockIoStatus::Ok;
+        case sdhci::Status::Busy:
+        case sdhci::Status::Timeout:
+            return fs::BlockIoStatus::Busy;
+        case sdhci::Status::NoDevice:
+            return fs::BlockIoStatus::NoDevice;
+        default:
+            return fs::BlockIoStatus::IoError;
+    }
+}
+
+fs::BlockIoStatus sdhci_partition_write(void* context,
+                                        uint32_t lba,
+                                        uint8_t count,
+                                        const void* buffer) {
+    auto* ctx = static_cast<SdhciPartitionContext*>(context);
+    sdhci::Status status = sdhci::write_sectors(
+        ctx->device_index, ctx->lba_base + lba, count, buffer);
+    switch (status) {
+        case sdhci::Status::Ok:
+            return fs::BlockIoStatus::Ok;
+        case sdhci::Status::Busy:
+        case sdhci::Status::Timeout:
+            return fs::BlockIoStatus::Busy;
+        case sdhci::Status::NoDevice:
+            return fs::BlockIoStatus::NoDevice;
+        default:
+            return fs::BlockIoStatus::IoError;
+    }
+}
+
+size_t scan_mbr_partitions(size_t device_index,
+                           PartitionInfo* partitions,
+                           size_t max_partitions) {
+    if (partitions == nullptr || max_partitions == 0) {
+        return 0;
+    }
+
+    sdhci::Status status = sdhci::read_sectors(device_index, 0, 1, g_partition_buffer);
+    if (status != sdhci::Status::Ok) {
+        log_message(LogLevel::Warn,
+                    "sdhci %s: failed to read partition table (status %d)",
+                    sdhci::device_name(device_index),
+                    static_cast<int>(status));
+        return 0;
+    }
+
+    if (g_partition_buffer[510] != 0x55 || g_partition_buffer[511] != 0xAA) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (size_t entry = 0; entry < 4; ++entry) {
+        const uint8_t* record = g_partition_buffer + 446 + (entry * 16);
+        uint8_t type = record[4];
+        uint64_t start_lba = read_u32_le(record + 8);
+        uint64_t sectors = read_u32_le(record + 12);
+        if (type == 0 || sectors == 0) {
+            continue;
+        }
+        if (count >= max_partitions) {
+            break;
+        }
+        partitions[count++] = {type, static_cast<uint8_t>(entry), start_lba,
+                               sectors};
+    }
+    return count;
+}
+
+size_t scan_gpt_partitions(size_t device_index,
+                           uint64_t disk_sectors,
+                           PartitionInfo* partitions,
+                           size_t max_partitions) {
+    if (partitions == nullptr || max_partitions == 0 || disk_sectors < 64) {
+        return 0;
+    }
+
+    sdhci::Status status = sdhci::read_sectors(device_index, 1, 1, g_partition_buffer);
+    if (status != sdhci::Status::Ok) {
+        return 0;
+    }
+    const uint8_t kGptMagic[8] = {'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'};
+    for (size_t i = 0; i < sizeof(kGptMagic); ++i) {
+        if (g_partition_buffer[i] != kGptMagic[i]) {
+            return 0;
+        }
+    }
+
+    uint64_t entries_lba = read_u64_le(g_partition_buffer + 72);
+    uint32_t entry_count = read_u32_le(g_partition_buffer + 80);
+    uint32_t entry_size = read_u32_le(g_partition_buffer + 84);
+    if (entries_lba == 0 || entry_count == 0 || entry_size < 128 ||
+        entry_size > 512) {
+        return 0;
+    }
+
+    size_t count = 0;
+    uint8_t entry_sector[512];
+    for (uint32_t entry = 0; entry < entry_count && count < max_partitions; ++entry) {
+        uint64_t byte_offset = static_cast<uint64_t>(entry) * entry_size;
+        uint64_t lba = entries_lba + (byte_offset / 512);
+        size_t in_sector = static_cast<size_t>(byte_offset % 512);
+        if (in_sector + entry_size > 512 || lba >= disk_sectors) {
+            continue;
+        }
+        status = sdhci::read_sectors(device_index, lba, 1, entry_sector);
+        if (status != sdhci::Status::Ok) {
+            return count;
+        }
+        const uint8_t* record = entry_sector + in_sector;
+        if (guid_is_zero(record)) {
+            continue;
+        }
+        uint64_t first_lba = read_u64_le(record + 32);
+        uint64_t last_lba = read_u64_le(record + 40);
+        if (first_lba == 0 || last_lba < first_lba || last_lba >= disk_sectors) {
+            continue;
+        }
+        partitions[count++] = {
+            0xEE,
+            static_cast<uint8_t>(entry),
+            first_lba,
+            last_lba - first_lba + 1,
+        };
+    }
+    return count;
+}
+
+size_t scan_partitions(size_t device_index,
+                       uint64_t disk_sectors,
+                       PartitionInfo* partitions,
+                       size_t max_partitions) {
+    size_t gpt_count =
+        scan_gpt_partitions(device_index, disk_sectors, partitions, max_partitions);
+    if (gpt_count != 0) {
+        return gpt_count;
+    }
+    return scan_mbr_partitions(device_index, partitions, max_partitions);
+}
+
+size_t enumerate_sdhci_devices(fs::BlockDevice* out_devices, size_t max_devices) {
+    if (out_devices == nullptr || max_devices == 0) {
+        return 0;
+    }
+
+    if (!sdhci::init()) {
+        return 0;
+    }
+
+    size_t exported_count = 0;
+    size_t controller_device_count = sdhci::device_count();
+    for (size_t device_index = 0; device_index < controller_device_count;
+         ++device_index) {
+        if (exported_count >= max_devices) {
+            break;
+        }
+
+        const sdhci::IdentifyInfo& identify = sdhci::identify(device_index);
+        if (!identify.present) {
+            continue;
+        }
+
+        if (exported_count >= max_devices) {
+            break;
+        }
+        SdhciPartitionContext& disk_context =
+            g_partition_contexts[exported_count];
+        disk_context.device_index = device_index;
+        disk_context.lba_base = 0;
+
+        fs::BlockDevice& disk = out_devices[exported_count];
+        disk.name = sdhci::device_name(device_index);
+        disk.parent_name = nullptr;
+        disk.sector_size = 512;
+        disk.sector_count = identify.sector_count;
+        disk.start_lba = 0;
+        disk.partition_index = 0xFFFFFFFFu;
+        disk.partition_type = 0xFF;
+        disk.removable = identify.removable;
+        disk.descriptor_handle = descriptor::kInvalidHandle;
+        disk.read = sdhci_partition_read;
+        disk.write = sdhci_partition_write;
+        disk.context = &disk_context;
+        ++exported_count;
+
+        PartitionInfo partitions[kMaxPartitionsPerDevice]{};
+        size_t partition_count =
+            scan_partitions(device_index,
+                            identify.sector_count,
+                            partitions,
+                            kMaxPartitionsPerDevice);
+
+        if (partition_count == 0) {
+            log_message(LogLevel::Info,
+                        "sdhci %s: no recognized partitions detected",
+                        sdhci::device_name(device_index));
+        }
+
+        for (size_t partition_index = 0; partition_index < partition_count;
+             ++partition_index) {
+            if (exported_count >= max_devices) {
+                log_message(LogLevel::Warn,
+                            "sdhci provider: device list exhausted");
+                break;
+            }
+
+            uint32_t partition_ordinal = partitions[partition_index].ordinal;
+            uint64_t base_lba = partitions[partition_index].start_lba;
+            uint64_t sector_count = partitions[partition_index].sector_count;
+
+            SdhciPartitionContext& context =
+                g_partition_contexts[exported_count];
+            context.device_index = device_index;
+            context.lba_base = base_lba;
+
+            char* name_buffer = g_name_storage[exported_count];
+            copy_string(name_buffer, kMaxNameLen, sdhci::device_name(device_index));
+            if (!append_suffix(name_buffer, kMaxNameLen, partition_ordinal)) {
+                log_message(LogLevel::Warn,
+                            "sdhci provider: mount name overflow for %s part %u",
+                            sdhci::device_name(device_index),
+                            static_cast<unsigned int>(partition_ordinal));
+                continue;
+            }
+
+            fs::BlockDevice& device = out_devices[exported_count];
+            device.name = name_buffer;
+            device.parent_name = sdhci::device_name(device_index);
+            device.sector_size = 512;
+            device.sector_count = sector_count;
+            device.start_lba = base_lba;
+            device.partition_index = partition_ordinal;
+            device.partition_type = partitions[partition_index].type;
+            device.removable = identify.removable;
+            device.descriptor_handle = descriptor::kInvalidHandle;
+            device.read = sdhci_partition_read;
+            device.write = sdhci_partition_write;
+            device.context = &context;
+
+            ++exported_count;
+        }
+    }
+
+    return exported_count;
+}
+
+}  // namespace
+
+namespace fs {
+
+void register_sdhci_block_device_provider() {
+    static bool registered = false;
+    if (registered) {
+        return;
+    }
+    registered = true;
+    register_block_device_provider(enumerate_sdhci_devices);
+}
+
+}  // namespace fs

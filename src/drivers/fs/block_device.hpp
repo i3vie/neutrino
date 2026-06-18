@@ -29,6 +29,7 @@ struct BlockDevice {
     uint64_t start_lba = 0;
     uint32_t partition_index = 0;
     uint8_t partition_type = 0xFF;
+    bool removable = false;
     uint32_t descriptor_handle = descriptor::kInvalidHandle;
     BlockReadFn read;
     BlockWriteFn write;

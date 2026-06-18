@@ -60,6 +60,12 @@ BlockDeviceRecord* find_block_device_by_index(uint64_t index) {
     return nullptr;
 }
 
+bool is_whole_disk_record(const BlockDeviceRecord& record) {
+    return record.in_use &&
+           record.device.parent_name == nullptr &&
+           record.device.partition_index == 0xFFFFFFFFu;
+}
+
 bool starts_with_disk_partition_prefix(const char* name, const char* disk_name) {
     if (name == nullptr || disk_name == nullptr || disk_name[0] == '\0') {
         return false;
@@ -77,6 +83,9 @@ bool starts_with_disk_partition_prefix(const char* name, const char* disk_name) 
 bool block_device_belongs_to_disk(const BlockDeviceRecord& record,
                                   const char* disk_name) {
     if (!record.in_use) {
+        return false;
+    }
+    if (is_whole_disk_record(record)) {
         return false;
     }
     if (record.device.parent_name != nullptr &&
@@ -111,7 +120,24 @@ size_t partition_count_for_disk(const char* disk_name) {
     return count;
 }
 
+bool disk_is_removable(const char* disk_name) {
+    BlockDeviceRecord* disk = find_block_device_by_name(disk_name);
+    if (disk != nullptr && is_whole_disk_record(*disk)) {
+        return disk->device.removable;
+    }
+    for (auto& record : g_block_devices) {
+        if (block_device_belongs_to_disk(record, disk_name)) {
+            return record.device.removable;
+        }
+    }
+    return false;
+}
+
 bool disk_exists(const char* disk_name) {
+    BlockDeviceRecord* record = find_block_device_by_name(disk_name);
+    if (record != nullptr && is_whole_disk_record(*record)) {
+        return true;
+    }
     return partition_count_for_disk(disk_name) != 0;
 }
 
@@ -157,7 +183,9 @@ bool disk_name_by_index(uint64_t index, char* out, size_t out_size) {
             continue;
         }
         char disk_name[kMaxBlockDeviceNameLen]{};
-        if (record.device.parent_name != nullptr) {
+        if (is_whole_disk_record(record)) {
+            string_util::copy(disk_name, sizeof(disk_name), record.name);
+        } else if (record.device.parent_name != nullptr) {
             string_util::copy(disk_name,
                               sizeof(disk_name),
                               record.device.parent_name);
@@ -638,6 +666,9 @@ int disk_get_property(DescriptorEntry& entry,
         string_util::copy(info->name, sizeof(info->name), record->name);
         info->partition_count =
             static_cast<uint32_t>(partition_count_for_disk(record->name));
+        if (disk_is_removable(record->name)) {
+            info->flags |= descriptor_defs::kDiskFlagRemovable;
+        }
         return 0;
     }
     return -1;

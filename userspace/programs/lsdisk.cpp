@@ -155,7 +155,12 @@ bool list_disk(long console, uint64_t disk_index) {
 
     print(console, "Disk ");
     print(console, disk_info.name);
-    print(console, ": ");
+    print(console, " (");
+    print(console,
+          (disk_info.flags & descriptor_defs::kDiskFlagRemovable) != 0
+              ? "removable"
+              : "fixed");
+    print(console, "): ");
     print_u64(console, disk_info.partition_count);
     print_line(console, " partition(s)");
 

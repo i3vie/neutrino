@@ -21,7 +21,7 @@ struct IdePartitionContext {
 
 constexpr size_t kMaxPartitionsPerDevice = 4;
 constexpr size_t kMaxDevices =
-    kMaxPartitionsPerDevice * 4;  // four IDE device slots
+    (kMaxPartitionsPerDevice + 1) * 4;  // four IDE device slots
 constexpr size_t kMaxNameLen = 16;
 
 constexpr struct {
@@ -79,10 +79,6 @@ uint32_t read_u32_le(const uint8_t* data) {
            (static_cast<uint32_t>(data[1]) << 8) |
            (static_cast<uint32_t>(data[2]) << 16) |
            (static_cast<uint32_t>(data[3]) << 24);
-}
-
-bool is_fat32_partition(uint8_t type) {
-    return type == 0x0B || type == 0x0C || type == 0x1B || type == 0x1C;
 }
 
 size_t copy_string(char* dest, size_t dest_size, const char* src) {
@@ -155,12 +151,6 @@ size_t scan_partitions(IdeDeviceId device, PartitionInfo* partitions,
         if (type == 0 || sectors == 0) {
             continue;
         }
-        if (!is_fat32_partition(type)) {
-            log_message(LogLevel::Info,
-                        "IDE %s: partition %u type %02x unsupported",
-                        ide_device_name(device), (unsigned int)entry, type);
-            continue;
-        }
         if (count >= max_partitions) {
             break;
         }
@@ -193,18 +183,32 @@ size_t enumerate_ide_devices(fs::BlockDevice* out_devices,
             continue;
         }
 
+        IdePartitionContext& disk_context = g_partition_contexts[device_count];
+        disk_context.device = cfg.device;
+        disk_context.lba_base = 0;
+
+        fs::BlockDevice& disk = out_devices[device_count];
+        disk.name = cfg.base_name;
+        disk.parent_name = nullptr;
+        disk.sector_size = 512;
+        disk.sector_count = identify.sector_count;
+        disk.start_lba = 0;
+        disk.partition_index = 0xFFFFFFFFu;
+        disk.partition_type = 0xFF;
+        disk.descriptor_handle = descriptor::kInvalidHandle;
+        disk.read = ide_partition_read;
+        disk.write = ide_partition_write;
+        disk.context = &disk_context;
+        ++device_count;
+
         PartitionInfo partitions[kMaxPartitionsPerDevice]{};
         size_t partition_count =
             scan_partitions(cfg.device, partitions, kMaxPartitionsPerDevice);
 
-        bool use_whole_disk = false;
         if (partition_count == 0) {
             log_message(LogLevel::Info,
-                        "IDE %s: no recognized partitions detected, using whole disk",
+                        "IDE %s: no recognized partitions detected",
                         ide_device_name(cfg.device));
-            partitions[0] = {0xFF, 0, 0, identify.sector_count};
-            partition_count = 1;
-            use_whole_disk = true;
         }
 
         for (size_t index = 0; index < partition_count; ++index) {
@@ -214,13 +218,9 @@ size_t enumerate_ide_devices(fs::BlockDevice* out_devices,
                 break;
             }
 
-            uint32_t partition_index =
-                use_whole_disk ? 0 : partitions[index].ordinal;
-            uint32_t base_lba =
-                use_whole_disk ? 0 : partitions[index].start_lba;
-            uint32_t sector_count =
-                use_whole_disk ? identify.sector_count
-                                : partitions[index].sector_count;
+            uint32_t partition_index = partitions[index].ordinal;
+            uint32_t base_lba = partitions[index].start_lba;
+            uint32_t sector_count = partitions[index].sector_count;
 
             IdePartitionContext& context = g_partition_contexts[device_count];
             context.device = cfg.device;
