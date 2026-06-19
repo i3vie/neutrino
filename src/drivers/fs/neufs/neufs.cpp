@@ -675,7 +675,8 @@ static bool bitmap_find_first_clear_from(const fs::BlockDevice& device,
     return false;
 }
 
-static bool bitmap_reserved_ranges_valid(const neufs::NeufsVolume& volume) {
+[[maybe_unused]] static bool bitmap_reserved_ranges_valid(
+    const neufs::NeufsVolume& volume) {
     if (!volume.has_bitmaps) {
         return false;
     }
@@ -2249,13 +2250,19 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
         return false;
     }
 
-    if (volume.has_bitmaps && bitmap_reserved_ranges_valid(volume)) {
+    if (volume.has_bitmaps) {
+        // The bitmap layout and bounds were validated above. Start at the
+        // first legal allocation point instead of rescanning the large,
+        // deliberately reserved prefix on every mount. On eMMC that prefix
+        // scan dominated boot time.
         uint64_t next_meta_bit = 0;
         uint64_t meta_bits = volume.meta_size / 8;
+        uint64_t first_meta_bit =
+            align_up(volume.root_offset + sizeof(NeufsNdir), 8) / 8;
         if (bitmap_find_first_clear_from(volume.device,
                                          volume.meta_bitmap_offset,
                                          meta_bits,
-                                         0,
+                                         first_meta_bit,
                                          next_meta_bit)) {
             volume.next_free_metadata = next_meta_bit * 8;
         } else {
@@ -2263,10 +2270,13 @@ bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
         }
 
         uint64_t next_data_bit = 0;
+        uint64_t first_data_bit =
+            align_up(volume.meta_size, device.sector_size) /
+            device.sector_size;
         if (bitmap_find_first_clear_from(volume.device,
                                          volume.data_bitmap_offset,
                                          device.sector_count,
-                                         0,
+                                         first_data_bit,
                                          next_data_bit)) {
             volume.next_free_data = next_data_bit * device.sector_size;
         } else {
