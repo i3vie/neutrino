@@ -19,8 +19,11 @@ enum class Type : uint16_t {
     Vty         = 0x050,
     CpuStats    = 0x060,
     TaskStats   = 0x061,
+    KernelLog   = 0x062,
     NetDevice   = 0x070,
     NetEndpoint = 0x071,
+    Pci         = 0x080,
+    AudioOutput = 0x090,
 };
 
 enum class Flag : uint64_t {
@@ -42,6 +45,7 @@ enum class Property : uint32_t {
     ConsoleColor      = 0x00000004,
     ConsoleTextFlags  = 0x00000005,
     ConsoleKernelLog  = 0x00000006,
+    ConsoleUpdate     = 0x00000007,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     BlockGeometry     = 0x00020001,
@@ -60,6 +64,15 @@ enum class Property : uint32_t {
     NetIpv4Config     = 0x00060002,
     NetDeviceDebug    = 0x00060003,
     NetEndpointInfo   = 0x00070001,
+    AudioFormat       = 0x00080001,
+};
+
+struct AudioFormatInfo {
+    uint32_t sample_rate;
+    uint16_t channels;
+    uint16_t bits_per_sample;
+    uint32_t frame_bytes;
+    uint32_t reserved;
 };
 
 enum DiskFlag : uint32_t {
@@ -220,6 +233,21 @@ struct TaskUsage {
     uint64_t kernel_ticks;
     char image_path[64];
 };
+
+struct PciDeviceInfo {
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint8_t bus;
+    uint8_t slot;
+    uint8_t function;
+    uint8_t class_code;
+    uint8_t subclass;
+    uint8_t prog_if;
+    uint8_t revision;
+    uint8_t reserved;
+};
+
+static_assert(sizeof(PciDeviceInfo) == 12, "PciDeviceInfo size mismatch");
 
 enum NetDeviceInfoFlag : uint32_t {
     kNetDeviceFlagUp = 1u << 0,

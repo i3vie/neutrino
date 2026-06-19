@@ -18,7 +18,9 @@ SRC_PROG_DIR := programs
 OUT_DIR  := out
 BIN_DIR  := binary
 
-PROGRAMS := init shell ls cat mkdir rmdir rm cp mv mount lsdisk userctl hexedit installer mkneufs netctl networkd tcpd dhcp ping tcpecho netget browse netshell date top pwd echo touch sleep clear head wc write sheet
+# Every standalone source in programs/ is built and installed into /binary.
+# Adding a new command therefore only requires programs/<name>.cpp.
+PROGRAMS := $(sort $(patsubst $(SRC_PROG_DIR)/%.cpp,%,$(wildcard $(SRC_PROG_DIR)/*.cpp)))
 PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64

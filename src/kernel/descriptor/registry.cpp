@@ -15,8 +15,11 @@ bool register_shared_memory_descriptor();
 bool register_vty_descriptor();
 bool register_cpu_stats_descriptor();
 bool register_task_stats_descriptor();
+bool register_kernel_log_descriptor();
 bool register_net_device_descriptor();
 bool register_net_endpoint_descriptor();
+bool register_pci_descriptor();
+bool register_audio_output_descriptor();
 
 void register_builtin_types() {
     reset_block_device_registry();
@@ -65,6 +68,10 @@ void register_builtin_types() {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register task stats descriptor type");
     }
+    if (!register_kernel_log_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register kernel log descriptor type");
+    }
     if (!register_net_device_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register net device descriptor type");
@@ -72,6 +79,14 @@ void register_builtin_types() {
     if (!register_net_endpoint_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register net endpoint descriptor type");
+    }
+    if (!register_pci_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register PCI descriptor type");
+    }
+    if (!register_audio_output_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register audio output descriptor type");
     }
 }
 

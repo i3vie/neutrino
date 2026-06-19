@@ -51,10 +51,16 @@ constexpr uint32_t kTypeCpuStats =
     static_cast<uint32_t>(descriptor_defs::Type::CpuStats);
 constexpr uint32_t kTypeTaskStats =
     static_cast<uint32_t>(descriptor_defs::Type::TaskStats);
+constexpr uint32_t kTypeKernelLog =
+    static_cast<uint32_t>(descriptor_defs::Type::KernelLog);
 constexpr uint32_t kTypeNetDevice =
     static_cast<uint32_t>(descriptor_defs::Type::NetDevice);
 constexpr uint32_t kTypeNetEndpoint =
     static_cast<uint32_t>(descriptor_defs::Type::NetEndpoint);
+constexpr uint32_t kTypePci =
+    static_cast<uint32_t>(descriptor_defs::Type::Pci);
+constexpr uint32_t kTypeAudioOutput =
+    static_cast<uint32_t>(descriptor_defs::Type::AudioOutput);
 
 constexpr int64_t kWouldBlock = -2;
 

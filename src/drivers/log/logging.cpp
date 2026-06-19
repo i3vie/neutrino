@@ -433,3 +433,26 @@ size_t log_copy_recent(char* out, size_t max_len) {
     out[to_copy] = '\0';
     return to_copy;
 }
+
+size_t log_read_recent(char* out, size_t max_len, size_t offset) {
+    if (out == nullptr || max_len == 0) {
+        return 0;
+    }
+
+    lock_console();
+    size_t available = g_size;
+    if (offset >= available) {
+        unlock_console();
+        return 0;
+    }
+
+    size_t remaining = available - offset;
+    size_t to_copy = remaining < max_len ? remaining : max_len;
+    size_t src = (g_start_pos + offset) % LOG_BUFFER_CAPACITY;
+    for (size_t i = 0; i < to_copy; ++i) {
+        out[i] = g_buffer[src];
+        src = (src + 1) % LOG_BUFFER_CAPACITY;
+    }
+    unlock_console();
+    return to_copy;
+}
