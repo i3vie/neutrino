@@ -42,11 +42,14 @@ using ControlTransferFn =
 using BulkTransferFn =
     TransferStatus (*)(void* context, uint8_t endpoint, void* data,
                        size_t length, size_t& transferred);
+using ResetEndpointFn =
+    TransferStatus (*)(void* context, uint8_t endpoint);
 
 struct Transport {
     void* context;
     ControlTransferFn control;
     BulkTransferFn bulk;
+    ResetEndpointFn reset_endpoint;
 };
 
 struct Endpoint {

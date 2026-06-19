@@ -24,6 +24,9 @@ constexpr uint32_t kCbwSignature = 0x43425355;
 constexpr uint32_t kCswSignature = 0x53425355;
 constexpr uint8_t kDataIn = 0x80;
 constexpr uint8_t kCswPassed = 0x00;
+constexpr uint8_t kRequestClearFeature = 0x01;
+constexpr uint8_t kFeatureEndpointHalt = 0x00;
+constexpr uint8_t kBulkOnlyReset = 0xFF;
 
 constexpr uint8_t kScsiTestUnitReady = 0x00;
 constexpr uint8_t kScsiRequestSense = 0x03;
@@ -59,9 +62,11 @@ struct DeviceState {
     usb::Device device;
     usb::Endpoint bulk_in;
     usb::Endpoint bulk_out;
+    uint8_t interface_number;
     IdentifyInfo identify;
     char name[kNameLen];
     uint32_t next_tag;
+    bool last_command_failed;
     volatile int lock;
 };
 
@@ -195,6 +200,57 @@ Status bulk_transfer(DeviceState& state,
     return transferred == length ? Status::Ok : Status::IoError;
 }
 
+bool control_request(DeviceState& state, const usb::ControlRequest& request) {
+    if (state.device.transport.control == nullptr) {
+        return false;
+    }
+    return state.device.transport.control(state.device.transport.context,
+                                          request, nullptr) ==
+           usb::TransferStatus::Ok;
+}
+
+bool clear_endpoint_halt(DeviceState& state, uint8_t endpoint) {
+    usb::ControlRequest clear_halt{
+        0x02,  // host-to-device, standard, endpoint
+        kRequestClearFeature,
+        kFeatureEndpointHalt,
+        endpoint,
+        0,
+    };
+    if (!control_request(state, clear_halt)) {
+        return false;
+    }
+    if (state.device.transport.reset_endpoint == nullptr) {
+        return false;
+    }
+    return state.device.transport.reset_endpoint(
+               state.device.transport.context, endpoint) ==
+           usb::TransferStatus::Ok;
+}
+
+bool bot_reset_recovery(DeviceState& state) {
+    usb::ControlRequest reset{
+        0x21,  // host-to-device, class, interface
+        kBulkOnlyReset,
+        0,
+        state.interface_number,
+        0,
+    };
+    bool reset_ok = control_request(state, reset);
+    bool in_ok = clear_endpoint_halt(state, state.bulk_in.address);
+    bool out_ok = clear_endpoint_halt(state, state.bulk_out.address);
+    if (!reset_ok || !in_ok || !out_ok) {
+        log_message(LogLevel::Warn,
+                    "usb-storage %s: BOT recovery failed reset=%u in=%u out=%u",
+                    state.name,
+                    reset_ok ? 1u : 0u,
+                    in_ok ? 1u : 0u,
+                    out_ok ? 1u : 0u);
+        return false;
+    }
+    return true;
+}
+
 Status bot_command(DeviceState& state,
                    const uint8_t* cdb,
                    uint8_t cdb_length,
@@ -207,6 +263,7 @@ Status bot_command(DeviceState& state,
     if (data_length != 0 && data == nullptr) {
         return Status::IoError;
     }
+    state.last_command_failed = false;
 
     CommandBlockWrapper cbw{};
     cbw.signature = kCbwSignature;
@@ -220,6 +277,9 @@ Status bot_command(DeviceState& state,
     Status status = bulk_transfer(
         state, state.bulk_out.address, &cbw, sizeof(cbw));
     if (status != Status::Ok) {
+        log_message(LogLevel::Warn,
+                    "usb-storage %s: CBW transfer failed status=%d opcode=%02x",
+                    state.name, static_cast<int>(status), cdb[0]);
         return status;
     }
 
@@ -230,6 +290,10 @@ Status bot_command(DeviceState& state,
                                data,
                                data_length);
         if (status != Status::Ok) {
+            log_message(LogLevel::Warn,
+                        "usb-storage %s: data transfer failed status=%d opcode=%02x length=%u",
+                        state.name, static_cast<int>(status), cdb[0],
+                        static_cast<unsigned int>(data_length));
             return status;
         }
     }
@@ -237,12 +301,22 @@ Status bot_command(DeviceState& state,
     CommandStatusWrapper csw{};
     status = bulk_transfer(state, state.bulk_in.address, &csw, sizeof(csw));
     if (status != Status::Ok) {
+        log_message(LogLevel::Warn,
+                    "usb-storage %s: CSW transfer failed status=%d opcode=%02x",
+                    state.name, static_cast<int>(status), cdb[0]);
         return status;
     }
     if (csw.signature != kCswSignature || csw.tag != cbw.tag) {
+        log_message(LogLevel::Warn,
+                    "usb-storage %s: invalid CSW signature=%08x tag=%u expected=%u",
+                    state.name, csw.signature, csw.tag, cbw.tag);
         return Status::IoError;
     }
     if (csw.status != kCswPassed) {
+        state.last_command_failed = true;
+        log_message(LogLevel::Warn,
+                    "usb-storage %s: command failed opcode=%02x csw_status=%u residue=%u",
+                    state.name, cdb[0], csw.status, csw.residue);
         return Status::IoError;
     }
     return Status::Ok;
@@ -253,7 +327,15 @@ void request_sense(DeviceState& state) {
     uint8_t sense[kSenseLen]{};
     cdb[0] = kScsiRequestSense;
     cdb[4] = sizeof(sense);
-    (void)bot_command(state, cdb, 6, sense, sizeof(sense), true);
+    if (bot_command(state, cdb, 6, sense, sizeof(sense), true) != Status::Ok) {
+        return;
+    }
+    uint8_t response_code = sense[0] & 0x7Fu;
+    if (response_code == 0x70 || response_code == 0x71) {
+        log_message(LogLevel::Warn,
+                    "usb-storage %s: sense key=%02x asc=%02x ascq=%02x",
+                    state.name, sense[2] & 0x0Fu, sense[12], sense[13]);
+    }
 }
 
 Status test_unit_ready(DeviceState& state) {
@@ -337,12 +419,14 @@ void init() {
 
 bool probe_device(const usb::Device& device) {
     bool mass_storage = false;
+    uint8_t interface_number = 0;
     for (size_t i = 0; i < device.interface_count; ++i) {
         const usb::Interface& interface = device.interfaces[i];
         if (interface.class_code == kClassMassStorage &&
             interface.subclass == kSubclassScsiTransparent &&
             interface.protocol == kProtocolBulkOnly) {
             mass_storage = true;
+            interface_number = interface.number;
             break;
         }
     }
@@ -358,6 +442,7 @@ bool probe_device(const usb::Device& device) {
     DeviceState& state = g_devices[g_device_count];
     state = {};
     state.device = device;
+    state.interface_number = interface_number;
     state.next_tag = 1;
     state.lock = 0;
     if (!find_bulk_endpoints(device, state.bulk_in, state.bulk_out)) {
@@ -383,6 +468,7 @@ bool probe_device(const usb::Device& device) {
         if (status == Status::Ok) {
             break;
         }
+        (void)bot_reset_recovery(state);
     }
     if (status != Status::Ok) {
         log_message(LogLevel::Warn,
@@ -454,6 +540,16 @@ Status read_sectors(size_t device_index,
 
     lock_device(state);
     Status status = bot_command(state, cdb, 10, buffer, byte_count, true);
+    if (status != Status::Ok && state.last_command_failed) {
+        request_sense(state);
+    }
+    if (status != Status::Ok && bot_reset_recovery(state)) {
+        log_message(LogLevel::Info,
+                    "usb-storage %s: retrying READ(10) lba=%llu count=%u after BOT recovery",
+                    state.name, static_cast<unsigned long long>(lba),
+                    static_cast<unsigned int>(sector_count));
+        status = bot_command(state, cdb, 10, buffer, byte_count, true);
+    }
     unlock_device(state);
     return status;
 }
@@ -491,6 +587,21 @@ Status write_sectors(size_t device_index,
                                 const_cast<void*>(buffer),
                                 byte_count,
                                 false);
+    if (status != Status::Ok && state.last_command_failed) {
+        request_sense(state);
+    }
+    if (status != Status::Ok && bot_reset_recovery(state)) {
+        log_message(LogLevel::Info,
+                    "usb-storage %s: retrying WRITE(10) lba=%llu count=%u after BOT recovery",
+                    state.name, static_cast<unsigned long long>(lba),
+                    static_cast<unsigned int>(sector_count));
+        status = bot_command(state,
+                             cdb,
+                             10,
+                             const_cast<void*>(buffer),
+                             byte_count,
+                             false);
+    }
     unlock_device(state);
     return status;
 }

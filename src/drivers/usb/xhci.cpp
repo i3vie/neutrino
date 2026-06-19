@@ -51,6 +51,8 @@ constexpr uint32_t kTrbTypeEnableSlotCommand = 9;
 constexpr uint32_t kTrbTypeDisableSlotCommand = 10;
 constexpr uint32_t kTrbTypeAddressDeviceCommand = 11;
 constexpr uint32_t kTrbTypeConfigureEndpointCommand = 12;
+constexpr uint32_t kTrbTypeResetEndpointCommand = 14;
+constexpr uint32_t kTrbTypeSetTrDequeuePointerCommand = 16;
 constexpr uint32_t kTrbTypeTransferEvent = 32;
 constexpr uint32_t kTrbTypeCommandCompletionEvent = 33;
 constexpr uint32_t kTrbTypePortStatusChangeEvent = 34;
@@ -1055,6 +1057,65 @@ usb::TransferStatus bulk_transfer(void* context,
     return status;
 }
 
+usb::TransferStatus reset_endpoint(void* context, uint8_t endpoint) {
+    auto* slot = static_cast<DeviceSlot*>(context);
+    if (slot == nullptr || !slot->used || slot->controller == nullptr) {
+        return usb::TransferStatus::NoDevice;
+    }
+
+    uint8_t endpoint_id = endpoint_id_from_address(endpoint);
+    if (endpoint_id == 0 || endpoint_id >= kMaxEndpointContexts) {
+        return usb::TransferStatus::Unsupported;
+    }
+    Ring& ring = slot->endpoint_rings[endpoint_id];
+    if (ring.phys == 0) {
+        return usb::TransferStatus::Unsupported;
+    }
+
+    Controller& controller = *slot->controller;
+    uint32_t* ep_context =
+        device_context(controller, slot->output_context_phys, endpoint_id);
+    constexpr uint32_t kEndpointStateMask = 0x7u;
+    constexpr uint32_t kEndpointStateHalted = 2u;
+    if ((ep_context[0] & kEndpointStateMask) != kEndpointStateHalted) {
+        // CLEAR_FEATURE is required for both BOT bulk endpoints, even though
+        // xHCI only permits Reset Endpoint for one that is actually halted.
+        return usb::TransferStatus::Ok;
+    }
+
+    Trb event{};
+    uint32_t reset_control =
+        (kTrbTypeResetEndpointCommand << 10) |
+        (static_cast<uint32_t>(endpoint_id) << 16) |
+        (static_cast<uint32_t>(slot->slot_id) << 24);
+    if (!issue_command(controller, 0, 0, reset_control, event)) {
+        return usb::TransferStatus::IoError;
+    }
+
+    // Discard the stopped transfer and restart from a fresh ring.  Merely
+    // clearing ENDPOINT_HALT on the USB device does not update xHCI's dequeue
+    // pointer, so the controller would otherwise remain stuck on the TRB that
+    // produced the stall.
+    memset(paging_phys_to_virt(ring.phys), 0, kRingPageCount * kPageSize);
+    ring.enqueue = 0;
+    ring.cycle = 1;
+    Trb* trbs = ring_trbs(ring);
+    trbs[kTrbsPerPage - 1].parameter = ring.phys;
+    trbs[kTrbsPerPage - 1].status = 0;
+    trbs[kTrbsPerPage - 1].control =
+        (kTrbTypeLink << 10) | kTrbToggleCycle | kTrbCycle;
+
+    uint32_t dequeue_control =
+        (kTrbTypeSetTrDequeuePointerCommand << 10) |
+        (static_cast<uint32_t>(endpoint_id) << 16) |
+        (static_cast<uint32_t>(slot->slot_id) << 24);
+    if (!issue_command(controller, ring.phys | ring.cycle, 0,
+                       dequeue_control, event)) {
+        return usb::TransferStatus::IoError;
+    }
+    return usb::TransferStatus::Ok;
+}
+
 bool get_descriptor(DeviceSlot& slot,
                     uint8_t descriptor_type,
                     uint8_t descriptor_index,
@@ -1271,6 +1332,7 @@ bool enumerate_device(Controller& controller, uint8_t port) {
     device.transport.context = slot;
     device.transport.control = control_transfer;
     device.transport.bulk = bulk_transfer;
+    device.transport.reset_endpoint = reset_endpoint;
 
     uint8_t config_header[9]{};
     if (!get_descriptor(*slot, 2, 0, config_header, sizeof(config_header))) {
