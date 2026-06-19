@@ -160,6 +160,23 @@ bool list_disk(long console, uint64_t disk_index) {
           (disk_info.flags & descriptor_defs::kDiskFlagRemovable) != 0
               ? "removable"
               : "fixed");
+    print(console, ", fs=");
+    descriptor_defs::BlockGeometry disk_geom{};
+    const char* disk_fs_type = "unknown";
+    uint64_t disk_sector_size = 512;
+    if (descriptor_get_property(
+            static_cast<uint32_t>(disk),
+            static_cast<uint32_t>(descriptor_defs::Property::BlockGeometry),
+            &disk_geom,
+            sizeof(disk_geom)) == 0) {
+        disk_sector_size = disk_geom.sector_size;
+        uint8_t sector[4096];
+        disk_fs_type = detect_fs(static_cast<uint32_t>(disk),
+                                 disk_geom,
+                                 sector,
+                                 sizeof(sector));
+    }
+    print(console, disk_fs_type);
     print(console, "): ");
     print_u64(console, disk_info.partition_count);
     print_line(console, " partition(s)");
@@ -182,7 +199,7 @@ bool list_disk(long console, uint64_t disk_index) {
             0);
         descriptor_defs::BlockGeometry geom{};
         const char* fs_type = "unknown";
-        uint64_t sector_size = 512;
+        uint64_t sector_size = disk_sector_size;
         if (part >= 0 &&
             descriptor_get_property(
                 static_cast<uint32_t>(part),
@@ -247,6 +264,8 @@ int main(uint64_t arg_ptr, uint64_t) {
         print_line(console, "usage: lsdisk [-l]");
         return 1;
     }
+
+    (void)rescan_block_devices();
 
     bool any = false;
     for (uint64_t index = 0;; ++index) {
