@@ -70,6 +70,9 @@ bool register_pci_driver(const char* name,
             .used = true,
             .probed = false,
         };
+        log_message(LogLevel::Info,
+                    "DriverRegistry: registered PCI driver %s",
+                    name);
         return true;
     }
     return false;
@@ -102,6 +105,9 @@ void pci_probe_worker(process::Process& proc) {
 
         entry.probed = true;
         if (!driver_matches_any_pci_device(entry)) {
+            log_message(LogLevel::Debug,
+                        "DriverRegistry: no PCI match for %s",
+                        entry.name);
             proc.state = process::State::Ready;
             return;
         }

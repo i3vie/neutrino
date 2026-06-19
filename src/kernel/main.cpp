@@ -4,6 +4,7 @@
 
 #include "../drivers/console/console.hpp"
 #include "../drivers/driver_registry.hpp"
+#include "../drivers/audio/hda.hpp"
 #include "../drivers/fs/mount_manager.hpp"
 #include "../drivers/gpu/intel_uhd.hpp"
 #include "../drivers/input/keyboard.hpp"
@@ -16,6 +17,8 @@
 #include "../drivers/net/virtio_net.hpp"
 #include "../drivers/pci/pci.hpp"
 #include "../drivers/timer/pit.hpp"
+#include "../drivers/usb/usb_mass_storage.hpp"
+#include "../drivers/usb/xhci.hpp"
 #include "../fs/vfs.hpp"
 #include "../net/network.hpp"
 #include "arch/x86_64/gdt.hpp"
@@ -222,6 +225,32 @@ static void kernel_main_stage2() {
         // so we can't actually use it without a framebuffer
     }
 
+    // Limine owns the response storage. Preserve the command line before the
+    // physical allocator and PCI drivers can reuse bootloader-reclaimable
+    // memory; losing this pointer later made ROOT= appear intermittently
+    // absent on real machines.
+    char boot_cmdline[kMaxCmdline] = {0};
+    const char* early_cmdline = nullptr;
+    if (cmdline_request.response != nullptr &&
+        cmdline_request.response->cmdline != nullptr) {
+        early_cmdline = cmdline_request.response->cmdline;
+    }
+    if (early_cmdline == nullptr && kernel_file_request.response != nullptr) {
+#if LIMINE_API_REVISION >= 3
+        if (kernel_file_request.response->executable_file != nullptr) {
+            early_cmdline =
+                kernel_file_request.response->executable_file->string;
+        }
+#else
+        if (kernel_file_request.response->kernel_file != nullptr) {
+            early_cmdline = kernel_file_request.response->kernel_file->cmdline;
+        }
+#endif
+    }
+    if (early_cmdline != nullptr) {
+        string_util::copy(boot_cmdline, sizeof(boot_cmdline), early_cmdline);
+    }
+
     auto fb = *framebuffer_request.response->framebuffers[0];
     uint8_t* fb_virtual = static_cast<uint8_t*>(fb.address);
     uint64_t fb_phys_addr = reinterpret_cast<uint64_t>(fb.address);
@@ -384,23 +413,7 @@ static void kernel_main_stage2() {
             static_cast<unsigned long long>(fb_length));
     }
 
-    const char* cmdline = nullptr;
-    if (cmdline_request.response != nullptr &&
-        cmdline_request.response->cmdline != nullptr) {
-        cmdline = cmdline_request.response->cmdline;
-    }
-    if (cmdline == nullptr &&
-        kernel_file_request.response != nullptr) {
-#if LIMINE_API_REVISION >= 3
-        if (kernel_file_request.response->executable_file != nullptr) {
-            cmdline = kernel_file_request.response->executable_file->string;
-        }
-#else
-        if (kernel_file_request.response->kernel_file != nullptr) {
-            cmdline = kernel_file_request.response->kernel_file->cmdline;
-        }
-#endif
-    }
+    const char* cmdline = boot_cmdline[0] != '\0' ? boot_cmdline : nullptr;
     net::init(cmdline);
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
@@ -410,6 +423,9 @@ static void kernel_main_stage2() {
     virtio_net::register_driver();
     e1000e::register_driver();
     intel_uhd::register_driver();
+    hda::register_driver();
+    usb::mass_storage::init();
+    xhci::register_driver();
 
     vfs::init();
 
@@ -584,8 +600,10 @@ static void kernel_main_stage2() {
 
     process::init();
     scheduler::init();
+    log_message(LogLevel::Info, "DriverRegistry: probing PCI drivers");
+    driver_registry::probe_pci_drivers();
+    log_message(LogLevel::Info, "DriverRegistry: PCI probe complete");
     descriptor::start_block_io_worker();
-    driver_registry::start_pci_probe_worker();
 
     constexpr size_t kInitMaxSize = 64 * 1024;
     alignas(16) static uint8_t init_buffer[kInitMaxSize];
@@ -660,9 +678,16 @@ static void kernel_main_stage2() {
                                   init_path_used);
             }
             if (loader::load_into_process(image, *proc)) {
+                // Keep the bootstrap process on the BSP. AP run queues are
+                // not yet reliable during early userspace startup; placing
+                // init there can leave the kernel alive (including CPU-0
+                // poll workers) while login never executes. Children inherit
+                // this affinity through the process syscall path.
+                proc->preferred_cpu = 0;
                 log_message(LogLevel::Info,
-                            "Boot: launched init task from %s (%x bytes)",
-                            init_path_used, init_size);
+                            "Boot: launched init task from %s (%x bytes) on CPU 0",
+                            init_path_used,
+                            init_size);
                 scheduler::enqueue(proc);
                 init_started = true;
             } else {
@@ -685,6 +710,11 @@ static void kernel_main_stage2() {
         error_screen::display("FAILED_INIT_PATH", nullptr, nullptr);
     }
 
+    // Userspace now owns the interactive console. Deferred driver work (most
+    // notably xHCI port enumeration) must not write over login or shell
+    // prompts. Logging continues to serial and the kernel ring buffer, where
+    // it remains available through dmesg.
+    log_set_console_enabled(false);
     scheduler::run();
 
     error_screen::display("SCHEDULER_EXITED", nullptr, nullptr);
