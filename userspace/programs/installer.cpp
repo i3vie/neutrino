@@ -68,6 +68,7 @@ struct Device {
     descriptor_defs::BlockGeometry geom;
     bool writable;
     bool is_memdisk;
+    bool is_usb_mass_storage;
 };
 
 struct CopyProgress {
@@ -321,7 +322,8 @@ bool is_partition_device_name(const char* name) {
 }
 
 bool is_install_target(const Device& dev) {
-    return !dev.is_memdisk && !is_partition_device_name(dev.name);
+    return !dev.is_memdisk && !dev.is_usb_mass_storage &&
+           !is_partition_device_name(dev.name);
 }
 
 size_t collect_install_targets(const Device* devices,
@@ -501,6 +503,8 @@ bool fetch_devices(Device* devices, size_t capacity, size_t& count) {
             static_cast<uint64_t>(descriptor_defs::Flag::Writable)) == 1;
 
         dev.is_memdisk = strncmp(dev.name, "MEMDISK_", strlen("MEMDISK_")) == 0;
+        dev.is_usb_mass_storage =
+            strncmp(dev.name, "USBMS_", strlen("USBMS_")) == 0;
 
         descriptor_close(static_cast<uint32_t>(handle));
         ++count;

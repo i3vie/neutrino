@@ -26,6 +26,10 @@ QEMU_STORAGE ?= ide
 QEMU_PRIMARY_IMG ?= hdd.img
 QEMU_EXTRA_IDE_IMG ?=
 QEMU_EXTRA_AHCI_IMG ?=
+QEMU_XHCI ?= 0
+QEMU_USB_STORAGE_IMG ?=
+QEMU_HDA ?= 0
+QEMU_AUDIO_DRIVER ?= sdl
 QEMU_HOSTFWD ?= tcp::2222-:2222
 QEMU_TAP_IFACE ?= tap0
 QEMU_TAP_SCRIPT ?= no
@@ -63,11 +67,24 @@ ifneq ($(strip $(QEMU_EXTRA_IDE_IMG)),)
 QEMU_IDE_EXTRA_ARGS := -drive file=$(QEMU_EXTRA_IDE_IMG),format=raw,if=ide,index=2
 endif
 QEMU_STORAGE_ARGS += $(QEMU_IDE_EXTRA_ARGS) $(QEMU_AHCI_EXTRA_ARGS)
+ifeq ($(QEMU_XHCI),1)
+QEMU_USB_ARGS := -device qemu-xhci,id=xhci0
+ifneq ($(strip $(QEMU_USB_STORAGE_IMG)),)
+QEMU_USB_ARGS += -drive file=$(QEMU_USB_STORAGE_IMG),format=raw,if=none,id=usb_disk0 \
+		-device usb-storage,drive=usb_disk0,bus=xhci0.0
+endif
+endif
+ifeq ($(QEMU_HDA),1)
+QEMU_AUDIO_ARGS := -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 \
+		-device ich9-intel-hda -device hda-output,audiodev=audio0
+endif
 QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		$(QEMU_STORAGE_ARGS) \
 		-enable-kvm -display sdl \
 		-machine pc -cpu qemu64,+apic \
+		$(QEMU_USB_ARGS) \
+		$(QEMU_AUDIO_ARGS) \
 		$(QEMU_NET_ARGS)
 QEMU_DEBUG_ARGS := -d int \
 		-monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot

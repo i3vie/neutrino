@@ -7,6 +7,7 @@
 #include "drivers/storage/ide_provider.hpp"
 #include "drivers/storage/ramdisk_provider.hpp"
 #include "drivers/storage/sdhci_provider.hpp"
+#include "drivers/usb/usb_mass_storage.hpp"
 #include "drivers/fs/fat32/driver.hpp"
 #include "drivers/fs/neufs/driver.hpp"
 #include "kernel/descriptor.hpp"
@@ -34,6 +35,7 @@ void ensure_builtins_registered() {
     register_ahci_block_device_provider();
     register_sdhci_block_device_provider();
     register_ide_block_device_provider();
+    register_usb_mass_storage_block_device_provider();
     register_neufs_filesystem_driver();
     register_fat32_filesystem_driver();
     g_builtins_registered = true;
