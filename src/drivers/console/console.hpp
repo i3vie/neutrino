@@ -35,6 +35,7 @@ public:
 
     void set_color(uint32_t fg, uint32_t bg);
     void set_text_flags(uint8_t flags);
+    void set_update_deferred(bool deferred);
 
     bool enable_back_buffer();
     void present();
@@ -55,6 +56,7 @@ private:
     uint8_t* back_buffer;
     size_t frame_bytes;
     size_t back_buffer_capacity;
+    size_t update_depth;
 
     bool refresh_framebuffer_info();
     bool allocate_back_buffer();

@@ -206,6 +206,9 @@ void Console::flush_region(size_t x, size_t y, size_t width, size_t height) {
     if (!descriptor::framebuffer_is_active(0)) {
         return;
     }
+    if (update_depth != 0) {
+        return;
+    }
     if (width == 0 || height == 0) {
         return;
     }
@@ -257,6 +260,9 @@ void Console::flush_all() {
     if (!descriptor::framebuffer_is_active(0)) {
         return;
     }
+    if (update_depth != 0) {
+        return;
+    }
 
     if (frame_bytes == 0 || back_buffer_capacity == 0) {
         return;
@@ -274,7 +280,24 @@ void Console::flush_all() {
 }
 
 void Console::present() {
+    size_t saved_depth = update_depth;
+    update_depth = 0;
     flush_all();
+    update_depth = saved_depth;
+}
+
+void Console::set_update_deferred(bool deferred) {
+    if (deferred) {
+        ++update_depth;
+        return;
+    }
+    if (update_depth == 0) {
+        return;
+    }
+    --update_depth;
+    if (update_depth == 0) {
+        flush_all();
+    }
 }
 
 void Console::get_dimensions(size_t& out_cols, size_t& out_rows) const {
@@ -344,7 +367,8 @@ Console::Console(uint32_t framebuffer_handle)
       back_fb{},
       back_buffer(nullptr),
       frame_bytes(0),
-      back_buffer_capacity(0) {  // white on black
+      back_buffer_capacity(0),
+      update_depth(0) {  // white on black
     refresh_framebuffer_info();
 
     size_t cw = cell_width_px();

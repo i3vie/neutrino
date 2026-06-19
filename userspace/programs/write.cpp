@@ -56,6 +56,15 @@ void clear_console(long console) {
         0);
 }
 
+void defer_console_updates(long console, bool deferred) {
+    uint8_t value = deferred ? 1 : 0;
+    descriptor_set_property(
+        static_cast<uint32_t>(console),
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleUpdate),
+        &value,
+        sizeof(value));
+}
+
 void write_text(long console, const char* text) {
     if (text == nullptr) {
         return;
@@ -296,6 +305,7 @@ void ensure_cursor_visible(uint32_t rows, uint32_t cols) {
 }
 
 void render(long console, const char* path, uint32_t cols, uint32_t rows) {
+    defer_console_updates(console, true);
     ensure_cursor_visible(rows, cols);
     clear_console(console);
 
@@ -374,6 +384,7 @@ void render(long console, const char* path, uint32_t cols, uint32_t rows) {
         cursor_x = cols - 1;
     }
     set_cursor(console, cursor_x, y);
+    defer_console_updates(console, false);
 }
 
 void insert_char(char ch) {
