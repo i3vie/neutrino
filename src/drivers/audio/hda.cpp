@@ -11,7 +11,9 @@ namespace hda {
 namespace {
 
 constexpr size_t kPageSize = 4096;
-constexpr size_t kDmaPages = 16;
+// A reasonably deep cyclic buffer gives userspace/storage over a second to
+// provide more samples without starving the controller.
+constexpr size_t kDmaPages = 64;
 constexpr size_t kDmaBytes = kDmaPages * kPageSize;
 constexpr uint64_t kMmioVirtBase = 0xFFFFE50000000000ull;
 constexpr uint64_t kMmioLength = 0x4000;
@@ -23,6 +25,9 @@ constexpr uint32_t kStreamCtlReset = 1u << 0;
 constexpr uint8_t kStreamStsBcis = 1u << 2;
 constexpr uint32_t kWidgetTypeOutput = 0;
 constexpr uint32_t kWidgetTypePin = 4;
+constexpr uint32_t kWidgetCapInputAmp = 1u << 1;
+constexpr uint32_t kWidgetCapOutputAmp = 1u << 2;
+constexpr uint32_t kWidgetCapAmpOverride = 1u << 3;
 
 constexpr driver_registry::PciMatch kPciMatches[] = {
     {driver_registry::kAnyVendor, driver_registry::kAnyDevice, 0x04, 0x03,
@@ -43,6 +48,7 @@ struct Widget {
     uint32_t default_config;
     uint8_t connections[32];
     uint8_t connection_count;
+    uint8_t selected_connection;
 };
 
 struct State {
@@ -60,6 +66,13 @@ struct State {
     uint8_t* dma;
     uint64_t bdl_phys;
     BdlEntry* bdl;
+    size_t write_position;
+    size_t queued_bytes;
+    uint32_t last_position;
+    bool stream_running;
+    bool paused;
+    uint8_t volume;
+    uint8_t volume_node;
     Widget widgets[256];
     volatile int lock;
 };
@@ -195,10 +208,89 @@ bool find_dac_path(uint8_t node, bool visited[256]) {
         if (find_dac_path(widget.connections[i], visited)) {
             // Selectors and mixers both accept this; harmless when ignored.
             (void)set_verb(node, 0x70100u | i);
+            widget.selected_connection = i;
             return true;
         }
     }
     return false;
+}
+
+uint8_t zero_db_gain(uint8_t node, uint8_t parameter) {
+    // Widgets without Amp Parameter Override inherit their amplifier
+    // capabilities from the audio function group.  Bits 6:0 are the gain
+    // step which represents 0 dB; gain step zero is often near -64 dB.
+    uint8_t caps_node =
+        (g_state.widgets[node].caps & kWidgetCapAmpOverride) != 0
+            ? node
+            : g_state.function_group;
+    return static_cast<uint8_t>(get_parameter(caps_node, parameter) & 0x7Fu);
+}
+
+void enable_path(uint8_t node, bool visited[256]) {
+    if (visited[node] || !g_state.widgets[node].present) return;
+    visited[node] = true;
+    Widget& widget = g_state.widgets[node];
+
+    (void)set_verb(node, 0x70500u);  // Power this widget to D0.
+    if ((widget.caps & kWidgetCapOutputAmp) != 0) {
+        uint32_t gain = zero_db_gain(node, 0x12);
+        (void)set_verb(node, 0x30000u | (1u << 15) | (1u << 13) |
+                                  (1u << 12) | gain);
+    }
+
+    if (node == g_state.dac ||
+        widget.selected_connection >= widget.connection_count)
+        return;
+
+    uint8_t index = widget.selected_connection;
+    if ((widget.caps & kWidgetCapInputAmp) != 0) {
+        uint32_t gain = zero_db_gain(node, 0x0D);
+        (void)set_verb(node, 0x30000u | (1u << 14) | (1u << 13) |
+                                  (1u << 12) |
+                                  (static_cast<uint32_t>(index) << 8) | gain);
+    }
+    enable_path(widget.connections[index], visited);
+}
+
+void select_volume_node() {
+    uint8_t node = g_state.pin;
+    uint8_t best_node = 0;
+    uint8_t best_offset = 0;
+    bool visited[256]{};
+    while (!visited[node] && g_state.widgets[node].present) {
+        visited[node] = true;
+        Widget& widget = g_state.widgets[node];
+        if ((widget.caps & kWidgetCapOutputAmp) != 0) {
+            uint8_t offset = zero_db_gain(node, 0x12);
+            if (best_node == 0 || offset > best_offset) {
+                best_node = node;
+                best_offset = offset;
+            }
+        }
+        if (node == g_state.dac ||
+            widget.selected_connection >= widget.connection_count)
+            break;
+        node = widget.connections[widget.selected_connection];
+    }
+    g_state.volume_node = best_node;
+    g_state.volume = 100;
+}
+
+bool apply_volume(uint8_t percent) {
+    if (g_state.volume_node == 0 || percent > 100) return false;
+    uint32_t caps_node =
+        (g_state.widgets[g_state.volume_node].caps & kWidgetCapAmpOverride) != 0
+            ? g_state.volume_node
+            : g_state.function_group;
+    uint32_t caps = get_parameter(static_cast<uint8_t>(caps_node), 0x12);
+    uint32_t zero_db = caps & 0x7Fu;
+    uint32_t gain = (zero_db * percent + 50u) / 100u;
+    uint32_t mute = percent == 0 ? (1u << 7) : 0;
+    bool ok = set_verb(g_state.volume_node,
+                       0x30000u | (1u << 15) | (1u << 13) |
+                           (1u << 12) | mute | gain);
+    if (ok) g_state.volume = percent;
+    return ok;
 }
 
 int pin_score(const Widget& widget) {
@@ -229,6 +321,7 @@ bool enumerate_codec(uint8_t codec) {
             uint8_t nid = static_cast<uint8_t>(w);
             Widget& widget = g_state.widgets[nid];
             widget.present = true;
+            widget.selected_connection = 0xFF;
             widget.caps = get_parameter(nid, 0x09);
             read_connections(nid, widget);
             if (((widget.caps >> 20) & 0xFu) != kWidgetTypePin) continue;
@@ -318,12 +411,11 @@ bool setup_output() {
     memset(g_state.bdl, 0, kPageSize);
     if (!reset_stream()) return false;
 
-    (void)set_verb(g_state.dac, 0x70500u);
-    (void)set_verb(g_state.pin, 0x70500u);
+    bool visited[256]{};
+    enable_path(g_state.pin, visited);
+    select_volume_node();
     (void)set_verb(g_state.dac, 0x20000u | kPcmFormat);
     (void)set_verb(g_state.dac, 0x70600u | (g_state.stream_tag << 4));
-    (void)set_verb(g_state.dac, 0x30000u | (1u << 15) | (1u << 13) |
-                                      (1u << 12));
     (void)set_verb(g_state.pin, 0x70700u | 0xC0u);  // output + headphone drive
     if (g_state.widgets[g_state.pin].pin_caps & (1u << 16))
         (void)set_verb(g_state.pin, 0x70C02u);       // external amplifier
@@ -333,6 +425,11 @@ bool setup_output() {
     write16(sd + 0x0C, 0);  // One BDL entry.
     write32(sd + 0x18, static_cast<uint32_t>(g_state.bdl_phys));
     write32(sd + 0x1C, static_cast<uint32_t>(g_state.bdl_phys >> 32));
+    g_state.bdl[0].address_low = static_cast<uint32_t>(g_state.dma_phys);
+    g_state.bdl[0].address_high = static_cast<uint32_t>(g_state.dma_phys >> 32);
+    g_state.bdl[0].length = static_cast<uint32_t>(kDmaBytes);
+    g_state.bdl[0].flags = 1u;
+    write32(sd + 0x08, static_cast<uint32_t>(kDmaBytes));
     uint32_t ctl = read_stream_ctl(sd);
     ctl &= ~(0xFu << 20);
     ctl |= static_cast<uint32_t>(g_state.stream_tag) << 20;
@@ -399,42 +496,147 @@ void init() {
 
 bool available() { return g_state.active; }
 
+void update_playback_position() {
+    if (!g_state.stream_running) return;
+    size_t sd = stream_base();
+    uint32_t position = read32(sd + 0x04);
+    if (position >= kDmaBytes) return;
+    size_t consumed =
+        (static_cast<size_t>(position) + kDmaBytes - g_state.last_position) %
+        kDmaBytes;
+    if (consumed > g_state.queued_bytes) consumed = g_state.queued_bytes;
+    g_state.queued_bytes -= consumed;
+    g_state.last_position = position;
+}
+
 size_t write_pcm(const void* data, size_t bytes) {
     if (!g_state.active || data == nullptr || bytes < 4) return 0;
     bytes &= ~static_cast<size_t>(3);
     while (__atomic_test_and_set(&g_state.lock, __ATOMIC_ACQUIRE)) relax();
+    if (g_state.paused) {
+        __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
+        return 0;
+    }
     size_t done = 0;
     while (done < bytes) {
-        size_t chunk = bytes - done;
-        if (chunk > kDmaBytes) chunk = kDmaBytes;
-        chunk &= ~static_cast<size_t>(3);
-        if (!stop_stream()) break;
-        memcpy(g_state.dma, static_cast<const uint8_t*>(data) + done, chunk);
-        g_state.bdl[0].address_low = static_cast<uint32_t>(g_state.dma_phys);
-        g_state.bdl[0].address_high = static_cast<uint32_t>(g_state.dma_phys >> 32);
-        g_state.bdl[0].length = static_cast<uint32_t>(chunk);
-        g_state.bdl[0].flags = 1u;  // Interrupt on completion (status works polled).
-        size_t sd = stream_base();
-        write32(sd + 0x08, static_cast<uint32_t>(chunk));
-        write8(sd + 0x03, 0x1Cu);
-        asm volatile("mfence" ::: "memory");
-        write_stream_ctl(sd, read_stream_ctl(sd) | kStreamCtlRun);
-        bool complete = false;
-        // Roughly generous for a full 64 KiB buffer (~341 ms at this format).
-        for (uint32_t spins = 0; spins < 300000000; ++spins) {
-            if (read8(sd + 0x03) & kStreamStsBcis) {
-                complete = true;
-                break;
-            }
+        update_playback_position();
+        size_t available = kDmaBytes - g_state.queued_bytes;
+        // Once the ring is running, refill only after the controller has
+        // moved into the next page.  Writing a few bytes immediately behind
+        // LPIB can race a controller's DMA prefetch and produce crackles.
+        if (g_state.stream_running && g_state.queued_bytes != 0 &&
+            available < kPageSize) {
             relax();
+            continue;
         }
-        (void)stop_stream();
-        write8(sd + 0x03, 0x1Cu);
-        if (!complete) break;
+        size_t chunk = bytes - done;
+        if (chunk > available) chunk = available;
+        size_t contiguous = kDmaBytes - g_state.write_position;
+        if (chunk > contiguous) chunk = contiguous;
+        chunk &= ~static_cast<size_t>(3);
+        memcpy(g_state.dma + g_state.write_position,
+               static_cast<const uint8_t*>(data) + done, chunk);
+        g_state.write_position = (g_state.write_position + chunk) % kDmaBytes;
+        g_state.queued_bytes += chunk;
         done += chunk;
+        asm volatile("mfence" ::: "memory");
+
+        if (g_state.stream_running) continue;
+        size_t sd = stream_base();
+        write8(sd + 0x03, 0x1Cu);
+        g_state.last_position = read32(sd + 0x04);
+        write_stream_ctl(sd, read_stream_ctl(sd) | kStreamCtlRun);
+        g_state.stream_running = true;
     }
     __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
     return done;
+}
+
+void drain() {
+    if (!g_state.active) return;
+    while (__atomic_test_and_set(&g_state.lock, __ATOMIC_ACQUIRE)) relax();
+    if (g_state.paused && g_state.queued_bytes != 0) {
+        size_t sd = stream_base();
+        g_state.last_position = read32(sd + 0x04);
+        write_stream_ctl(sd, read_stream_ctl(sd) | kStreamCtlRun);
+        g_state.stream_running = true;
+        g_state.paused = false;
+    }
+    while (g_state.stream_running && g_state.queued_bytes != 0) {
+        update_playback_position();
+        relax();
+    }
+    if (g_state.stream_running) (void)stop_stream();
+    size_t sd = stream_base();
+    uint32_t position = read32(sd + 0x04);
+    if (position >= kDmaBytes) position = 0;
+    g_state.stream_running = false;
+    g_state.paused = false;
+    g_state.write_position = static_cast<size_t>(position) & ~size_t{3};
+    g_state.queued_bytes = 0;
+    g_state.last_position = position;
+    __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
+}
+
+void flush() {
+    if (!g_state.active) return;
+    while (__atomic_test_and_set(&g_state.lock, __ATOMIC_ACQUIRE)) relax();
+    if (g_state.stream_running) {
+        update_playback_position();
+        (void)stop_stream();
+        update_playback_position();
+    }
+    size_t sd = stream_base();
+    uint32_t position = read32(sd + 0x04);
+    if (position >= kDmaBytes) position = 0;
+    g_state.stream_running = false;
+    g_state.paused = false;
+    g_state.write_position = static_cast<size_t>(position) & ~size_t{3};
+    g_state.queued_bytes = 0;
+    g_state.last_position = position;
+    __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
+}
+
+void set_paused(bool paused) {
+    if (!g_state.active) return;
+    while (__atomic_test_and_set(&g_state.lock, __ATOMIC_ACQUIRE)) relax();
+    if (paused && !g_state.paused) {
+        if (g_state.stream_running) {
+            update_playback_position();
+            (void)stop_stream();
+            update_playback_position();
+            g_state.stream_running = false;
+        }
+        g_state.paused = true;
+    } else if (!paused && g_state.paused) {
+        g_state.paused = false;
+        if (g_state.queued_bytes != 0) {
+            size_t sd = stream_base();
+            g_state.last_position = read32(sd + 0x04);
+            write_stream_ctl(sd, read_stream_ctl(sd) | kStreamCtlRun);
+            g_state.stream_running = true;
+        }
+    }
+    __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
+}
+
+bool set_volume(uint8_t percent) {
+    if (!g_state.active || percent > 100) return false;
+    while (__atomic_test_and_set(&g_state.lock, __ATOMIC_ACQUIRE)) relax();
+    bool ok = apply_volume(percent);
+    __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
+    return ok;
+}
+
+void get_status(size_t& queued_bytes, bool& running, bool& paused,
+                uint8_t& volume) {
+    while (__atomic_test_and_set(&g_state.lock, __ATOMIC_ACQUIRE)) relax();
+    update_playback_position();
+    queued_bytes = g_state.queued_bytes;
+    running = g_state.stream_running;
+    paused = g_state.paused;
+    volume = g_state.volume;
+    __atomic_clear(&g_state.lock, __ATOMIC_RELEASE);
 }
 
 }  // namespace hda
