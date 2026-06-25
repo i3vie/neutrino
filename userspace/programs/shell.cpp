@@ -21,6 +21,8 @@ namespace {
 constexpr size_t kMaxInputLength = 256;
 constexpr size_t kMaxCommandLength = 128;
 constexpr size_t kMaxSearchDirs = 8;
+constexpr size_t kHistoryCapacity = 16;
+constexpr size_t kMaxCompletionMatches = 32;
 constexpr uint32_t kPromptUserColor = 0xFF8FD0FFu;
 constexpr uint32_t kPromptPathColor = 0xFFF2F4F8u;
 constexpr uint32_t kPromptBgColor = 0x00000000u;
@@ -456,6 +458,108 @@ size_t render_line(long console,
     return current_len;
 }
 
+bool starts_with(const char* text, const char* prefix) {
+    if (text == nullptr || prefix == nullptr) return false;
+    while (*prefix != '\0') {
+        if (*text++ != *prefix++) return false;
+    }
+    return true;
+}
+
+bool complete_path(long console, char* buffer, size_t& buffer_len) {
+    size_t token_start = buffer_len;
+    while (token_start > 0 && !isspace(buffer[token_start - 1])) --token_start;
+
+    size_t slash = buffer_len;
+    while (slash > token_start && buffer[slash - 1] != '/') --slash;
+    bool has_slash = slash > token_start;
+    size_t leaf_start = has_slash ? slash : token_start;
+
+    char directory[128];
+    if (!has_slash) {
+        strlcpy(directory, ".", sizeof(directory));
+    } else {
+        size_t dir_len = leaf_start - token_start;
+        if (dir_len == 1 && buffer[token_start] == '/') {
+            strlcpy(directory, "/", sizeof(directory));
+        } else {
+            if (dir_len > 0 && buffer[token_start + dir_len - 1] == '/') --dir_len;
+            if (dir_len + 1 > sizeof(directory)) return false;
+            memcpy(directory, buffer + token_start, dir_len);
+            directory[dir_len] = '\0';
+        }
+    }
+
+    char prefix[64];
+    size_t prefix_len = buffer_len - leaf_start;
+    if (prefix_len >= sizeof(prefix)) return false;
+    memcpy(prefix, buffer + leaf_start, prefix_len);
+    prefix[prefix_len] = '\0';
+
+    long dir = directory_open(directory);
+    if (dir < 0) return false;
+
+    char matches[kMaxCompletionMatches][65]{};
+    uint32_t match_flags[kMaxCompletionMatches]{};
+    size_t match_count = 0;
+    char common[65]{};
+    DirEntry entry{};
+    while (directory_read(static_cast<uint32_t>(dir), &entry) > 0) {
+        if (!starts_with(entry.name, prefix)) continue;
+        if (match_count == 0) {
+            strlcpy(common, entry.name, sizeof(common));
+        } else {
+            size_t i = 0;
+            while (common[i] != '\0' && entry.name[i] != '\0' &&
+                   common[i] == entry.name[i])
+                ++i;
+            common[i] = '\0';
+        }
+        if (match_count < kMaxCompletionMatches) {
+            strlcpy(matches[match_count], entry.name,
+                    sizeof(matches[match_count]));
+            match_flags[match_count] = entry.flags;
+        }
+        ++match_count;
+    }
+    directory_close(static_cast<uint32_t>(dir));
+    if (match_count == 0) return false;
+
+    size_t common_len = strlen(common);
+    if (common_len > prefix_len) {
+        size_t extra = common_len - prefix_len;
+        if (buffer_len + extra >= kMaxInputLength) return false;
+        memcpy(buffer + buffer_len, common + prefix_len, extra);
+        buffer_len += extra;
+        buffer[buffer_len] = '\0';
+    }
+
+    if (match_count == 1) {
+        char suffix = (match_flags[0] & DIR_ENTRY_FLAG_DIRECTORY) != 0 ? '/' : ' ';
+        if (buffer_len + 1 < kMaxInputLength) {
+            buffer[buffer_len++] = suffix;
+            buffer[buffer_len] = '\0';
+        }
+        return false;
+    }
+
+    if (common_len == prefix_len) {
+        descriptor_write(static_cast<uint32_t>(console), "\n", 1);
+        size_t shown = match_count < kMaxCompletionMatches
+                           ? match_count
+                           : kMaxCompletionMatches;
+        for (size_t i = 0; i < shown; ++i) {
+            print(console, matches[i]);
+            if ((match_flags[i] & DIR_ENTRY_FLAG_DIRECTORY) != 0)
+                print(console, "/");
+            print(console, (i + 1 == shown) ? "\n" : "  ");
+        }
+        if (match_count > shown) print_line(console, "...");
+        return true;
+    }
+    return false;
+}
+
 void execute_command(long console, const char* line) {
     const char* cursor = skip_spaces(line);
     if (cursor == nullptr || *cursor == '\0') {
@@ -681,12 +785,49 @@ int main(uint64_t arg, uint64_t) {
     size_t input_length = 0;
     input_buffer[0] = '\0';
     size_t rendered_length = prompt_len;
+    char history[kHistoryCapacity][kMaxInputLength]{};
+    size_t history_count = 0;
+    size_t history_position = 0;
+    char history_draft[kMaxInputLength]{};
 
     bool input_is_keyboard = (std_input < 0);
     bool echo_input = std_input < 0;
     bool suppress_next_lf = false;
     uint8_t escape_state = 0;
     while (1) {
+        auto show_input = [&]() {
+            prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
+            rendered_length = render_line(console,
+                                          prompt_buffer,
+                                          prompt_len,
+                                          input_buffer,
+                                          input_length,
+                                          rendered_length);
+        };
+
+        auto recall_history = [&](bool older) {
+            if (history_count == 0) return;
+            if (history_position > history_count) history_position = history_count;
+            if (older) {
+                if (history_position == history_count)
+                    strlcpy(history_draft, input_buffer, sizeof(history_draft));
+                if (history_position == 0) return;
+                --history_position;
+                strlcpy(input_buffer, history[history_position],
+                        sizeof(input_buffer));
+            } else {
+                if (history_position == history_count) return;
+                ++history_position;
+                strlcpy(input_buffer,
+                        history_position == history_count
+                            ? history_draft
+                            : history[history_position],
+                        sizeof(input_buffer));
+            }
+            input_length = strlen(input_buffer);
+            show_input();
+        };
+
         auto handle_input_byte = [&](uint8_t key) {
             if (escape_state != 0) {
                 if (escape_state == 1 && key == '[') {
@@ -695,6 +836,8 @@ int main(uint64_t arg, uint64_t) {
                 }
                 if (escape_state == 2 && key >= 0x40 && key <= 0x7E) {
                     escape_state = 0;
+                    if (key == 'A') recall_history(true);
+                    if (key == 'B') recall_history(false);
                     return;
                 }
                 escape_state = 0;
@@ -715,9 +858,25 @@ int main(uint64_t arg, uint64_t) {
                     descriptor_write(static_cast<uint32_t>(console), "\n", 1);
                 }
                 input_buffer[input_length] = '\0';
+                const char* entered = skip_spaces(input_buffer);
+                if (entered != nullptr && *entered != '\0') {
+                    if (history_count == 0 ||
+                        strcmp(history[history_count - 1], input_buffer) != 0) {
+                        if (history_count == kHistoryCapacity) {
+                            for (size_t i = 1; i < kHistoryCapacity; ++i)
+                                strlcpy(history[i - 1], history[i],
+                                        sizeof(history[i - 1]));
+                            --history_count;
+                        }
+                        strlcpy(history[history_count++], input_buffer,
+                                sizeof(history[0]));
+                    }
+                }
                 execute_command(console, input_buffer);
                 input_length = 0;
                 input_buffer[0] = '\0';
+                history_position = history_count;
+                history_draft[0] = '\0';
                 prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
                 write_prompt(console, prompt_buffer, prompt_len);
                 rendered_length = prompt_len;
@@ -734,10 +893,13 @@ int main(uint64_t arg, uint64_t) {
                                                       input_buffer,
                                                       input_length,
                                                       rendered_length);
-                    }
+                    } else
+                        rendered_length = prompt_len + input_length;
                 }
             } else if (key == '\t') {
-                // ignore tabs for now
+                bool listed = complete_path(console, input_buffer, input_length);
+                if (listed) rendered_length = 0;
+                show_input();
             } else if (key >= 0x20 && key <= 0x7E) {
                 if (input_length + 1 < sizeof(input_buffer)) {
                     input_buffer[input_length++] = static_cast<char>(key);
@@ -751,7 +913,8 @@ int main(uint64_t arg, uint64_t) {
                                                       input_buffer,
                                                       input_length,
                                                       rendered_length);
-                    }
+                    } else
+                        rendered_length = prompt_len + input_length;
                 }
             }
         };
@@ -769,6 +932,10 @@ int main(uint64_t arg, uint64_t) {
                         continue;
                     }
                     if (keyboard::is_extended(events[i])) {
+                        if (events[i].scancode == keyboard::kScancodeUp)
+                            recall_history(true);
+                        else if (events[i].scancode == keyboard::kScancodeDown)
+                            recall_history(false);
                         continue;
                     }
                     char ch = keyboard::scancode_to_char(events[i].scancode,
