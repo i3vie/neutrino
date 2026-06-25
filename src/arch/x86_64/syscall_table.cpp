@@ -286,6 +286,27 @@ uint32_t duplicate_stream_descriptor(process::Process& from,
                                    context);
     }
 
+    if (type == descriptor::kTypeVty) {
+        descriptor_defs::VtyInfo info{};
+        if (descriptor::get_property(
+                from,
+                from.descriptors,
+                handle,
+                static_cast<uint32_t>(descriptor_defs::Property::VtyInfo),
+                reinterpret_cast<uint64_t>(&info),
+                sizeof(info)) != 0 ||
+            info.id == 0) {
+            return descriptor::kInvalidHandle;
+        }
+        return descriptor::open_at(to,
+                                   to.descriptors,
+                                   target_index,
+                                   descriptor::kTypeVty,
+                                   info.id,
+                                   flags,
+                                   0);
+    }
+
     return descriptor::kInvalidHandle;
 }
 
