@@ -2,6 +2,7 @@
 
 #include "../../drivers/console/console.hpp"
 #include "../../drivers/log/logging.hpp"
+#include "../../lib/mem.hpp"
 #include "../process.hpp"
 
 namespace descriptor {
@@ -13,6 +14,7 @@ int vty_set_property(uint32_t id,
                      uint32_t property,
                      const void* in,
                      size_t size);
+bool vty_redraw_console(uint32_t id, Console& console);
 }
 
 namespace descriptor {
@@ -76,7 +78,11 @@ int console_set_property(DescriptorEntry& entry,
             property ==
                 static_cast<uint32_t>(descriptor_defs::Property::ConsoleKernelLog) ||
             property ==
-                static_cast<uint32_t>(descriptor_defs::Property::ConsoleUpdate)) {
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleUpdate) ||
+            property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleScale) ||
+            property ==
+                static_cast<uint32_t>(descriptor_defs::Property::ConsoleFont)) {
             return 0;
         }
         return -1;
@@ -171,6 +177,42 @@ int console_set_property(DescriptorEntry& entry,
         console->set_update_deferred(deferred != 0);
         return 0;
     }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleScale)) {
+        if (in == nullptr || size != sizeof(uint32_t)) {
+            return -1;
+        }
+        uint32_t scale = *reinterpret_cast<const uint32_t*>(in);
+        bool changed = console->get_scale() != scale;
+        if (!console->set_scale(scale)) {
+            return -1;
+        }
+        if (changed) {
+            if (vty_id != 0) {
+                return vty_redraw_console(vty_id, *console) ? 0 : -1;
+            }
+            console->clear();
+        }
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleFont)) {
+        if (in == nullptr || size < sizeof(descriptor_defs::ConsoleFont)) {
+            return -1;
+        }
+        auto* font = reinterpret_cast<const descriptor_defs::ConsoleFont*>(in);
+        if (font->data_size > descriptor_defs::kConsoleMaxFontDataSize ||
+            size != descriptor_defs::console_font_payload_size(*font) ||
+            !console->set_font(*font,
+                               reinterpret_cast<const uint8_t*>(font + 1))) {
+            return -1;
+        }
+        if (vty_id != 0) {
+            return vty_redraw_console(vty_id, *console) ? 0 : -1;
+        }
+        console->clear();
+        return 0;
+    }
     return -1;
 }
 
@@ -180,6 +222,36 @@ int console_get_property(DescriptorEntry& entry,
                          size_t size) {
     if (is_stdout_redirect(entry)) {
         return -1;
+    }
+
+    auto* console = static_cast<Console*>(entry.object);
+    if (console == nullptr) {
+        return -1;
+    }
+
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleScale)) {
+        if (out == nullptr || size != sizeof(uint32_t)) {
+            return -1;
+        }
+        *reinterpret_cast<uint32_t*>(out) = console->get_scale();
+        return 0;
+    }
+    if (property ==
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleFont)) {
+        if (out == nullptr || size < sizeof(descriptor_defs::ConsoleFont)) {
+            return -1;
+        }
+        auto* font = reinterpret_cast<descriptor_defs::ConsoleFont*>(out);
+        *font = console->get_font_info();
+        if (size == sizeof(*font)) {
+            return 0;
+        }
+        if (size != descriptor_defs::console_font_payload_size(*font)) {
+            return -1;
+        }
+        memcpy(font + 1, console->get_font_data(), font->data_size);
+        return 0;
     }
 
     uint32_t vty_id = 0;

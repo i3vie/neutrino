@@ -410,6 +410,53 @@ static inline long descriptor_set_property(uint32_t handle,
     return result;
 }
 
+static inline long console_get_scale(uint32_t handle, uint32_t* scale) {
+    if (scale == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleScale),
+        scale,
+        sizeof(*scale));
+}
+
+static inline long console_set_scale(uint32_t handle, uint32_t scale) {
+    return descriptor_set_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleScale),
+        &scale,
+        sizeof(scale));
+}
+
+static inline long console_get_font(uint32_t handle,
+                                    void* font_payload,
+                                    size_t payload_size) {
+    if (font_payload == nullptr ||
+        payload_size < sizeof(descriptor_defs::ConsoleFont)) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleFont),
+        font_payload,
+        payload_size);
+}
+
+static inline long console_set_font(uint32_t handle,
+                                    const void* font_payload,
+                                    size_t payload_size) {
+    if (font_payload == nullptr ||
+        payload_size < sizeof(descriptor_defs::ConsoleFont)) {
+        return -1;
+    }
+    return descriptor_set_property(
+        handle,
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleFont),
+        font_payload,
+        payload_size);
+}
+
 static inline long mount_descriptor(uint32_t block_handle,
                                     const char* mount_name) {
     return raw_syscall2(SystemCall::Mount,

@@ -8,9 +8,10 @@
 
 namespace {
 
-constexpr int kGlyphWidth = 8;
-constexpr int kGlyphHeight = 8;
-constexpr int kLineSpacing = 3 * scale;
+constexpr uint32_t kDefaultScale = 2;
+constexpr uint16_t kDefaultGlyphWidth = 8;
+constexpr uint16_t kDefaultGlyphHeight = 8;
+constexpr uint16_t kDefaultGlyphCount = 128;
 constexpr uint8_t kMemoryModelRgb = 1;
 constexpr size_t kPageSize = 0x1000;
 
@@ -84,14 +85,6 @@ void fill_span(uint8_t* dst,
     }
 }
 
-
-size_t cell_width_px() {
-    return static_cast<size_t>(kGlyphWidth * scale);
-}
-
-size_t cell_height_px() {
-    return static_cast<size_t>(kGlyphHeight * scale + kLineSpacing);
-}
 
 void fill_rect(Framebuffer* fb,
                size_t x,
@@ -360,6 +353,15 @@ Console::Console(uint32_t framebuffer_handle)
       fg_color(0xFFFFFFFF),
       bg_color(0x00000000),
       text_flags(0),
+      font_scale(kDefaultScale),
+      font_info{kDefaultGlyphWidth,
+                kDefaultGlyphHeight,
+                kDefaultGlyphCount,
+                1,
+                sizeof(font8x8_basic),
+                0},
+      font_data(&font8x8_basic[0][0]),
+      font_data_phys(0),
       columns(0),
       rows(0),
       text_width(0),
@@ -371,6 +373,23 @@ Console::Console(uint32_t framebuffer_handle)
       update_depth(0) {  // white on black
     refresh_framebuffer_info();
 
+    update_geometry();
+}
+
+size_t Console::cell_width_px() const {
+    return static_cast<size_t>(font_info.width) * font_scale;
+}
+
+size_t Console::line_spacing_px() const {
+    return static_cast<size_t>(3) * font_scale;
+}
+
+size_t Console::cell_height_px() const {
+    return static_cast<size_t>(font_info.height) * font_scale +
+           line_spacing_px();
+}
+
+void Console::update_geometry() {
     size_t cw = cell_width_px();
     size_t ch = cell_height_px();
     if (cw == 0) {
@@ -407,10 +426,10 @@ void Console::draw_char(char c, size_t x, size_t y) {
         return;
     }
     uint8_t uc = static_cast<uint8_t>(c);
-    if (uc >= 128) return;
+    if (uc >= font_info.glyph_count) return;
 
     size_t glyph_width = cell_width_px();
-    size_t glyph_height = static_cast<size_t>(kGlyphHeight * scale);
+    size_t glyph_height = static_cast<size_t>(font_info.height) * font_scale;
     size_t base_px = x * glyph_width;
     size_t base_py = y * cell_height_px();
     if (base_px >= text_width || base_py >= target->height) {
@@ -438,19 +457,20 @@ void Console::draw_char(char c, size_t x, size_t y) {
     uint64_t packed_fg = pack_color(target, fg_color);
     uint64_t packed_bg = pack_color(target, bg_color);
 
-    for (int row = 0; row < kGlyphHeight; ++row) {
-        uint8_t bits = font8x8_basic[uc][row];
-        for (int dy = 0; dy < scale; ++dy) {
-            size_t py = base_py + static_cast<size_t>(row) * scale + dy;
+    for (size_t row = 0; row < font_info.height; ++row) {
+        for (uint32_t dy = 0; dy < font_scale; ++dy) {
+            size_t py = base_py + static_cast<size_t>(row) * font_scale + dy;
             if (py >= target->height) {
                 continue;
             }
 
             uint8_t* dst = target->base + py * target->pitch + base_px * bpp;
             size_t px_offset = 0;
-            for (int col = 0; col < kGlyphWidth && px_offset < glyph_draw_width; ++col) {
-                bool bit_set = (bits & (1u << col)) != 0;
-                size_t span = static_cast<size_t>(scale);
+            for (size_t col = 0;
+                 col < font_info.width && px_offset < glyph_draw_width;
+                 ++col) {
+                bool bit_set = font_pixel(uc, col, row);
+                size_t span = static_cast<size_t>(font_scale);
                 if (px_offset + span > glyph_draw_width) {
                     span = glyph_draw_width - px_offset;
                 }
@@ -471,12 +491,13 @@ void Console::draw_char(char c, size_t x, size_t y) {
 
     // fill line spacing with background colour
     size_t gap_start_y = base_py + glyph_height;
-    if (kLineSpacing > 0 && gap_start_y < target->height && glyph_draw_width > 0) {
+    size_t line_spacing = line_spacing_px();
+    if (line_spacing > 0 && gap_start_y < target->height && glyph_draw_width > 0) {
         fill_rect(target,
                   base_px,
                   gap_start_y,
                   glyph_draw_width,
-                  static_cast<size_t>(kLineSpacing),
+                  line_spacing,
                   bg_color);
     }
 
@@ -486,7 +507,7 @@ void Console::draw_char(char c, size_t x, size_t y) {
             underline_y = target->height - 1;
         }
         if (underline_y < target->height) {
-            size_t underline_h = static_cast<size_t>(scale);
+            size_t underline_h = static_cast<size_t>(font_scale);
             if (underline_y + underline_h > target->height) {
                 underline_h = target->height - underline_y;
             }
@@ -500,7 +521,7 @@ void Console::draw_char(char c, size_t x, size_t y) {
     }
 
     if (back_buffer != nullptr) {
-        size_t flush_height = glyph_height + kLineSpacing;
+        size_t flush_height = glyph_height + line_spacing;
         size_t remaining_height = (base_py < target->height)
                                       ? (target->height - base_py)
                                       : 0;
@@ -525,6 +546,136 @@ void Console::set_color(uint32_t fg, uint32_t bg) {
 
 void Console::set_text_flags(uint8_t flags) {
     text_flags = flags;
+}
+
+bool Console::set_scale(uint32_t new_scale) {
+    if (new_scale < descriptor_defs::kConsoleMinScale ||
+        new_scale > descriptor_defs::kConsoleMaxScale) {
+        return false;
+    }
+    if (font_scale == new_scale) {
+        return true;
+    }
+    font_scale = new_scale;
+    update_geometry();
+    return true;
+}
+
+uint32_t Console::get_scale() const {
+    return font_scale;
+}
+
+bool Console::font_pixel(uint8_t glyph, size_t x, size_t y) const {
+    if (font_data == nullptr || glyph >= font_info.glyph_count ||
+        x >= font_info.width || y >= font_info.height) {
+        return false;
+    }
+    size_t glyph_bytes = static_cast<size_t>(font_info.height) *
+                         font_info.bytes_per_row;
+    size_t offset = static_cast<size_t>(glyph) * glyph_bytes +
+                    y * font_info.bytes_per_row + x / 8;
+    size_t bit = x % 8;
+    if ((font_info.flags & descriptor_defs::kConsoleFontMsbFirst) != 0) {
+        bit = 7 - bit;
+    }
+    return (font_data[offset] & (1u << bit)) != 0;
+}
+
+bool Console::set_font(const descriptor_defs::ConsoleFont& new_font,
+                       const uint8_t* data) {
+    if (data == nullptr || new_font.width == 0 || new_font.height == 0 ||
+        new_font.glyph_count == 0 || new_font.glyph_count > 256 ||
+        new_font.width > 64 || new_font.height > 64 ||
+        new_font.bytes_per_row != (new_font.width + 7u) / 8u ||
+        (new_font.flags & ~descriptor_defs::kConsoleFontMsbFirst) != 0) {
+        return false;
+    }
+    size_t expected_size = static_cast<size_t>(new_font.glyph_count) *
+                           new_font.height * new_font.bytes_per_row;
+    if (new_font.data_size != expected_size ||
+        expected_size > descriptor_defs::kConsoleMaxFontDataSize) {
+        return false;
+    }
+
+    size_t pages = (expected_size + kPageSize - 1) / kPageSize;
+    uint64_t new_phys = memory::alloc_kernel_block_pages(pages);
+    if (new_phys == 0) {
+        return false;
+    }
+    auto* new_data = static_cast<uint8_t*>(paging_phys_to_virt(new_phys));
+    memcpy(new_data, data, expected_size);
+
+    uint64_t old_phys = font_data_phys;
+    font_info = new_font;
+    font_data = new_data;
+    font_data_phys = new_phys;
+    update_geometry();
+    if (old_phys != 0) {
+        memory::free_kernel_block(old_phys);
+    }
+    return true;
+}
+
+descriptor_defs::ConsoleFont Console::get_font_info() const {
+    return font_info;
+}
+
+const uint8_t* Console::get_font_data() const {
+    return font_data;
+}
+
+void Console::redraw_cells(const descriptor_defs::VtyCell* cells,
+                           size_t source_cols,
+                           size_t source_rows,
+                           size_t source_cursor_x,
+                           size_t source_cursor_y,
+                           uint32_t final_fg,
+                           uint32_t final_bg,
+                           uint8_t final_flags) {
+    if (cells == nullptr || source_cols == 0 || source_rows == 0) {
+        clear();
+        return;
+    }
+
+    set_update_deferred(true);
+    fg_color = final_fg;
+    bg_color = final_bg;
+    text_flags = final_flags;
+    clear();
+
+    size_t draw_rows = source_rows < rows ? source_rows : rows;
+    size_t source_start_y = 0;
+    if (source_rows > draw_rows && source_cursor_y >= draw_rows) {
+        source_start_y = source_cursor_y - draw_rows + 1;
+        size_t max_start = source_rows - draw_rows;
+        if (source_start_y > max_start) {
+            source_start_y = max_start;
+        }
+    }
+    size_t draw_cols = source_cols < columns ? source_cols : columns;
+    for (size_t y = 0; y < draw_rows; ++y) {
+        size_t source_y = source_start_y + y;
+        for (size_t x = 0; x < draw_cols; ++x) {
+            const auto& cell = cells[source_y * source_cols + x];
+            fg_color = cell.fg;
+            bg_color = cell.bg;
+            text_flags = cell.flags;
+            draw_char(static_cast<char>(cell.ch), x, y);
+        }
+    }
+
+    fg_color = final_fg;
+    bg_color = final_bg;
+    text_flags = final_flags;
+    cursor_x = source_cursor_x < columns ? source_cursor_x
+                                         : (columns ? columns - 1 : 0);
+    cursor_y = source_cursor_y >= source_start_y
+                   ? source_cursor_y - source_start_y
+                   : 0;
+    if (cursor_y >= rows) {
+        cursor_y = rows ? rows - 1 : 0;
+    }
+    set_update_deferred(false);
 }
 
 void Console::scroll() {

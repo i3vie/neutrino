@@ -1,5 +1,6 @@
 #include "../descriptor.hpp"
 
+#include "../../drivers/console/console.hpp"
 #include "../process.hpp"
 #include "../vm.hpp"
 #include "../../lib/mem.hpp"
@@ -526,6 +527,25 @@ bool register_vty_descriptor() {
     return register_type(kTypeVty,
                          descriptor_vty::open_vty,
                          &descriptor_vty::kVtyOps);
+}
+
+bool vty_redraw_console(uint32_t id, Console& console) {
+    using namespace descriptor_vty;
+    Vty* vty = find_vty(id);
+    if (vty == nullptr || !vty->in_use) {
+        return false;
+    }
+    lock_vty(*vty);
+    console.redraw_cells(vty->cells,
+                         vty->cols,
+                         vty->rows,
+                         vty->cursor_x,
+                         vty->cursor_y,
+                         vty->fg,
+                         vty->bg,
+                         vty->text_flags);
+    unlock_vty(*vty);
+    return true;
 }
 
 int vty_get_property(uint32_t id,
