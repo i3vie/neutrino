@@ -21,14 +21,14 @@ QEMU ?= qemu-system-x86_64
 QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
-QEMU_NET_DEVICE ?= e1000e
+QEMU_NET_DEVICE ?= virtio-net-pci
 QEMU_STORAGE ?= ide
 QEMU_PRIMARY_IMG ?= hdd.img
 QEMU_EXTRA_IDE_IMG ?=
 QEMU_EXTRA_AHCI_IMG ?=
 QEMU_XHCI ?= 0
 QEMU_USB_STORAGE_IMG ?=
-QEMU_HDA ?= 0
+QEMU_HDA ?= 1
 QEMU_AUDIO_DRIVER ?= sdl
 QEMU_HOSTFWD ?= tcp::2222-:2222
 QEMU_TAP_IFACE ?= tap0
@@ -250,7 +250,7 @@ live-esp: $(LIVE_ESP_IMG)
 .PHONY: force-live-esp
 force-live-esp: $(LIVE_ESP_IMG)
 
-$(LIVE_ROOTFS_IMG): userspace/Makefile $(shell find userspace/programs userspace/crt userspace/libc userspace/config -type f 2>/dev/null)
+$(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(shell find userspace/programs userspace/crt userspace/libc userspace/config -type f 2>/dev/null)
 	@mkdir -p $(dir $@)
 	rm -f $@
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
