@@ -46,6 +46,8 @@ enum class Property : uint32_t {
     ConsoleTextFlags  = 0x00000005,
     ConsoleKernelLog  = 0x00000006,
     ConsoleUpdate     = 0x00000007,
+    ConsoleScale      = 0x00000008,
+    ConsoleFont       = 0x00000009,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
     BlockGeometry     = 0x00020001,
@@ -65,6 +67,8 @@ enum class Property : uint32_t {
     NetDeviceDebug    = 0x00060003,
     NetEndpointInfo   = 0x00070001,
     AudioFormat       = 0x00080001,
+    AudioStatus       = 0x00080002,
+    AudioControl      = 0x00080003,
 };
 
 struct AudioFormatInfo {
@@ -73,6 +77,29 @@ struct AudioFormatInfo {
     uint16_t bits_per_sample;
     uint32_t frame_bytes;
     uint32_t reserved;
+};
+
+enum AudioCommand : uint32_t {
+    kAudioCommandPause = 1,
+    kAudioCommandResume = 2,
+    kAudioCommandFlush = 3,
+    kAudioCommandSetVolume = 4,
+};
+
+enum AudioStatusFlag : uint32_t {
+    kAudioStatusPaused = 1u << 0,
+    kAudioStatusRunning = 1u << 1,
+};
+
+struct AudioControlInfo {
+    uint32_t command;
+    int32_t value;
+};
+
+struct AudioStatusInfo {
+    uint64_t queued_bytes;
+    uint32_t flags;
+    uint32_t volume;
 };
 
 enum DiskFlag : uint32_t {
@@ -164,6 +191,32 @@ struct ColorPair {
     uint32_t fg;
     uint32_t bg;
 };
+
+constexpr uint32_t kConsoleMinScale = 1;
+constexpr uint32_t kConsoleMaxScale = 8;
+constexpr uint32_t kConsoleMaxFontDataSize = 64 * 1024;
+
+enum ConsoleFontFlag : uint32_t {
+    kConsoleFontMsbFirst = 1u << 0,
+};
+
+struct ConsoleFont {
+    uint16_t width;
+    uint16_t height;
+    uint16_t glyph_count;
+    uint16_t bytes_per_row;
+    uint32_t data_size;
+    uint32_t flags;
+};
+
+static_assert(sizeof(ConsoleFont) == 16, "ConsoleFont size mismatch");
+
+// Packed glyph data immediately follows this header. Glyphs are stored in
+// code-point order and row by row. By default the leftmost pixel is in the low
+// bit; kConsoleFontMsbFirst selects the high bit instead.
+constexpr size_t console_font_payload_size(const ConsoleFont& font) {
+    return sizeof(ConsoleFont) + static_cast<size_t>(font.data_size);
+}
 
 enum class VtyOpen : uint64_t {
     Attach = 1ull << 0,
@@ -290,6 +343,9 @@ struct NetDeviceDebug {
     uint32_t tx_completed;
     uint32_t rx_desc_seen;
     uint32_t rx_frames_passed;
+    uint32_t rx_queued;
+    uint32_t rx_frames_received;
+    uint32_t rx_frames_dropped;
     uint32_t reserved;
 };
 
