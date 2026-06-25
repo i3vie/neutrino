@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "../crt/syscall.hpp"
 #include "../net/network_protocol.hpp"
@@ -13,7 +14,9 @@ constexpr size_t kMaxListeners = 8;
 constexpr size_t kMaxConnections = 32;
 constexpr size_t kMaxClientPorts = 8;
 constexpr size_t kMaxPendingConnects = 8;
-constexpr uint16_t kDefaultWindowSize = 4096;
+constexpr uint16_t kDefaultWindowSize = 65535;
+constexpr size_t kAckFlushBytes = 8192;
+constexpr uint8_t kAckFlushSegments = 4;
 constexpr uint16_t kEphemeralPortStart = 49152;
 constexpr uint16_t kEphemeralPortEnd = 65535;
 
@@ -42,9 +45,11 @@ struct Connection {
     uint16_t remote_port;
     uint32_t remote_next_seq;
     uint32_t local_next_seq;
+    uint32_t pending_ack_bytes;
     uint32_t app_pipe_handle;
     uint32_t endpoint_handle;
     uint32_t endpoint_id;
+    uint8_t pending_ack_segments;
     Listener* listener;
 };
 
@@ -367,8 +372,8 @@ bool send_network_segment(ServerContext& ctx,
         message.send_tcp_request.source_ip[i] = source_ip[i];
         message.send_tcp_request.destination_ip[i] = destination_ip[i];
     }
-    for (size_t i = 0; i < payload_length; ++i) {
-        message.send_tcp_request.payload[i] = payload[i];
+    if (payload_length != 0 && payload != nullptr) {
+        memcpy(message.send_tcp_request.payload, payload, payload_length);
     }
     if (!networkd_protocol::write_message(ctx.networkd_server_pipe, message)) {
         return false;
@@ -427,18 +432,6 @@ void send_data_event(Connection& conn, const uint8_t* payload, size_t payload_le
     if (payload_length > tcpd_protocol::kMaxPayload) {
         return;
     }
-    print("tcpd: deliver data conn=");
-    print_u32(conn.id);
-    print(" bytes=");
-    print_u32(static_cast<uint32_t>(payload_length));
-    print("\n");
-    tcpd_protocol::Message message{};
-    tcpd_protocol::init_message(message, tcpd_protocol::kDataEvent);
-    message.data_event.connection_id = conn.id;
-    message.data_event.payload_length = static_cast<uint16_t>(payload_length);
-    for (size_t i = 0; i < payload_length; ++i) {
-        message.data_event.payload[i] = payload[i];
-    }
     if (conn.endpoint_handle != 0) {
         size_t written = 0;
         while (written < payload_length) {
@@ -454,6 +447,15 @@ void send_data_event(Connection& conn, const uint8_t* payload, size_t payload_le
             }
             written += static_cast<size_t>(result);
         }
+        return;
+    }
+
+    tcpd_protocol::Message message{};
+    tcpd_protocol::init_message(message, tcpd_protocol::kDataEvent);
+    message.data_event.connection_id = conn.id;
+    message.data_event.payload_length = static_cast<uint16_t>(payload_length);
+    if (payload_length != 0 && payload != nullptr) {
+        memcpy(message.data_event.payload, payload, payload_length);
     }
     (void)tcpd_protocol::write_message(conn.app_pipe_handle, message);
 }
@@ -475,10 +477,17 @@ void reset_connection(Connection& conn) {
     conn.remote_port = 0;
     conn.remote_next_seq = 0;
     conn.local_next_seq = 0;
+    conn.pending_ack_bytes = 0;
     conn.app_pipe_handle = 0;
     conn.endpoint_handle = 0;
     conn.endpoint_id = 0;
+    conn.pending_ack_segments = 0;
     conn.listener = nullptr;
+}
+
+void clear_pending_ack(Connection& conn) {
+    conn.pending_ack_bytes = 0;
+    conn.pending_ack_segments = 0;
 }
 
 void release_client_port(ServerContext& ctx, uint16_t port) {
@@ -590,6 +599,8 @@ bool begin_outbound_connection(ServerContext& ctx,
     conn->local_port = local_port;
     conn->remote_port = remote_port;
     conn->remote_next_seq = 0;
+    conn->pending_ack_bytes = 0;
+    conn->pending_ack_segments = 0;
     conn->app_pipe_handle = app_pipe_handle;
     conn->endpoint_handle = 0;
     conn->endpoint_id = endpoint_id;
@@ -709,6 +720,7 @@ void handle_send_request(ServerContext& ctx, const tcpd_protocol::SendRequest& r
                              request.payload,
                              request.payload_length)) {
         conn->local_next_seq += request.payload_length;
+        clear_pending_ack(*conn);
     }
 }
 
@@ -736,6 +748,7 @@ void send_connection_payload(ServerContext& ctx,
                              payload,
                              payload_length)) {
         conn.local_next_seq += payload_length;
+        clear_pending_ack(conn);
     }
 }
 
@@ -976,6 +989,48 @@ void send_ack_only(ServerContext& ctx,
                                0);
 }
 
+void send_ack_now(ServerContext& ctx,
+                  Connection& conn,
+                  uint16_t flags = usernet::kTcpFlagAck) {
+    send_ack_only(ctx, conn, flags);
+    clear_pending_ack(conn);
+}
+
+void note_received_payload_for_ack(ServerContext& ctx,
+                                   Connection& conn,
+                                   size_t payload_length) {
+    if (payload_length == 0) {
+        return;
+    }
+    if (conn.pending_ack_bytes <= 0xffffffffu - payload_length) {
+        conn.pending_ack_bytes += static_cast<uint32_t>(payload_length);
+    } else {
+        conn.pending_ack_bytes = 0xffffffffu;
+    }
+    if (conn.pending_ack_segments != 0xffu) {
+        ++conn.pending_ack_segments;
+    }
+    if (conn.pending_ack_bytes >= kAckFlushBytes ||
+        conn.pending_ack_segments >= kAckFlushSegments) {
+        send_ack_now(ctx, conn);
+    }
+}
+
+bool flush_pending_acks(ServerContext& ctx) {
+    bool did_work = false;
+    for (size_t i = 0; i < kMaxConnections; ++i) {
+        Connection& conn = ctx.connections[i];
+        if (!conn.in_use ||
+            conn.state != kConnStateEstablished ||
+            conn.pending_ack_segments == 0) {
+            continue;
+        }
+        send_ack_now(ctx, conn);
+        did_work = true;
+    }
+    return did_work;
+}
+
 void resend_syn_ack(ServerContext& ctx, Connection& conn) {
     descriptor_defs::NetIpv4Config cfg{};
     if (!load_ipv4_config(ctx, cfg)) {
@@ -1026,6 +1081,8 @@ void handle_new_connection(ServerContext& ctx,
     conn->local_port = segment.destination_port;
     conn->remote_port = segment.source_port;
     conn->remote_next_seq = segment.sequence_number + 1;
+    conn->pending_ack_bytes = 0;
+    conn->pending_ack_segments = 0;
     uint32_t initial_seq =
         0x4E540000u + (static_cast<uint32_t>(listener.port) << 4) + conn->id;
     conn->local_next_seq = initial_seq + 1;
@@ -1124,11 +1181,11 @@ void handle_existing_connection(ServerContext& ctx,
             if (payload_length != 0) {
                 conn.remote_next_seq += static_cast<uint32_t>(payload_length);
                 send_data_event(conn, segment.payload, payload_length);
-                send_ack_only(ctx, conn);
+                note_received_payload_for_ack(ctx, conn, payload_length);
             }
             if ((segment.flags & usernet::kTcpFlagFin) != 0) {
                 conn.remote_next_seq += 1;
-                send_ack_only(ctx, conn);
+                send_ack_now(ctx, conn);
                 close_connection(ctx, conn, tcpd_protocol::kCloseRemoteFin);
             }
         } else {
@@ -1183,13 +1240,14 @@ void handle_existing_connection(ServerContext& ctx,
     }
 
     if (seq != conn.remote_next_seq) {
-        send_ack_only(ctx, conn);
+        send_ack_now(ctx, conn);
         return;
     }
 
     if (payload_length != 0) {
         conn.remote_next_seq += static_cast<uint32_t>(payload_length);
         send_data_event(conn, segment.payload, payload_length);
+        note_received_payload_for_ack(ctx, conn, payload_length);
     }
 
     if ((segment.flags & usernet::kTcpFlagFin) != 0) {
@@ -1197,13 +1255,9 @@ void handle_existing_connection(ServerContext& ctx,
             ++ctx.registry->remote_fins;
         }
         conn.remote_next_seq += 1;
-        send_ack_only(ctx, conn);
+        send_ack_now(ctx, conn);
         close_connection(ctx, conn, tcpd_protocol::kCloseRemoteFin);
         return;
-    }
-
-    if (payload_length != 0) {
-        send_ack_only(ctx, conn);
     }
 }
 
@@ -1366,6 +1420,9 @@ int main(uint64_t, uint64_t) {
         if (did_work) {
             continue;
         }
+        if (flush_pending_acks(ctx)) {
+            continue;
+        }
 
         size_t wait_count = 0;
         waits[wait_count].handle = ctx.tcpd_server_pipe;
@@ -1387,6 +1444,7 @@ int main(uint64_t, uint64_t) {
             const Connection& conn = ctx.connections[i];
             if (!conn.in_use ||
                 conn.state != kConnStateEstablished ||
+                conn.endpoint_handle == 0 ||
                 conn.endpoint_handle == kInvalidDescriptor) {
                 continue;
             }

@@ -9,7 +9,7 @@ namespace descriptor {
 
 namespace descriptor_net_endpoint {
 
-constexpr size_t kEndpointBufferSize = 8192;
+constexpr size_t kEndpointBufferSize = 65536;
 constexpr size_t kMaxEndpoints = 64;
 constexpr size_t kMaxEndpointHandles = kMaxEndpoints * 2;
 constexpr size_t kMaxEndpointWaiters = 128;

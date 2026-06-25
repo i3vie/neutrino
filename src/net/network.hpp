@@ -7,7 +7,7 @@ namespace net {
 
 using TransmitFn = bool (*)(void* context, const void* data, size_t length);
 
-constexpr size_t kMaxQueuedFrames = 32;
+constexpr size_t kMaxQueuedFrames = 128;
 constexpr size_t kMaxQueuedFrameSize = 1600;
 constexpr size_t kEthernetMtu = 1500;
 
@@ -28,6 +28,8 @@ struct LinkDevice {
     uint16_t rx_tail;
     uint16_t rx_lengths[kMaxQueuedFrames];
     uint8_t rx_frames[kMaxQueuedFrames][kMaxQueuedFrameSize];
+    uint32_t rx_frames_received;
+    uint32_t rx_frames_dropped;
     volatile int rx_lock;
 };
 

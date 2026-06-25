@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "udp.hpp"
 
@@ -162,10 +163,8 @@ inline bool build_tcp_ipv4_frame(uint8_t* out_frame,
         return false;
     }
 
-    for (size_t i = 0; i < 6; ++i) {
-        out_frame[i] = destination_mac[i];
-        out_frame[6 + i] = source_mac[i];
-    }
+    memcpy(out_frame, destination_mac, 6);
+    memcpy(out_frame + 6, source_mac, 6);
     store_be16(out_frame + 12, kEtherTypeIpv4);
 
     uint8_t* ipv4 = out_frame + kEthernetHeaderSize;
@@ -177,10 +176,8 @@ inline bool build_tcp_ipv4_frame(uint8_t* out_frame,
     ipv4[8] = 64;
     ipv4[9] = kIpv4ProtocolTcp;
     store_be16(ipv4 + 10, 0);
-    for (size_t i = 0; i < 4; ++i) {
-        ipv4[12 + i] = source_ip[i];
-        ipv4[16 + i] = destination_ip[i];
-    }
+    memcpy(ipv4 + 12, source_ip, 4);
+    memcpy(ipv4 + 16, destination_ip, 4);
     store_be16(ipv4 + 10, internet_checksum(ipv4, kIpv4HeaderMinSize));
 
     uint8_t* tcp = ipv4 + kIpv4HeaderMinSize;
@@ -196,13 +193,13 @@ inline bool build_tcp_ipv4_frame(uint8_t* out_frame,
     store_be16(tcp + 18, 0);
 
     const uint8_t* option_bytes = static_cast<const uint8_t*>(options);
-    for (size_t i = 0; i < options_length; ++i) {
-        tcp[kTcpHeaderMinSize + i] = option_bytes[i];
+    if (options_length != 0) {
+        memcpy(tcp + kTcpHeaderMinSize, option_bytes, options_length);
     }
 
     const uint8_t* payload_bytes = static_cast<const uint8_t*>(payload);
-    for (size_t i = 0; i < payload_length; ++i) {
-        tcp[tcp_header_length + i] = payload_bytes[i];
+    if (payload_length != 0) {
+        memcpy(tcp + tcp_header_length, payload_bytes, payload_length);
     }
 
     store_be16(tcp + 16, tcp_checksum(source_ip, destination_ip, tcp, ipv4_payload_length));

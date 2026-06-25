@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "../crt/syscall.hpp"
 #include "descriptors.hpp"
@@ -151,25 +152,23 @@ struct Message {
 };
 
 inline void init_message(Message& message, uint16_t type) {
-    for (size_t i = 0; i < sizeof(Message); ++i) {
-        reinterpret_cast<uint8_t*>(&message)[i] = 0;
-    }
+    memset(&message, 0, sizeof(Message));
     message.magic = kMessageMagic;
     message.version = kMessageVersion;
     message.type = type;
 }
 
 inline bool write_message(uint32_t handle, const Message& message) {
-    auto* bounce = static_cast<Message*>(
-        map_anonymous(sizeof(Message), MAP_WRITE));
+    static Message* bounce = nullptr;
+    if (bounce == nullptr) {
+        bounce = static_cast<Message*>(
+            map_anonymous(sizeof(Message), MAP_WRITE));
+    }
     if (bounce == nullptr) {
         return false;
     }
-    const uint8_t* src = reinterpret_cast<const uint8_t*>(&message);
     uint8_t* bounce_bytes = reinterpret_cast<uint8_t*>(bounce);
-    for (size_t i = 0; i < sizeof(Message); ++i) {
-        bounce_bytes[i] = src[i];
-    }
+    memcpy(bounce_bytes, &message, sizeof(Message));
     size_t written = 0;
     descriptor_defs::DescriptorWait wait{};
     wait.handle = handle;
@@ -188,18 +187,19 @@ inline bool write_message(uint32_t handle, const Message& message) {
             continue;
         }
         if (result <= 0) {
-            unmap(bounce, sizeof(Message));
             return false;
         }
         written += static_cast<size_t>(result);
     }
-    unmap(bounce, sizeof(Message));
     return true;
 }
 
 inline bool read_message(uint32_t handle, Message& message) {
-    auto* bounce = static_cast<Message*>(
-        map_anonymous(sizeof(Message), MAP_WRITE));
+    static Message* bounce = nullptr;
+    if (bounce == nullptr) {
+        bounce = static_cast<Message*>(
+            map_anonymous(sizeof(Message), MAP_WRITE));
+    }
     if (bounce == nullptr) {
         return false;
     }
@@ -216,7 +216,6 @@ inline bool read_message(uint32_t handle, Message& message) {
                                       sizeof(Message) - total);
         if (result == kDescriptorWouldBlock) {
             if (total == 0) {
-                unmap(bounce, sizeof(Message));
                 return false;
             }
             wait.revents = 0;
@@ -226,18 +225,13 @@ inline bool read_message(uint32_t handle, Message& message) {
             continue;
         }
         if (result <= 0) {
-            unmap(bounce, sizeof(Message));
             return false;
         }
         total += static_cast<size_t>(result);
     }
-    uint8_t* dest = reinterpret_cast<uint8_t*>(&message);
-    for (size_t i = 0; i < sizeof(Message); ++i) {
-        dest[i] = bounce_bytes[i];
-    }
+    memcpy(&message, bounce_bytes, sizeof(Message));
     bool ok = message.magic == kMessageMagic &&
               message.version == kMessageVersion;
-    unmap(bounce, sizeof(Message));
     return ok;
 }
 

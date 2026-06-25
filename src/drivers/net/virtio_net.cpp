@@ -33,7 +33,7 @@ constexpr uint64_t kFeatureVersion1 = 1ull << 32;
 
 constexpr uint16_t kQueueIndexRx = 0;
 constexpr uint16_t kQueueIndexTx = 1;
-constexpr uint16_t kMaxQueueSize = 8;
+constexpr uint16_t kMaxQueueSize = 64;
 constexpr uint16_t kMsixVectorUnused = 0xFFFFu;
 
 constexpr uint16_t kVirtqDescFlagWrite = 1u << 1;
@@ -429,7 +429,6 @@ void recycle_receive_descriptor(Queue& queue, uint16_t descriptor_index) {
         return;
     }
 
-    memset(queue.buffer_virt[descriptor_index], 0, kPacketBufferSize);
     queue.avail_ring[queue.next_avail_idx % queue.size] = descriptor_index;
     ++queue.next_avail_idx;
     compiler_barrier();
@@ -469,7 +468,6 @@ void poll_tx_queue(Queue& queue) {
             continue;
         }
         queue.buffer_in_use[elem.id] = false;
-        memset(queue.buffer_virt[elem.id], 0, kPacketBufferSize);
     }
 }
 

@@ -583,6 +583,8 @@ bool register_link(LinkDevice& device,
     device.ipv4_dns = 0;
     device.rx_head = 0;
     device.rx_tail = 0;
+    device.rx_frames_received = 0;
+    device.rx_frames_dropped = 0;
     device.rx_lock = 0;
     memset(device.rx_lengths, 0, sizeof(device.rx_lengths));
 
@@ -701,16 +703,27 @@ void receive_frame(LinkDevice* device, const void* frame, size_t length) {
     }
 
     if (length <= kMaxQueuedFrameSize) {
+        bool queued = false;
         lock_device(*device);
+        ++device->rx_frames_received;
         uint16_t next_head =
             static_cast<uint16_t>((device->rx_head + 1) % kMaxQueuedFrames);
         if (next_head != device->rx_tail) {
             memcpy(device->rx_frames[device->rx_head], frame, length);
             device->rx_lengths[device->rx_head] = static_cast<uint16_t>(length);
             device->rx_head = next_head;
+            queued = true;
+        } else {
+            ++device->rx_frames_dropped;
         }
         unlock_device(*device);
-        descriptor::wake_waiters();
+        if (queued) {
+            descriptor::wake_waiters();
+        }
+    } else {
+        lock_device(*device);
+        ++device->rx_frames_dropped;
+        unlock_device(*device);
     }
 
     const uint8_t* bytes = static_cast<const uint8_t*>(frame);

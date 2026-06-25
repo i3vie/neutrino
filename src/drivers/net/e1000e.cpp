@@ -107,7 +107,7 @@ constexpr uint64_t kMmioVirtBase = 0xFFFFE10020000000ull;
 constexpr size_t kMmioWindowSize = 2ull * 1024 * 1024;
 constexpr size_t kPageSize = 4096;
 constexpr size_t kRegisterWindowSize = 128ull * 1024;
-constexpr size_t kRingCount = 32;
+constexpr size_t kRingCount = 128;
 constexpr size_t kPacketBufferSize = 2048;
 constexpr uint32_t kPollSpinCount = 100000;
 
@@ -216,7 +216,7 @@ constexpr uint32_t IMS_RXDMT0 = 0x00000010u;
 constexpr uint32_t IMS_RXO = 0x00000040u;
 constexpr uint32_t IMS_RXT0 = 0x00000080u;
 constexpr uint32_t kInterruptMask =
-    IMS_TXDW | IMS_LSC | IMS_RXDMT0 | IMS_RXO | IMS_RXT0;
+    IMS_LSC | IMS_RXDMT0 | IMS_RXO | IMS_RXT0;
 
 struct [[gnu::packed]] RxDescriptor {
     uint64_t buffer_addr;

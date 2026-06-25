@@ -135,11 +135,19 @@ int get_property(DescriptorEntry& entry,
             }
             auto* debug =
                 reinterpret_cast<descriptor_defs::NetDeviceDebug*>(out);
+            bool ok = true;
             if (device->name != nullptr &&
                 string_util::equals(device->name, "e1000e")) {
-                return e1000e::get_debug_info(*debug) ? 0 : -1;
+                ok = e1000e::get_debug_info(*debug);
+            } else {
+                memset(debug, 0, sizeof(*debug));
             }
-            memset(debug, 0, sizeof(*debug));
+            if (!ok) {
+                return -1;
+            }
+            debug->rx_queued = static_cast<uint32_t>(net::queued_frame_count(*device));
+            debug->rx_frames_received = device->rx_frames_received;
+            debug->rx_frames_dropped = device->rx_frames_dropped;
             return 0;
         }
         default:

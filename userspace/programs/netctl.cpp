@@ -526,6 +526,12 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
         print_u32(debug.rx_desc_seen);
         print("\nrx frames passed: ");
         print_u32(debug.rx_frames_passed);
+        print("\nrx queued: ");
+        print_u32(debug.rx_queued);
+        print("\nrx received: ");
+        print_u32(debug.rx_frames_received);
+        print("\nrx dropped: ");
+        print_u32(debug.rx_frames_dropped);
         print("\n");
         descriptor_close(static_cast<uint32_t>(handle));
         return 0;

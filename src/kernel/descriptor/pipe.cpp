@@ -10,7 +10,7 @@ namespace descriptor {
 
 namespace descriptor_pipe {
 
-constexpr size_t kPipeBufferSize = 4096;
+constexpr size_t kPipeBufferSize = 65536;
 constexpr size_t kMaxPipes = 64;
 constexpr size_t kMaxPipeWaiters = 128;
 

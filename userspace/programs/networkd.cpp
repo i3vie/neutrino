@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "../crt/syscall.hpp"
 #include "../net/ipv4.hpp"
@@ -12,6 +13,7 @@ namespace {
 constexpr size_t kMaxBindings = 16;
 constexpr size_t kMaxArpEntries = 16;
 constexpr size_t kMaxPendingPings = 8;
+constexpr uint32_t kDeviceWriteRetryLimit = 100000;
 constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 struct ArpEntry {
@@ -254,6 +256,24 @@ bool load_ipv4_config(ServerContext& ctx, descriptor_defs::NetIpv4Config& out) {
            (out.flags & descriptor_defs::kNetIpv4FlagEnabled) != 0;
 }
 
+bool write_device_frame(ServerContext& ctx, const uint8_t* frame, size_t frame_length) {
+    if (frame == nullptr || frame_length == 0) {
+        return false;
+    }
+    for (uint32_t attempts = 0; attempts < kDeviceWriteRetryLimit; ++attempts) {
+        long written = descriptor_write(ctx.device.handle, frame, frame_length);
+        if (written == static_cast<long>(frame_length)) {
+            return true;
+        }
+        if (written == kDescriptorWouldBlock) {
+            yield();
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
 bool resolve_next_hop(ServerContext& ctx,
                       const uint8_t destination_ip[4],
                       uint8_t next_hop_ip[4]) {
@@ -290,8 +310,7 @@ bool send_arp_request(ServerContext& ctx, const uint8_t target_ip[4]) {
                                           target_ip)) {
         return false;
     }
-    bool ok = descriptor_write(ctx.device.handle, frame, frame_length) > 0;
-    return ok;
+    return write_device_frame(ctx, frame, frame_length);
 }
 
 bool lookup_or_resolve_mac(ServerContext& ctx,
@@ -397,8 +416,8 @@ void send_udp_packet(Binding& binding, const usernet::UdpPacketView& packet) {
         message->udp_event.source_ip[i] = packet.source_ip[i];
         message->udp_event.destination_ip[i] = packet.destination_ip[i];
     }
-    for (size_t i = 0; i < packet.payload_length; ++i) {
-        message->udp_event.payload[i] = packet.payload[i];
+    if (packet.payload_length != 0) {
+        memcpy(message->udp_event.payload, packet.payload, packet.payload_length);
     }
     (void)networkd_protocol::write_message(binding.pipe_handle, *message);
 }
@@ -427,11 +446,11 @@ void send_tcp_segment(Binding& binding, const usernet::TcpSegmentView& segment) 
         message->tcp_event.source_ip[i] = segment.source_ip[i];
         message->tcp_event.destination_ip[i] = segment.destination_ip[i];
     }
-    for (size_t i = 0; i < segment.options_length; ++i) {
-        message->tcp_event.options[i] = segment.options[i];
+    if (segment.options_length != 0) {
+        memcpy(message->tcp_event.options, segment.options, segment.options_length);
     }
-    for (size_t i = 0; i < segment.payload_length; ++i) {
-        message->tcp_event.payload[i] = segment.payload[i];
+    if (segment.payload_length != 0) {
+        memcpy(message->tcp_event.payload, segment.payload, segment.payload_length);
     }
     (void)networkd_protocol::write_message(binding.pipe_handle, *message);
 }
@@ -454,8 +473,8 @@ void send_icmp_reply(PendingPing& ping, const usernet::IcmpEchoReplyView& reply)
         message->icmp_event.source_ip[i] = reply.source_ip[i];
         message->icmp_event.destination_ip[i] = reply.destination_ip[i];
     }
-    for (size_t i = 0; i < reply.payload_length; ++i) {
-        message->icmp_event.payload[i] = reply.payload[i];
+    if (reply.payload_length != 0) {
+        memcpy(message->icmp_event.payload, reply.payload, reply.payload_length);
     }
     (void)networkd_protocol::write_message(ping.pipe_handle, *message);
 }
@@ -600,7 +619,7 @@ void handle_send_request(ServerContext& ctx,
     if (ctx.registry != nullptr) {
         ++ctx.registry->net_tx_udp;
     }
-    (void)descriptor_write(ctx.device.handle, frame, frame_length);
+    (void)write_device_frame(ctx, frame, frame_length);
 }
 
 void handle_tcp_send_request(ServerContext& ctx,
@@ -652,7 +671,7 @@ void handle_tcp_send_request(ServerContext& ctx,
     if (ctx.registry != nullptr) {
         ++ctx.registry->net_tx_tcp;
     }
-    (void)descriptor_write(ctx.device.handle, frame, frame_length);
+    (void)write_device_frame(ctx, frame, frame_length);
 }
 
 void handle_icmp_request(ServerContext& ctx,
@@ -705,7 +724,7 @@ void handle_icmp_request(ServerContext& ctx,
     pending->identifier = request.identifier;
     pending->sequence = request.sequence;
     pending->pipe_handle = static_cast<uint32_t>(handle);
-    (void)descriptor_write(ctx.device.handle, frame, frame_length);
+    (void)write_device_frame(ctx, frame, frame_length);
 }
 
 bool poll_control(ServerContext& ctx) {
@@ -719,9 +738,6 @@ bool poll_control(ServerContext& ctx) {
             return did_work;
         }
         did_work = true;
-        print("networkd: control message type=");
-        print_u32(message->type);
-        print("\n");
         if (message->type == networkd_protocol::kBindUdpRequest) {
             handle_udp_bind_request(ctx, message->bind_request);
         } else if (message->type == networkd_protocol::kUnbindUdpRequest) {
