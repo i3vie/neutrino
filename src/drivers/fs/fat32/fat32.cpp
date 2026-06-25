@@ -437,7 +437,7 @@ bool iterate_directory(Fat32Volume& volume, uint32_t start_cluster, Fn&& fn) {
             }
 
             IterationResult res = fn(entry,
-                                     current_cluster,
+                                     start_cluster,
                                      static_cast<uint32_t>(raw_index),
                                      static_cast<uint32_t>(visible_index),
                                      long_name);
@@ -1275,7 +1275,7 @@ bool fat32_create_file(Fat32Volume& volume,
         return false;
     }
 
-    copy_entry(raw, slot.cluster, slot.raw_index, nullptr, out_entry);
+    copy_entry(raw, parent_cluster, slot.raw_index, nullptr, out_entry);
     return true;
 }
 
@@ -1382,7 +1382,7 @@ bool fat32_create_directory(Fat32Volume& volume,
         return false;
     }
 
-    copy_entry(raw, slot.cluster, slot.raw_index, nullptr, out_entry);
+    copy_entry(raw, parent_cluster, slot.raw_index, nullptr, out_entry);
     return true;
 }
 

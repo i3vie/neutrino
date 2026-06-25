@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+#include "drivers/fs/block_cache.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/storage/ahci_provider.hpp"
 #include "drivers/storage/ide_provider.hpp"
@@ -31,6 +32,7 @@ void ensure_builtins_registered() {
     if (g_builtins_registered) {
         return;
     }
+    block_cache::init();
     register_ramdisk_block_device_provider();
     register_ahci_block_device_provider();
     register_sdhci_block_device_provider();
@@ -205,10 +207,16 @@ bool mount_requested_filesystems(const char* root_spec,
             continue;
         }
 
+        BlockDevice cached_device{};
+        const BlockDevice* probe_device = &device;
+        if (block_cache::wrap_device(device, cached_device)) {
+            probe_device = &cached_device;
+        }
+
         bool handled = false;
         for (size_t driver_index = 0;
              driver_index < g_filesystem_driver_count; ++driver_index) {
-            if (g_filesystem_drivers[driver_index](device)) {
+            if (g_filesystem_drivers[driver_index](*probe_device)) {
                 handled = true;
                 ++mounted;
                 if (is_root) {
@@ -264,9 +272,15 @@ bool mount_block_device(const BlockDevice& device, const char* mount_name) {
     BlockDevice mount_device = device;
     mount_device.name = stable_name;
 
+    BlockDevice cached_device{};
+    const BlockDevice* probe_device = &mount_device;
+    if (block_cache::wrap_device(mount_device, cached_device)) {
+        probe_device = &cached_device;
+    }
+
     for (size_t driver_index = 0;
          driver_index < g_filesystem_driver_count; ++driver_index) {
-        if (g_filesystem_drivers[driver_index](mount_device)) {
+        if (g_filesystem_drivers[driver_index](*probe_device)) {
             return true;
         }
     }

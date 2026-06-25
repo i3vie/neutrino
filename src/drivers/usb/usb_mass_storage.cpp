@@ -39,6 +39,7 @@ constexpr size_t kMaxDevices = 8;
 constexpr size_t kNameLen = 16;
 constexpr size_t kInquiryLen = 36;
 constexpr size_t kSenseLen = 18;
+constexpr size_t kIoBounceSize = 4096;
 
 struct [[gnu::packed]] CommandBlockWrapper {
     uint32_t signature;
@@ -68,6 +69,10 @@ struct DeviceState {
     uint32_t next_tag;
     bool last_command_failed;
     volatile int lock;
+    // Keep xHCI DMA away from stack and filesystem buffers.  Some real xHCI
+    // controllers time out when handed virtual buffers with an unsuitable
+    // physical layout even though small, page-aligned discovery reads work.
+    alignas(4096) uint8_t io_bounce[kIoBounceSize];
 };
 
 DeviceState g_devices[kMaxDevices]{};
@@ -522,7 +527,8 @@ Status read_sectors(size_t device_index,
     }
     DeviceState& state = g_devices[device_index];
     if (!state.used || !state.identify.present ||
-        state.identify.sector_size == 0) {
+        state.identify.sector_size == 0 ||
+        state.identify.sector_size > kIoBounceSize) {
         return Status::NoDevice;
     }
     if (lba > 0xFFFFFFFFull ||
@@ -530,25 +536,44 @@ Status read_sectors(size_t device_index,
         return Status::IoError;
     }
 
-    uint8_t cdb[10]{};
-    cdb[0] = kScsiRead10;
-    store_be32(cdb + 2, static_cast<uint32_t>(lba));
-    cdb[7] = 0;
-    cdb[8] = sector_count;
-    uint32_t byte_count =
-        static_cast<uint32_t>(sector_count) * state.identify.sector_size;
-
     lock_device(state);
-    Status status = bot_command(state, cdb, 10, buffer, byte_count, true);
-    if (status != Status::Ok && state.last_command_failed) {
-        request_sense(state);
-    }
-    if (status != Status::Ok && bot_reset_recovery(state)) {
-        log_message(LogLevel::Info,
-                    "usb-storage %s: retrying READ(10) lba=%llu count=%u after BOT recovery",
-                    state.name, static_cast<unsigned long long>(lba),
-                    static_cast<unsigned int>(sector_count));
-        status = bot_command(state, cdb, 10, buffer, byte_count, true);
+    Status status = Status::Ok;
+    auto* out = static_cast<uint8_t*>(buffer);
+    uint8_t remaining = sector_count;
+    uint64_t current_lba = lba;
+    uint8_t max_chunk = static_cast<uint8_t>(
+        kIoBounceSize / state.identify.sector_size);
+    while (remaining != 0) {
+        uint8_t chunk = remaining < max_chunk ? remaining : max_chunk;
+        uint32_t byte_count =
+            static_cast<uint32_t>(chunk) * state.identify.sector_size;
+        uint8_t cdb[10]{};
+        cdb[0] = kScsiRead10;
+        store_be32(cdb + 2, static_cast<uint32_t>(current_lba));
+        cdb[7] = 0;
+        cdb[8] = chunk;
+
+        status = bot_command(state, cdb, 10, state.io_bounce,
+                             byte_count, true);
+        if (status != Status::Ok && state.last_command_failed) {
+            request_sense(state);
+        }
+        if (status != Status::Ok && bot_reset_recovery(state)) {
+            log_message(LogLevel::Info,
+                        "usb-storage %s: retrying READ(10) lba=%llu count=%u after BOT recovery",
+                        state.name,
+                        static_cast<unsigned long long>(current_lba),
+                        static_cast<unsigned int>(chunk));
+            status = bot_command(state, cdb, 10, state.io_bounce,
+                                 byte_count, true);
+        }
+        if (status != Status::Ok) {
+            break;
+        }
+        memcpy(out, state.io_bounce, byte_count);
+        out += byte_count;
+        current_lba += chunk;
+        remaining = static_cast<uint8_t>(remaining - chunk);
     }
     unlock_device(state);
     return status;
@@ -564,7 +589,8 @@ Status write_sectors(size_t device_index,
     }
     DeviceState& state = g_devices[device_index];
     if (!state.used || !state.identify.present ||
-        state.identify.sector_size == 0) {
+        state.identify.sector_size == 0 ||
+        state.identify.sector_size > kIoBounceSize) {
         return Status::NoDevice;
     }
     if (lba > 0xFFFFFFFFull ||
@@ -572,35 +598,44 @@ Status write_sectors(size_t device_index,
         return Status::IoError;
     }
 
-    uint8_t cdb[10]{};
-    cdb[0] = kScsiWrite10;
-    store_be32(cdb + 2, static_cast<uint32_t>(lba));
-    cdb[7] = 0;
-    cdb[8] = sector_count;
-    uint32_t byte_count =
-        static_cast<uint32_t>(sector_count) * state.identify.sector_size;
-
     lock_device(state);
-    Status status = bot_command(state,
-                                cdb,
-                                10,
-                                const_cast<void*>(buffer),
-                                byte_count,
-                                false);
-    if (status != Status::Ok && state.last_command_failed) {
-        request_sense(state);
-    }
-    if (status != Status::Ok && bot_reset_recovery(state)) {
-        log_message(LogLevel::Info,
-                    "usb-storage %s: retrying WRITE(10) lba=%llu count=%u after BOT recovery",
-                    state.name, static_cast<unsigned long long>(lba),
-                    static_cast<unsigned int>(sector_count));
-        status = bot_command(state,
-                             cdb,
-                             10,
-                             const_cast<void*>(buffer),
-                             byte_count,
-                             false);
+    Status status = Status::Ok;
+    const auto* in = static_cast<const uint8_t*>(buffer);
+    uint8_t remaining = sector_count;
+    uint64_t current_lba = lba;
+    uint8_t max_chunk = static_cast<uint8_t>(
+        kIoBounceSize / state.identify.sector_size);
+    while (remaining != 0) {
+        uint8_t chunk = remaining < max_chunk ? remaining : max_chunk;
+        uint32_t byte_count =
+            static_cast<uint32_t>(chunk) * state.identify.sector_size;
+        memcpy(state.io_bounce, in, byte_count);
+
+        uint8_t cdb[10]{};
+        cdb[0] = kScsiWrite10;
+        store_be32(cdb + 2, static_cast<uint32_t>(current_lba));
+        cdb[7] = 0;
+        cdb[8] = chunk;
+        status = bot_command(state, cdb, 10, state.io_bounce,
+                             byte_count, false);
+        if (status != Status::Ok && state.last_command_failed) {
+            request_sense(state);
+        }
+        if (status != Status::Ok && bot_reset_recovery(state)) {
+            log_message(LogLevel::Info,
+                        "usb-storage %s: retrying WRITE(10) lba=%llu count=%u after BOT recovery",
+                        state.name,
+                        static_cast<unsigned long long>(current_lba),
+                        static_cast<unsigned int>(chunk));
+            status = bot_command(state, cdb, 10, state.io_bounce,
+                                 byte_count, false);
+        }
+        if (status != Status::Ok) {
+            break;
+        }
+        in += byte_count;
+        current_lba += chunk;
+        remaining = static_cast<uint8_t>(remaining - chunk);
     }
     unlock_device(state);
     return status;

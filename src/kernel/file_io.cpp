@@ -12,7 +12,9 @@
 
 namespace {
 
-constexpr size_t kFileIoBounceSize = 4096;
+// Match the largest filesystem cluster so sequential writes reach the VFS as
+// full-cluster operations instead of repeated partial-cluster updates.
+constexpr size_t kFileIoBounceSize = 32768;
 alignas(4096) uint8_t g_file_io_bounce[kFileIoBounceSize];
 volatile int g_file_io_bounce_lock = 0;
 

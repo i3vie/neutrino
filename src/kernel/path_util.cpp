@@ -160,13 +160,17 @@ bool build_absolute_path(const char* base,
                              segment_count)) {
         return false;
     }
-    if (floor_count == 1 && segment_count > 0) {
+    // "..." is the sysroot anchor, not the root of whichever mounted
+    // filesystem contains the current working directory.  In particular,
+    // commands must continue resolving through .../binary after cd'ing into
+    // a removable filesystem such as /USBMS_0_0.
+    const char* root_mount = vfs::root_mount_name();
+    if (root_mount != nullptr && root_mount[0] != '\0') {
+        mount_root_segment = Segment{root_mount, string_length(root_mount)};
+    } else if (floor_count == 1 && segment_count > 0) {
+        // Preserve the old mount-root behavior only during early boot before
+        // a system root has been selected.
         mount_root_segment = segments[0];
-    } else {
-        const char* root_mount = vfs::root_mount_name();
-        if (root_mount != nullptr && root_mount[0] != '\0') {
-            mount_root_segment = Segment{root_mount, string_length(root_mount)};
-        }
     }
 
     if (input == nullptr || input[0] == '\0') {

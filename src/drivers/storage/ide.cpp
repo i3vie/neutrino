@@ -113,16 +113,12 @@ bool wait_drq(IdeDeviceId device, uint32_t timeout = 100000) {
 
 void read_data(IdeDeviceId device, uint16_t* buffer, size_t words) {
     const auto& desc = device_desc(device);
-    for (size_t i = 0; i < words; ++i) {
-        buffer[i] = inw(desc.io_base + ATA_REG_DATA);
-    }
+    insw(desc.io_base + ATA_REG_DATA, buffer, words);
 }
 
 void write_data(IdeDeviceId device, const uint16_t* buffer, size_t words) {
     const auto& desc = device_desc(device);
-    for (size_t i = 0; i < words; ++i) {
-        outw(desc.io_base + ATA_REG_DATA, buffer[i]);
-    }
+    outsw(desc.io_base + ATA_REG_DATA, buffer, words);
 }
 
 void swap_bytes(char* dest, const uint16_t* src, size_t word_count) {
@@ -290,7 +286,6 @@ IdeStatus ide_read_sectors(IdeDeviceId device, uint32_t lba,
         }
 
         read_data(device, buffer_words + (sector * 256), 256);
-        io_wait();
     }
 
     return IdeStatus::Ok;
@@ -349,7 +344,6 @@ IdeStatus ide_write_sectors(IdeDeviceId device, uint32_t lba,
         }
 
         write_data(device, buffer_words + (sector * 256), 256);
-        io_wait();
     }
 
     if (!wait_not_busy(device)) {

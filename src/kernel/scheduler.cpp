@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "drivers/fs/block_cache.hpp"
 #include "drivers/log/logging.hpp"
 #include "lib/mem.hpp"
 #include "arch/x86_64/gdt.hpp"
@@ -360,6 +361,7 @@ void enqueue(process::Process* proc) {
         }
         if (next == nullptr) {
             process::set_current(nullptr);
+            fs::block_cache::service_idle_flush();
             asm volatile("pause");
             asm volatile("sti; hlt");
             continue;
@@ -478,6 +480,7 @@ void reschedule(syscall::SyscallFrame& frame) {
         cpu::write_fs_base(0);
 
         do {
+            fs::block_cache::service_idle_flush();
             asm volatile("sti; hlt");
             QueueGuard guard;
             next = pop_locked();

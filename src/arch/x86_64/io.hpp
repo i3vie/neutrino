@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 static inline void io_wait() {
@@ -23,6 +24,22 @@ static inline uint16_t inw(uint16_t port) {
     uint16_t value;
     asm volatile("inw %1, %0" : "=a"(value) : "Nd"(port));
     return value;
+}
+
+static inline void insw(uint16_t port, void* buffer, size_t word_count) {
+    auto* destination = static_cast<uint16_t*>(buffer);
+    asm volatile("cld; rep insw"
+                 : "+D"(destination), "+c"(word_count)
+                 : "d"(port)
+                 : "memory");
+}
+
+static inline void outsw(uint16_t port, const void* buffer, size_t word_count) {
+    const auto* source = static_cast<const uint16_t*>(buffer);
+    asm volatile("cld; rep outsw"
+                 : "+S"(source), "+c"(word_count)
+                 : "d"(port)
+                 : "memory");
 }
 
 static inline void outl(uint16_t port, uint32_t value) {

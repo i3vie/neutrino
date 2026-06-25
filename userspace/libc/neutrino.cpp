@@ -61,12 +61,50 @@ extern "C" bool neutrino_parse_two_args(const char* args,
 }
 
 extern "C" bool neutrino_copy_file(const char* source, const char* dest) {
+    if (source == nullptr || dest == nullptr || source[0] == '\0' ||
+        dest[0] == '\0' || strcmp(source, dest) == 0) {
+        return false;
+    }
+
+    char destination[256];
+    strlcpy(destination, dest, sizeof(destination));
+    long dest_dir = directory_open(dest);
+    if (dest_dir >= 0) {
+        directory_close(static_cast<uint32_t>(dest_dir));
+        const char* basename = source + strlen(source);
+        while (basename > source && basename[-1] == '/') --basename;
+        const char* end = basename;
+        while (basename > source && basename[-1] != '/') --basename;
+        size_t dir_len = strlen(destination);
+        size_t name_len = static_cast<size_t>(end - basename);
+        bool separator = dir_len != 0 && destination[dir_len - 1] != '/';
+        if (name_len == 0 || dir_len + (separator ? 1 : 0) + name_len + 1 >
+                                 sizeof(destination)) {
+            return false;
+        }
+        if (separator) destination[dir_len++] = '/';
+        memcpy(destination + dir_len, basename, name_len);
+        destination[dir_len + name_len] = '\0';
+    }
+    if (strcmp(source, destination) == 0) return false;
+
     long in = file_open(source);
     if (in < 0) {
         return false;
     }
 
-    long out = file_create(dest);
+    // Creation is exclusive on both FAT32 and Neufs.  Replace an existing
+    // regular destination to provide the usual cp overwrite behavior.
+    long existing = file_open(destination);
+    if (existing >= 0) {
+        file_close(static_cast<uint32_t>(existing));
+        if (file_remove(destination) < 0) {
+            file_close(static_cast<uint32_t>(in));
+            return false;
+        }
+    }
+
+    long out = file_create(destination);
     if (out < 0) {
         file_close(static_cast<uint32_t>(in));
         return false;
@@ -105,7 +143,7 @@ extern "C" bool neutrino_copy_file(const char* source, const char* dest) {
     file_close(static_cast<uint32_t>(in));
     file_close(static_cast<uint32_t>(out));
     if (!ok) {
-        file_remove(dest);
+        file_remove(destination);
     }
     return ok;
 }
