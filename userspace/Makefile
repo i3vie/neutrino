@@ -41,6 +41,9 @@ BEARSSL_LIB := $(OBJ_DIR)/libbearssl.a
 # Opt programs into BearSSL with:
 # PROGRAM_LIBS_<program> += $(BEARSSL_LIB)
 PROGRAM_LIBS_browse += $(BEARSSL_LIB)
+PROGRAM_LIBS_download += $(BEARSSL_LIB)
+PROGRAM_LIBS_netget += $(BEARSSL_LIB)
+PROGRAM_DEPS_font += ../shared/include/TOSH-SAT.F14
 
 HDD_IMAGE ?= ../hdd.img
 MOUNT_DIR ?= $(HOME)/MountedImage
@@ -86,7 +89,7 @@ bearssl: $(BEARSSL_LIB)
 
 INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all
 
-$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_LIBS_$$*) | $(OUT_DIR)
+$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_DEPS_$$*) $$(PROGRAM_LIBS_$$*) | $(OUT_DIR)
 	@mkdir -p $(OUT_DIR) $(BIN_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $< $(PROGRAM_LIBS_$*) -o $@
 	@cp $@ $(BIN_DIR)/$*.elf
