@@ -4,6 +4,8 @@ out/
 build/
 userspace/programs/**/**.elf
 userspace/binary/
+userspace/lib/
+userspace/library/
 userspace/deps/
 *.debug.elf
 *.codex

@@ -18,6 +18,7 @@ OBJ_DIR  := build
 SRC_PROG_DIR := programs
 OUT_DIR  := out
 BIN_DIR  := binary
+LIB_DIR  := library
 
 # Every standalone source in programs/ is built and installed into /binary.
 # Adding a new command therefore only requires programs/<name>.cpp.
@@ -28,16 +29,26 @@ ASFLAGS  := -f elf64
 PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
                     -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
                     -fPIE -pie -Wall -Wextra -I. -I$(CRT_DIR) -I$(LIBC_DIR)/include -I../shared/include -I$(BEARSSL_DIR)/inc
+PROGRAM_LDFLAGS := -Wl,--no-dynamic-linker
+SHARED_CXXFLAGS := $(filter-out -fPIE -pie,$(PROGRAM_CXXFLAGS)) -fPIC
 PROGRAM_CFLAGS := -std=c99 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
                   -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
                   -fPIE -Wall -Wextra -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src \
                   -DBR_RDRAND=0 -DBR_USE_GETENTROPY=0 -DBR_USE_URANDOM=0 \
                   -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0 \
                   -DBR_AES_X86NI=0 -DBR_SSE2=0 -DBR_POWER8=0
+SHARED_CFLAGS := $(filter-out -fPIE,$(PROGRAM_CFLAGS)) -fPIC
+SHARED_LDFLAGS := -shared -nostdlib
 
 BEARSSL_SOURCES := $(shell cd $(BEARSSL_DIR)/src && find . -type f -name '*.c' | sed 's#^\./##' | sort)
 BEARSSL_OBJECTS := $(addprefix $(OBJ_DIR)/bearssl/,$(BEARSSL_SOURCES:.c=.o))
+BEARSSL_SHARED_OBJECTS := $(addprefix $(OBJ_DIR)/bearssl-pic/,$(BEARSSL_SOURCES:.c=.o))
 BEARSSL_LIB := $(OBJ_DIR)/libbearssl.a
+SHARED_LIBC_OBJECTS := $(OBJ_DIR)/shared/libc_string.o
+BEARSSL_SO := $(OUT_DIR)/libbearssl.so.0
+BEARSSL_SO_LINK := $(OUT_DIR)/libbearssl.so
+BEARSSL_STAGED_SO := $(LIB_DIR)/libbearssl.so.0
+BEARSSL_STAGED_SO_LINK := $(LIB_DIR)/libbearssl.so
 
 # Opt programs into BearSSL with:
 # PROGRAM_LIBS_<program> += $(BEARSSL_LIB)
@@ -62,7 +73,7 @@ MOUNT_GID ?= $(shell id -g)
 MOUNT_OPTS ?= loop,rw,uid=$(MOUNT_UID),gid=$(MOUNT_GID),umask=022
 RESET_USERS ?= 0
 
-.PHONY: all bearssl clean install install-reset-users install-mount install-mtools
+.PHONY: all bearssl bearssl-shared clean install install-reset-users install-mount install-mtools
 .SECONDEXPANSION:
 
 ifneq ($(filter clean,$(MAKECMDGOALS)),)
@@ -82,6 +93,10 @@ $(OBJ_DIR)/crt0.o: $(CRT_DIR)/crt0.s $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 $(OBJ_DIR)/libc_string.o: $(LIBC_DIR)/string.cpp $(LIBC_DIR)/include/string.h | $(OBJ_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
 
+$(OBJ_DIR)/shared/libc_string.o: $(LIBC_DIR)/string.cpp $(LIBC_DIR)/include/string.h | $(OBJ_DIR)
+	@mkdir -p $(dir $@)
+	$(CXX) $(SHARED_CXXFLAGS) -c $< -o $@
+
 $(OBJ_DIR)/libc_ctype.o: $(LIBC_DIR)/ctype.cpp $(LIBC_DIR)/include/ctype.h | $(OBJ_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
 
@@ -95,17 +110,36 @@ $(OBJ_DIR)/bearssl/%.o: $(BEARSSL_DIR)/src/%.c $(BEARSSL_DIR)/inc/bearssl.h | $(
 	@mkdir -p $(dir $@)
 	$(CC) $(PROGRAM_CFLAGS) -c $< -o $@
 
+$(OBJ_DIR)/bearssl-pic/%.o: $(BEARSSL_DIR)/src/%.c $(BEARSSL_DIR)/inc/bearssl.h | $(OBJ_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(SHARED_CFLAGS) -c $< -o $@
+
 $(BEARSSL_LIB): $(BEARSSL_DIR)/inc/bearssl.h $(BEARSSL_OBJECTS) | $(OBJ_DIR)
 	$(AR) rcs $@ $(BEARSSL_OBJECTS)
 
-bearssl: $(BEARSSL_LIB)
+$(BEARSSL_SO): $(BEARSSL_DIR)/inc/bearssl.h $(BEARSSL_SHARED_OBJECTS) $(SHARED_LIBC_OBJECTS) | $(OUT_DIR)
+	$(CC) $(SHARED_LDFLAGS) -Wl,-soname,libbearssl.so.0 $(BEARSSL_SHARED_OBJECTS) $(SHARED_LIBC_OBJECTS) -o $@
 
-INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all
+$(BEARSSL_SO_LINK): $(BEARSSL_SO)
+	@cp $(BEARSSL_SO) $@
+
+$(BEARSSL_STAGED_SO): $(BEARSSL_SO)
+	@mkdir -p $(LIB_DIR)
+	@cp $(BEARSSL_SO) $@
+
+$(BEARSSL_STAGED_SO_LINK): $(BEARSSL_SO)
+	@mkdir -p $(LIB_DIR)
+	@cp $(BEARSSL_SO) $@
+
+bearssl: $(BEARSSL_LIB)
+bearssl-shared: $(BEARSSL_SO) $(BEARSSL_SO_LINK) $(BEARSSL_STAGED_SO) $(BEARSSL_STAGED_SO_LINK)
+
+INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all bearssl-shared
 program_helper_objects = $(addprefix $(OBJ_DIR)/helper_,$(addsuffix .o,$(PROGRAM_HELPERS_$(1))))
 
 $(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_DEPS_$$*) $$(PROGRAM_LIBS_$$*) $$(call program_helper_objects,$$*) | $(OUT_DIR)
 	@mkdir -p $(OUT_DIR) $(BIN_DIR)
-	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(call program_helper_objects,$*) $< $(PROGRAM_LIBS_$*) -o $@
+	$(CXX) $(PROGRAM_CXXFLAGS) $(PROGRAM_LDFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(call program_helper_objects,$*) $< $(PROGRAM_LIBS_$*) -o $@
 	@cp $@ $(BIN_DIR)/$*.elf
 
 install: $(INSTALL_PREREQS)
@@ -118,6 +152,8 @@ install: $(INSTALL_PREREQS)
 	mounted=1; \
 	$(SUDO) rm -rf "$(MOUNT_DIR)/binary"; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/binary"; \
+	$(SUDO) rm -rf "$(MOUNT_DIR)/library"; \
+	$(SUDO) mkdir -p "$(MOUNT_DIR)/library"; \
 	$(SUDO) rm -rf "$(MOUNT_DIR)/config"; \
 	$(SUDO) mkdir -p "$(MOUNT_DIR)/config"; \
 	if [[ "$(RESET_USERS)" == "1" ]]; then \
@@ -126,6 +162,13 @@ install: $(INSTALL_PREREQS)
 	for prog in $(PROGRAMS); do \
 		$(SUDO) install -m 0644 "$(OUT_DIR)/$$prog.elf" "$(MOUNT_DIR)/binary/$$prog.elf"; \
 	done; \
+	if [[ -d "$(LIB_DIR)" ]]; then \
+		for lib in "$(LIB_DIR)"/*; do \
+			if [[ -f "$$lib" ]]; then \
+				$(SUDO) install -m 0644 "$$lib" "$(MOUNT_DIR)/library/$$(basename "$$lib")"; \
+			fi; \
+		done; \
+	fi; \
 	if [[ -d "config" ]]; then \
 		$(SUDO) cp -a "config/." "$(MOUNT_DIR)/config/"; \
 	fi; \
@@ -144,4 +187,4 @@ $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
 clean:
-	rm -rf $(OBJ_DIR) $(OUT_DIR) $(BIN_DIR)
+	rm -rf $(OBJ_DIR) $(OUT_DIR) $(BIN_DIR) $(LIB_DIR)

@@ -26,4 +26,17 @@ Once present, you can build the archive with:
 make -C userspace bearssl
 ```
 
+You can also build a packageable shared object with:
+
+```sh
+make -C userspace bearssl-shared
+```
+
+That produces `userspace/out/libbearssl.so.0` and stages `libbearssl.so.0`
+plus the linker-name copy `libbearssl.so` under `userspace/library`. The
+userspace install target copies staged shared libraries into `/library` on
+the target filesystem, adjacent to `/binary` for package payloads and runtime
+lookup. Current programs still link BearSSL statically until Neutrino grows
+the runtime loader path for `DT_NEEDED` dependencies.
+
 The userspace build is configured such that individual programs can optionally link against that .a, but BearSSL is probably not required for normal kernel or userspace builds unless a program explicitly depends on it.
