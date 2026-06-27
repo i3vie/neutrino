@@ -10,6 +10,11 @@ namespace {
 constexpr size_t kMaxCpuEntries = 16;
 constexpr size_t kMaxTaskEntries = 256;
 constexpr size_t kMaxVisibleTasks = 12;
+constexpr size_t kMaxRenderRows = 64;
+constexpr uint64_t kExpectedTicksPerSecond = 100;
+constexpr uint64_t kRefreshSeconds = 5;
+constexpr uint32_t kDefaultCols = 80;
+constexpr uint32_t kDefaultRows = 25;
 constexpr uint32_t kTaskStateUnused = 0;
 constexpr uint32_t kTaskStateReady = 1;
 constexpr uint32_t kTaskStateRunning = 2;
@@ -27,6 +32,8 @@ descriptor_defs::TaskUsage g_previous_tasks[kMaxTaskEntries]{};
 descriptor_defs::TaskUsage g_current_tasks[kMaxTaskEntries]{};
 TaskDelta g_deltas[kMaxTaskEntries]{};
 char g_render_buffer[8192]{};
+uint32_t g_previous_line_widths[kMaxRenderRows]{};
+uint32_t g_current_line_widths[kMaxRenderRows]{};
 
 void append_char(char* buffer, size_t capacity, size_t& length, char ch) {
     if (length + 1 >= capacity) {
@@ -176,6 +183,42 @@ bool clear_screen(long console) {
     return false;
 }
 
+bool set_cursor(long console, uint32_t x, uint32_t y) {
+    descriptor_defs::CursorPosition pos{x, y};
+    return descriptor_set_property(
+               static_cast<uint32_t>(console),
+               static_cast<uint32_t>(descriptor_defs::Property::ConsoleCursor),
+               &pos,
+               sizeof(pos)) == 0;
+}
+
+void defer_console_updates(long console, bool deferred) {
+    uint8_t value = deferred ? 1 : 0;
+    descriptor_set_property(
+        static_cast<uint32_t>(console),
+        static_cast<uint32_t>(descriptor_defs::Property::ConsoleUpdate),
+        &value,
+        sizeof(value));
+}
+
+void console_dimensions(long console, uint32_t& cols, uint32_t& rows) {
+    cols = kDefaultCols;
+    rows = kDefaultRows;
+    descriptor_defs::VtyInfo info{};
+    if (descriptor_get_property(
+            static_cast<uint32_t>(console),
+            static_cast<uint32_t>(descriptor_defs::Property::VtyInfo),
+            &info,
+            sizeof(info)) == 0) {
+        if (info.cols != 0) {
+            cols = info.cols;
+        }
+        if (info.rows != 0) {
+            rows = info.rows;
+        }
+    }
+}
+
 size_t read_cpu_stats(uint32_t handle,
                       descriptor_defs::CpuUsage* out,
                       size_t capacity) {
@@ -200,6 +243,20 @@ size_t read_task_stats(uint32_t handle,
         return 0;
     }
     return static_cast<size_t>(result) / sizeof(descriptor_defs::TaskUsage);
+}
+
+uint64_t delta_u64(uint64_t current, uint64_t previous) {
+    return current >= previous ? current - previous : current;
+}
+
+uint64_t cpu_usage_total(const descriptor_defs::CpuUsage& usage) {
+    return usage.user_ticks + usage.kernel_ticks + usage.idle_ticks +
+           usage.irq_ticks;
+}
+
+uint64_t cpu_usage_delta(const descriptor_defs::CpuUsage& current,
+                         const descriptor_defs::CpuUsage& previous) {
+    return delta_u64(cpu_usage_total(current), cpu_usage_total(previous));
 }
 
 const descriptor_defs::TaskUsage* find_previous_task(
@@ -261,52 +318,86 @@ uint64_t total_cpu_delta(const descriptor_defs::CpuUsage* current,
                          size_t count) {
     uint64_t total = 0;
     for (size_t i = 0; i < count; ++i) {
-        uint64_t current_total = current[i].user_ticks + current[i].kernel_ticks +
-                                 current[i].idle_ticks + current[i].irq_ticks;
-        uint64_t previous_total = previous[i].user_ticks + previous[i].kernel_ticks +
-                                  previous[i].idle_ticks + previous[i].irq_ticks;
-        total += current_total >= previous_total ? current_total - previous_total
-                                                 : current_total;
+        total += cpu_usage_delta(current[i], previous[i]);
     }
     return total;
 }
 
-void wait_for_next_second() {
-    NeutrinoWallTime now{};
-    NeutrinoWallTime later{};
-    if (!neutrino_get_time(&now)) {
-        sleep_seconds(1);
-        return;
+uint64_t display_cpu_total(uint64_t sampled_total) {
+    uint64_t expected = kExpectedTicksPerSecond * kRefreshSeconds;
+    return sampled_total < expected ? expected : sampled_total;
+}
+
+uint64_t display_interval_total(uint64_t sampled_total, size_t cpu_count) {
+    uint64_t expected = kExpectedTicksPerSecond * kRefreshSeconds *
+                        static_cast<uint64_t>(cpu_count == 0 ? 1 : cpu_count);
+    return sampled_total < expected ? expected : sampled_total;
+}
+
+void wait_for_next_sample() {
+    sleep_seconds(kRefreshSeconds);
+}
+
+void finish_line(char* buffer,
+                 size_t capacity,
+                 size_t& length,
+                 size_t line_start,
+                 uint32_t cols,
+                 uint32_t row) {
+    size_t used = length >= line_start ? length - line_start : 0;
+    uint32_t max_width = cols > 1 ? cols - 1 : 1;
+    if (used > max_width) {
+        length = line_start + max_width;
+        buffer[length] = '\0';
+        used = max_width;
     }
-    for (;;) {
-        sleep_ms(1);
-        if (!neutrino_get_time(&later)) {
-            return;
-        }
-        if (later.unix_seconds != now.unix_seconds) {
-            return;
-        }
+    uint32_t previous_width =
+        row < kMaxRenderRows ? g_previous_line_widths[row] : 0;
+    uint32_t target = static_cast<uint32_t>(used);
+    if (target < previous_width) {
+        target = previous_width;
     }
+    if (target > max_width) {
+        target = max_width;
+    }
+    while (used < target) {
+        append_char(buffer, capacity, length, ' ');
+        ++used;
+    }
+    if (row < kMaxRenderRows) {
+        g_current_line_widths[row] = static_cast<uint32_t>(length - line_start);
+    }
+    append_text(buffer, capacity, length, "\n");
+}
+
+void append_line(char* buffer,
+                 size_t capacity,
+                 size_t& length,
+                 const char* text,
+                 uint32_t cols,
+                 uint32_t row) {
+    size_t line_start = length;
+    append_text(buffer, capacity, length, text);
+    finish_line(buffer, capacity, length, line_start, cols, row);
 }
 
 void append_cpu_line(char* buffer,
                      size_t capacity,
                      size_t& length,
                      const descriptor_defs::CpuUsage& current,
-                     const descriptor_defs::CpuUsage& previous) {
-    uint64_t user = current.user_ticks >= previous.user_ticks
-                        ? current.user_ticks - previous.user_ticks
-                        : current.user_ticks;
-    uint64_t kernel = current.kernel_ticks >= previous.kernel_ticks
-                          ? current.kernel_ticks - previous.kernel_ticks
-                          : current.kernel_ticks;
-    uint64_t idle = current.idle_ticks >= previous.idle_ticks
-                        ? current.idle_ticks - previous.idle_ticks
-                        : current.idle_ticks;
-    uint64_t irq = current.irq_ticks >= previous.irq_ticks
-                       ? current.irq_ticks - previous.irq_ticks
-                       : current.irq_ticks;
-    uint64_t total = user + kernel + idle + irq;
+                     const descriptor_defs::CpuUsage& previous,
+                     uint32_t cols,
+                     uint32_t row) {
+    size_t line_start = length;
+    uint64_t user = delta_u64(current.user_ticks, previous.user_ticks);
+    uint64_t kernel = delta_u64(current.kernel_ticks, previous.kernel_ticks);
+    uint64_t idle = delta_u64(current.idle_ticks, previous.idle_ticks);
+    uint64_t irq = delta_u64(current.irq_ticks, previous.irq_ticks);
+    uint64_t sampled_total = user + kernel + idle + irq;
+    uint64_t total = display_cpu_total(sampled_total);
+    if (sampled_total < total) {
+        idle += total - sampled_total;
+    }
 
     append_text(buffer, capacity, length, "cpu");
     append_u64(buffer, capacity, length, current.cpu_index);
@@ -318,7 +409,8 @@ void append_cpu_line(char* buffer,
     append_percent_tenths_padded(buffer, capacity, length, idle, total, 5);
     append_text(buffer, capacity, length, "%  irq ");
     append_percent_tenths_padded(buffer, capacity, length, irq, total, 5);
-    append_text(buffer, capacity, length, "%\n");
+    append_text(buffer, capacity, length, "%");
+    finish_line(buffer, capacity, length, line_start, cols, row);
 }
 
 void append_task_table(char* buffer,
@@ -326,13 +418,18 @@ void append_task_table(char* buffer,
                        size_t& length,
                        TaskDelta* deltas,
                        size_t count,
-                       uint64_t interval_total) {
-    append_text(buffer, capacity, length, "\n");
-    append_text(buffer, capacity, length, "       pid   cpu%  state  kind    image\n");
-    append_text(buffer, capacity, length, "------------------------------------------------------------\n");
+                       uint64_t interval_total,
+                       uint32_t cols,
+                       size_t visible_limit,
+                       uint32_t first_row) {
+    append_line(buffer, capacity, length, "", cols, first_row);
+    append_line(buffer, capacity, length, "       pid   cpu%  state  kind    image", cols, first_row + 1);
+    append_line(buffer, capacity, length, "------------------------------------------------------------", cols, first_row + 2);
 
-    size_t visible = count < kMaxVisibleTasks ? count : kMaxVisibleTasks;
+    size_t visible = count < visible_limit ? count : visible_limit;
     for (size_t i = 0; i < visible; ++i) {
+        uint32_t row = first_row + 3 + static_cast<uint32_t>(i);
+        size_t line_start = length;
         append_padded_u64(buffer, capacity, length, deltas[i].snapshot.pid, 10);
         append_text(buffer, capacity, length, "  ");
         append_percent_tenths_padded(buffer,
@@ -358,7 +455,7 @@ void append_task_table(char* buffer,
                            6);
         append_text(buffer, capacity, length, "  ");
         append_text(buffer, capacity, length, deltas[i].snapshot.image_path);
-        append_text(buffer, capacity, length, "\n");
+        finish_line(buffer, capacity, length, line_start, cols, row);
     }
 }
 
@@ -387,12 +484,21 @@ extern "C" int main(uint64_t, uint64_t) {
         read_cpu_stats(static_cast<uint32_t>(cpu_desc), g_previous_cpus, kMaxCpuEntries);
     size_t previous_task_count =
         read_task_stats(static_cast<uint32_t>(task_desc), g_previous_tasks, kMaxTaskEntries);
+    uint32_t previous_render_rows = 0;
+    bool first_render = true;
+    clear_screen(console);
 
     for (;;) {
-        wait_for_next_second();
+        if (!first_render) {
+            wait_for_next_sample();
+        }
 
         size_t current_cpu_count =
             read_cpu_stats(static_cast<uint32_t>(cpu_desc), g_current_cpus, kMaxCpuEntries);
+        size_t cpu_count = current_cpu_count < previous_cpu_count
+                               ? current_cpu_count
+                               : previous_cpu_count;
+
         size_t current_task_count =
             read_task_stats(static_cast<uint32_t>(task_desc), g_current_tasks, kMaxTaskEntries);
         size_t delta_count = build_task_deltas(g_deltas,
@@ -406,36 +512,75 @@ extern "C" int main(uint64_t, uint64_t) {
         char* buffer = g_render_buffer;
         size_t length = 0;
         buffer[0] = '\0';
+        memset(g_current_line_widths, 0, sizeof(g_current_line_widths));
 
-        clear_screen(console);
-        append_text(buffer, sizeof(g_render_buffer), length, "neutrino top\n");
-        append_text(buffer, sizeof(g_render_buffer), length, "\n");
+        uint32_t cols = kDefaultCols;
+        uint32_t rows = kDefaultRows;
+        console_dimensions(console, cols, rows);
 
-        size_t cpu_count = current_cpu_count < previous_cpu_count
-                               ? current_cpu_count
-                               : previous_cpu_count;
+        uint32_t render_rows = 0;
+        append_line(buffer, sizeof(g_render_buffer), length, "neutrino top", cols, render_rows);
+        ++render_rows;
+        append_line(buffer, sizeof(g_render_buffer), length, "", cols, render_rows);
+        ++render_rows;
+
         for (size_t i = 0; i < cpu_count; ++i) {
             append_cpu_line(buffer,
                             sizeof(g_render_buffer),
                             length,
                             g_current_cpus[i],
-                            g_previous_cpus[i]);
+                            g_previous_cpus[i],
+                            cols,
+                            render_rows);
+            ++render_rows;
         }
 
         uint64_t interval_total =
             total_cpu_delta(g_current_cpus, g_previous_cpus, cpu_count);
+        uint64_t displayed_interval_total =
+            display_interval_total(interval_total, cpu_count);
+        size_t fixed_rows = render_rows + 3;
+        size_t visible_tasks = kMaxVisibleTasks;
+        if (rows > fixed_rows) {
+            size_t available = rows - fixed_rows;
+            if (visible_tasks > available) {
+                visible_tasks = available;
+            }
+        } else {
+            visible_tasks = 0;
+        }
         append_task_table(buffer,
                           sizeof(g_render_buffer),
                           length,
                           g_deltas,
                           delta_count,
-                          interval_total == 0 ? 1 : interval_total);
+                          displayed_interval_total == 0 ? 1 : displayed_interval_total,
+                          cols,
+                          visible_tasks,
+                          render_rows);
+        render_rows += 3 + static_cast<uint32_t>(
+                                delta_count < visible_tasks ? delta_count
+                                                            : visible_tasks);
 
+        while (render_rows < previous_render_rows && render_rows < rows) {
+            append_line(buffer, sizeof(g_render_buffer), length, "", cols, render_rows);
+            ++render_rows;
+        }
+
+        defer_console_updates(console, true);
+        set_cursor(console, 0, 0);
         neutrino_write(console, buffer);
+        set_cursor(console, 0, 0);
+        defer_console_updates(console, false);
 
         memcpy(g_previous_cpus, g_current_cpus, sizeof(g_previous_cpus));
         memcpy(g_previous_tasks, g_current_tasks, sizeof(g_previous_tasks));
         previous_cpu_count = current_cpu_count;
         previous_task_count = current_task_count;
+        previous_render_rows = render_rows;
+        memcpy(g_previous_line_widths,
+               g_current_line_widths,
+               sizeof(g_previous_line_widths));
+        first_render = false;
     }
 }
