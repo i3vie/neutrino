@@ -4,6 +4,8 @@
 
 #include "descriptors.hpp"
 #include "../crt/syscall.hpp"
+#include "../helpers/args.hpp"
+#include "../helpers/console.hpp"
 
 namespace {
 
@@ -35,33 +37,6 @@ struct Args {
     bool wipe;
 };
 
-void print(long console, const char* text) {
-    if (console < 0 || text == nullptr) {
-        return;
-    }
-    descriptor_write(static_cast<uint32_t>(console), text, strlen(text));
-}
-
-void print_line(long console, const char* text) {
-    print(console, text);
-    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-}
-
-void print_u64(long console, uint64_t value) {
-    char buffer[32];
-    size_t pos = sizeof(buffer);
-    buffer[--pos] = '\0';
-    if (value == 0) {
-        buffer[--pos] = '0';
-    } else {
-        while (value != 0 && pos > 0) {
-            buffer[--pos] = static_cast<char>('0' + (value % 10));
-            value /= 10;
-        }
-    }
-    print(console, &buffer[pos]);
-}
-
 void print_hex8(long console, uint8_t value) {
     const char* digits = "0123456789abcdef";
     char buffer[5];
@@ -70,39 +45,7 @@ void print_hex8(long console, uint8_t value) {
     buffer[2] = digits[(value >> 4) & 0x0F];
     buffer[3] = digits[value & 0x0F];
     buffer[4] = '\0';
-    print(console, buffer);
-}
-
-const char* skip_spaces(const char* text) {
-    while (text != nullptr && (*text == ' ' || *text == '\t' ||
-                               *text == '\n' || *text == '\r')) {
-        ++text;
-    }
-    return text;
-}
-
-bool copy_token(const char*& cursor, char* out, size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-    cursor = skip_spaces(cursor);
-    if (cursor == nullptr || *cursor == '\0') {
-        return false;
-    }
-
-    size_t len = 0;
-    while (cursor[len] != '\0' && cursor[len] != ' ' &&
-           cursor[len] != '\t' && cursor[len] != '\n' &&
-           cursor[len] != '\r') {
-        if (len + 1 >= out_size) {
-            return false;
-        }
-        out[len] = cursor[len];
-        ++len;
-    }
-    out[len] = '\0';
-    cursor += len;
-    return true;
+    userspace::write(console, buffer);
 }
 
 bool strings_equal(const char* a, const char* b) {
@@ -133,7 +76,7 @@ uint8_t hex_value(char c) {
 }
 
 bool parse_u64(const char* text, uint64_t& out) {
-    text = skip_spaces(text);
+    text = userspace::skip_spaces(text);
     if (text == nullptr || *text == '\0') {
         return false;
     }
@@ -163,7 +106,7 @@ bool parse_u64(const char* text, uint64_t& out) {
 
 bool parse_value_option(const char*& cursor, uint64_t& out) {
     char token[32];
-    if (!copy_token(cursor, token, sizeof(token))) {
+    if (!userspace::copy_token(cursor, token, sizeof(token))) {
         return false;
     }
     return parse_u64(token, out);
@@ -180,7 +123,7 @@ bool parse_args(const char* raw, Args& out) {
     size_t positional_count = 0;
 
     char token[64];
-    while (copy_token(cursor, token, sizeof(token))) {
+    while (userspace::copy_token(cursor, token, sizeof(token))) {
         if (strings_equal(token, "--mbr")) {
             out.table = TableKind::Mbr;
         } else if (strings_equal(token, "--gpt")) {
@@ -386,13 +329,13 @@ bool prepare_overwrite(long console,
                        uint8_t* sector) {
     const char* reason = nullptr;
     if (existing_layout(handle, geom, sector, reason) && !args.wipe) {
-        print(console, "mkpart: refusing to overwrite ");
-        print_line(console, reason != nullptr ? reason : "existing data");
-        print_line(console, "mkpart: pass --wipe to replace partition metadata");
+        userspace::write(console, "mkpart: refusing to overwrite ");
+        userspace::write_line(console, reason != nullptr ? reason : "existing data");
+        userspace::write_line(console, "mkpart: pass --wipe to replace partition metadata");
         return false;
     }
     if (args.wipe && !wipe_partition_metadata(handle, geom, sector)) {
-        print_line(console, "mkpart: failed to wipe partition metadata");
+        userspace::write_line(console, "mkpart: failed to wipe partition metadata");
         return false;
     }
     return true;
@@ -410,14 +353,14 @@ bool partition_bounds(long console,
         start_lba = first_allowed;
     }
     if (last_allowed <= start_lba) {
-        print_line(console, "mkpart: disk too small for requested layout");
+        userspace::write_line(console, "mkpart: disk too small for requested layout");
         return false;
     }
 
     sector_count = args.has_count ? args.sector_count : last_allowed - start_lba + 1;
     if (sector_count == 0 || start_lba + sector_count - 1 > last_allowed ||
         start_lba + sector_count > geom.sector_count) {
-        print_line(console, "mkpart: partition does not fit");
+        userspace::write_line(console, "mkpart: partition does not fit");
         return false;
     }
     return true;
@@ -440,7 +383,7 @@ bool write_mbr(long console,
         return false;
     }
     if (start_lba > 0xFFFFFFFFull || sector_count > 0xFFFFFFFFull) {
-        print_line(console, "mkpart: partition does not fit in MBR limits");
+        userspace::write_line(console, "mkpart: partition does not fit in MBR limits");
         return false;
     }
 
@@ -462,19 +405,19 @@ bool write_mbr(long console,
                          sector,
                          static_cast<size_t>(geom.sector_size),
                          0) != static_cast<long>(geom.sector_size)) {
-        print_line(console, "mkpart: failed to write MBR");
+        userspace::write_line(console, "mkpart: failed to write MBR");
         return false;
     }
 
-    print(console, "mkpart: created MBR ");
-    print(console, args.device);
-    print(console, "_0 type=");
+    userspace::write(console, "mkpart: created MBR ");
+    userspace::write(console, args.device);
+    userspace::write(console, "_0 type=");
     print_hex8(console, args.mbr_type);
-    print(console, " start=");
-    print_u64(console, start_lba);
-    print(console, " sectors=");
-    print_u64(console, sector_count);
-    print_line(console, "");
+    userspace::write(console, " start=");
+    userspace::write_u64(console, start_lba);
+    userspace::write(console, " sectors=");
+    userspace::write_u64(console, sector_count);
+    userspace::write_line(console, "");
     return true;
 }
 
@@ -576,14 +519,14 @@ bool write_gpt(long console,
                          sector,
                          static_cast<size_t>(geom.sector_size),
                          0) != static_cast<long>(geom.sector_size)) {
-        print_line(console, "mkpart: failed to write protective MBR");
+        userspace::write_line(console, "mkpart: failed to write protective MBR");
         return false;
     }
 
     uint8_t* entries = static_cast<uint8_t*>(
         map_anonymous(static_cast<size_t>(entries_bytes), MAP_WRITE));
     if (entries == nullptr) {
-        print_line(console, "mkpart: allocation failed");
+        userspace::write_line(console, "mkpart: allocation failed");
         return false;
     }
     memset(entries, 0, static_cast<size_t>(entries_bytes));
@@ -601,7 +544,7 @@ bool write_gpt(long console,
                          backup_entries_lba * geom.sector_size) !=
         static_cast<long>(entries_bytes)) {
         unmap(entries, static_cast<size_t>(entries_bytes));
-        print_line(console, "mkpart: failed to write GPT entries");
+        userspace::write_line(console, "mkpart: failed to write GPT entries");
         return false;
     }
     unmap(entries, static_cast<size_t>(entries_bytes));
@@ -621,7 +564,7 @@ bool write_gpt(long console,
                          sector,
                          static_cast<size_t>(geom.sector_size),
                          geom.sector_size) != static_cast<long>(geom.sector_size)) {
-        print_line(console, "mkpart: failed to write primary GPT header");
+        userspace::write_line(console, "mkpart: failed to write primary GPT header");
         return false;
     }
 
@@ -638,17 +581,17 @@ bool write_gpt(long console,
                          static_cast<size_t>(geom.sector_size),
                          backup_header_lba * geom.sector_size) !=
         static_cast<long>(geom.sector_size)) {
-        print_line(console, "mkpart: failed to write backup GPT header");
+        userspace::write_line(console, "mkpart: failed to write backup GPT header");
         return false;
     }
 
-    print(console, "mkpart: created GPT ");
-    print(console, args.device);
-    print(console, "_0 start=");
-    print_u64(console, start_lba);
-    print(console, " sectors=");
-    print_u64(console, sector_count);
-    print_line(console, "");
+    userspace::write(console, "mkpart: created GPT ");
+    userspace::write(console, args.device);
+    userspace::write(console, "_0 start=");
+    userspace::write_u64(console, start_lba);
+    userspace::write(console, " sectors=");
+    userspace::write_u64(console, sector_count);
+    userspace::write_line(console, "");
     return true;
 }
 
@@ -662,12 +605,12 @@ int main(uint64_t arg_ptr, uint64_t) {
 
     Args args{};
     if (!parse_args(reinterpret_cast<const char*>(arg_ptr), args)) {
-        print_line(console, "usage: mkpart [--gpt|--mbr] [--wipe] <disk> [--type N] [--start LBA] [--sectors N]");
-        print_line(console, "examples:");
-        print_line(console, "  mkpart --wipe --gpt USBMS_0");
-        print_line(console, "  mkpart --wipe --mbr USBMS_0 --type 0x83");
-        print_line(console, "then:");
-        print_line(console, "  mkneufs USBMS_0_0");
+        userspace::write_line(console, "usage: mkpart [--gpt|--mbr] [--wipe] <disk> [--type N] [--start LBA] [--sectors N]");
+        userspace::write_line(console, "examples:");
+        userspace::write_line(console, "  mkpart --wipe --gpt USBMS_0");
+        userspace::write_line(console, "  mkpart --wipe --mbr USBMS_0 --type 0x83");
+        userspace::write_line(console, "then:");
+        userspace::write_line(console, "  mkneufs USBMS_0_0");
         return 1;
     }
 
@@ -677,15 +620,15 @@ int main(uint64_t arg_ptr, uint64_t) {
         0,
         0);
     if (device < 0) {
-        print(console, "mkpart: unable to open ");
-        print_line(console, args.device);
+        userspace::write(console, "mkpart: unable to open ");
+        userspace::write_line(console, args.device);
         return 1;
     }
 
     if (descriptor_test_flag(static_cast<uint32_t>(device),
                              static_cast<uint64_t>(
                                  descriptor_defs::Flag::Writable)) != 1) {
-        print_line(console, "mkpart: block device is not writable");
+        userspace::write_line(console, "mkpart: block device is not writable");
         descriptor_close(static_cast<uint32_t>(device));
         return 1;
     }
@@ -698,7 +641,7 @@ int main(uint64_t arg_ptr, uint64_t) {
             sizeof(geom)) != 0 ||
         geom.sector_size < 512 || geom.sector_size > 4096 ||
         geom.sector_count < 4096) {
-        print_line(console, "mkpart: unsupported block geometry");
+        userspace::write_line(console, "mkpart: unsupported block geometry");
         descriptor_close(static_cast<uint32_t>(device));
         return 1;
     }
@@ -720,7 +663,7 @@ int main(uint64_t arg_ptr, uint64_t) {
         return 1;
     }
     if (rescan_block_devices() != 0) {
-        print_line(console, "mkpart: created partition table but rescan failed");
+        userspace::write_line(console, "mkpart: created partition table but rescan failed");
         return 1;
     }
     return 0;

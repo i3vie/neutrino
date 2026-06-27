@@ -4,6 +4,7 @@
 
 #include "descriptors.hpp"
 #include "../crt/syscall.hpp"
+#include "../helpers/console.hpp"
 
 namespace {
 
@@ -17,55 +18,28 @@ constexpr uint32_t kDescPartition =
 constexpr uint8_t kNeufsMagic[8] = {
     0x4E, 0x45, 0x55, 0x46, 0x53, 0x00, 0x77, 0x42};
 
-void print(long console, const char* text) {
-    if (console < 0 || text == nullptr) {
-        return;
-    }
-    descriptor_write(static_cast<uint32_t>(console), text, strlen(text));
-}
-
-void print_line(long console, const char* text) {
-    print(console, text);
-    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-}
-
-void print_u64(long console, uint64_t value) {
-    char buffer[32];
-    size_t pos = sizeof(buffer);
-    buffer[--pos] = '\0';
-    if (value == 0) {
-        buffer[--pos] = '0';
-    } else {
-        while (value != 0 && pos > 0) {
-            buffer[--pos] = static_cast<char>('0' + (value % 10));
-            value /= 10;
-        }
-    }
-    print(console, &buffer[pos]);
-}
-
 void print_size(long console, uint64_t bytes) {
     constexpr uint64_t kib = 1024ull;
     constexpr uint64_t mib = kib * 1024ull;
     constexpr uint64_t gib = mib * 1024ull;
     if (bytes >= gib) {
-        print_u64(console, bytes / gib);
-        print(console, ".");
-        print_u64(console, ((bytes % gib) * 10) / gib);
-        print(console, " GiB");
+        userspace::write_u64(console, bytes / gib);
+        userspace::write(console, ".");
+        userspace::write_u64(console, ((bytes % gib) * 10) / gib);
+        userspace::write(console, " GiB");
     } else if (bytes >= mib) {
-        print_u64(console, bytes / mib);
-        print(console, ".");
-        print_u64(console, ((bytes % mib) * 10) / mib);
-        print(console, " MiB");
+        userspace::write_u64(console, bytes / mib);
+        userspace::write(console, ".");
+        userspace::write_u64(console, ((bytes % mib) * 10) / mib);
+        userspace::write(console, " MiB");
     } else if (bytes >= kib) {
-        print_u64(console, bytes / kib);
-        print(console, ".");
-        print_u64(console, ((bytes % kib) * 10) / kib);
-        print(console, " KiB");
+        userspace::write_u64(console, bytes / kib);
+        userspace::write(console, ".");
+        userspace::write_u64(console, ((bytes % kib) * 10) / kib);
+        userspace::write(console, " KiB");
     } else {
-        print_u64(console, bytes);
-        print(console, " B");
+        userspace::write_u64(console, bytes);
+        userspace::write(console, " B");
     }
 }
 
@@ -124,7 +98,7 @@ const char* detect_fs(uint32_t partition_handle,
 
 void print_partition_type(long console, uint8_t type) {
     if (type == 0xFF) {
-        print(console, "whole");
+        userspace::write(console, "whole");
         return;
     }
     const char hex[] = "0123456789ABCDEF";
@@ -134,7 +108,7 @@ void print_partition_type(long console, uint8_t type) {
     buffer[2] = hex[(type >> 4) & 0x0F];
     buffer[3] = hex[type & 0x0F];
     buffer[4] = '\0';
-    print(console, buffer);
+    userspace::write(console, buffer);
 }
 
 bool list_disk(long console, uint64_t disk_index) {
@@ -153,14 +127,14 @@ bool list_disk(long console, uint64_t disk_index) {
         return false;
     }
 
-    print(console, "Disk ");
-    print(console, disk_info.name);
-    print(console, " (");
-    print(console,
+    userspace::write(console, "Disk ");
+    userspace::write(console, disk_info.name);
+    userspace::write(console, " (");
+    userspace::write(console,
           (disk_info.flags & descriptor_defs::kDiskFlagRemovable) != 0
               ? "removable"
               : "fixed");
-    print(console, ", fs=");
+    userspace::write(console, ", fs=");
     descriptor_defs::BlockGeometry disk_geom{};
     const char* disk_fs_type = "unknown";
     uint64_t disk_sector_size = 512;
@@ -176,10 +150,10 @@ bool list_disk(long console, uint64_t disk_index) {
                                  sector,
                                  sizeof(sector));
     }
-    print(console, disk_fs_type);
-    print(console, "): ");
-    print_u64(console, disk_info.partition_count);
-    print_line(console, " partition(s)");
+    userspace::write(console, disk_fs_type);
+    userspace::write(console, "): ");
+    userspace::write_u64(console, disk_info.partition_count);
+    userspace::write_line(console, " partition(s)");
 
     for (uint32_t i = 0; i < disk_info.partition_count; ++i) {
         descriptor_defs::PartitionInfo part_info{};
@@ -215,18 +189,18 @@ bool list_disk(long console, uint64_t disk_index) {
                                 sizeof(sector));
         }
 
-        print(console, "  ");
-        print(console, part_info.name);
-        print(console, " start=");
-        print_u64(console, part_info.start_lba);
-        print(console, " sectors=");
-        print_u64(console, part_info.sector_count);
-        print(console, " size=");
+        userspace::write(console, "  ");
+        userspace::write(console, part_info.name);
+        userspace::write(console, " start=");
+        userspace::write_u64(console, part_info.start_lba);
+        userspace::write(console, " sectors=");
+        userspace::write_u64(console, part_info.sector_count);
+        userspace::write(console, " size=");
         print_size(console, part_info.sector_count * sector_size);
-        print(console, " type=");
+        userspace::write(console, " type=");
         print_partition_type(console, part_info.type);
-        print(console, " fs=");
-        print_line(console, fs_type);
+        userspace::write(console, " fs=");
+        userspace::write_line(console, fs_type);
 
         if (part >= 0) {
             descriptor_close(static_cast<uint32_t>(part));
@@ -234,7 +208,7 @@ bool list_disk(long console, uint64_t disk_index) {
     }
 
     descriptor_close(static_cast<uint32_t>(disk));
-    print_line(console, "");
+    userspace::write_line(console, "");
     return true;
 }
 
@@ -261,7 +235,7 @@ int main(uint64_t arg_ptr, uint64_t) {
     }
 
     if (!valid_args(reinterpret_cast<const char*>(arg_ptr))) {
-        print_line(console, "usage: lsdisk [-l]");
+        userspace::write_line(console, "usage: lsdisk [-l]");
         return 1;
     }
 
@@ -276,7 +250,7 @@ int main(uint64_t arg_ptr, uint64_t) {
     }
 
     if (!any) {
-        print_line(console, "lsdisk: no disks found");
+        userspace::write_line(console, "lsdisk: no disks found");
         return 1;
     }
     return 0;

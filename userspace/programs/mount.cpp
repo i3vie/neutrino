@@ -4,6 +4,8 @@
 
 #include "descriptors.hpp"
 #include "../crt/syscall.hpp"
+#include "../helpers/args.hpp"
+#include "../helpers/console.hpp"
 
 namespace {
 
@@ -23,78 +25,20 @@ struct Args {
     uint32_t count;
 };
 
-void print(long console, const char* text) {
-    if (console < 0 || text == nullptr) {
-        return;
-    }
-    descriptor_write(static_cast<uint32_t>(console), text, strlen(text));
-}
-
-void print_line(long console, const char* text) {
-    print(console, text);
-    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-}
-
-void print_u64(long console, uint64_t value) {
-    char buffer[32];
-    size_t pos = sizeof(buffer);
-    buffer[--pos] = '\0';
-    if (value == 0) {
-        buffer[--pos] = '0';
-    } else {
-        while (value != 0 && pos > 0) {
-            buffer[--pos] = static_cast<char>('0' + (value % 10));
-            value /= 10;
-        }
-    }
-    print(console, &buffer[pos]);
-}
-
-const char* skip_spaces(const char* text) {
-    while (text != nullptr && (*text == ' ' || *text == '\t' ||
-                               *text == '\n' || *text == '\r')) {
-        ++text;
-    }
-    return text;
-}
-
-bool copy_token(const char*& cursor, char* out, size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-    cursor = skip_spaces(cursor);
-    if (cursor == nullptr || *cursor == '\0') {
-        return false;
-    }
-    size_t len = 0;
-    while (cursor[len] != '\0' && cursor[len] != ' ' &&
-           cursor[len] != '\t' && cursor[len] != '\n' &&
-           cursor[len] != '\r') {
-        if (len + 1 >= out_size) {
-            return false;
-        }
-        out[len] = cursor[len];
-        ++len;
-    }
-    out[len] = '\0';
-    cursor += len;
-    return true;
-}
-
 bool parse_args(const char* raw, Args& out) {
     out = {};
     const char* cursor = raw;
-    if (!copy_token(cursor, out.first, sizeof(out.first))) {
+    if (!userspace::copy_token(cursor, out.first, sizeof(out.first))) {
         return false;
     }
     out.count = 1;
-    if (copy_token(cursor, out.second, sizeof(out.second))) {
+    if (userspace::copy_token(cursor, out.second, sizeof(out.second))) {
         out.count = 2;
     }
-    if (copy_token(cursor, out.third, sizeof(out.third))) {
+    if (userspace::copy_token(cursor, out.third, sizeof(out.third))) {
         out.count = 3;
     }
-    cursor = skip_spaces(cursor);
+    cursor = userspace::skip_spaces(cursor);
     return cursor == nullptr || *cursor == '\0';
 }
 
@@ -117,21 +61,21 @@ bool parse_u32(const char* text, uint32_t& out) {
 }
 
 void usage(long console) {
-    print_line(console, "usage: mount <disk> [partition-index] [mount-name]");
-    print_line(console, "       mount <partition> [mount-name]");
-    print_line(console, "examples: mount AHCI_0 0 data");
-    print_line(console, "          mount AHCI_0_0 data");
+    userspace::write_line(console, "usage: mount <disk> [partition-index] [mount-name]");
+    userspace::write_line(console, "       mount <partition> [mount-name]");
+    userspace::write_line(console, "examples: mount AHCI_0 0 data");
+    userspace::write_line(console, "          mount AHCI_0_0 data");
 }
 
 void print_partition(long console,
                      const descriptor_defs::PartitionInfo& info) {
-    print(console, "  ");
-    print_u64(console, info.index);
-    print(console, ": ");
-    print(console, info.name);
-    print(console, " sectors=");
-    print_u64(console, info.sector_count);
-    print_line(console, "");
+    userspace::write(console, "  ");
+    userspace::write_u64(console, info.index);
+    userspace::write(console, ": ");
+    userspace::write(console, info.name);
+    userspace::write(console, " sectors=");
+    userspace::write_u64(console, info.sector_count);
+    userspace::write_line(console, "");
 }
 
 long open_partition_from_disk(long console,
@@ -143,8 +87,8 @@ long open_partition_from_disk(long console,
         0,
         0);
     if (disk < 0) {
-        print(console, "mount: unable to open disk ");
-        print_line(console, disk_name);
+        userspace::write(console, "mount: unable to open disk ");
+        userspace::write_line(console, disk_name);
         return -1;
     }
 
@@ -154,15 +98,15 @@ long open_partition_from_disk(long console,
             static_cast<uint32_t>(descriptor_defs::Property::DiskInfo),
             &disk_info,
             sizeof(disk_info)) != 0) {
-        print_line(console, "mount: unable to query disk");
+        userspace::write_line(console, "mount: unable to query disk");
         descriptor_close(static_cast<uint32_t>(disk));
         return -1;
     }
 
     if (partition_index >= disk_info.partition_count) {
-        print(console, "mount: partition index out of range; ");
-        print(console, disk_info.name);
-        print_line(console, " has:");
+        userspace::write(console, "mount: partition index out of range; ");
+        userspace::write(console, disk_info.name);
+        userspace::write_line(console, " has:");
         for (uint32_t i = 0; i < disk_info.partition_count; ++i) {
             descriptor_defs::PartitionInfo info{};
             if (descriptor_read(static_cast<uint32_t>(disk),
@@ -184,7 +128,7 @@ long open_partition_from_disk(long console,
         0);
     descriptor_close(static_cast<uint32_t>(disk));
     if (partition < 0) {
-        print_line(console, "mount: unable to open partition");
+        userspace::write_line(console, "mount: unable to open partition");
         return -1;
     }
     return partition;
@@ -192,7 +136,7 @@ long open_partition_from_disk(long console,
 
 bool mount_handle(long console, long handle, const char* mount_name) {
     if (mount_descriptor(static_cast<uint32_t>(handle), mount_name) != 0) {
-        print_line(console, "mount: mount syscall failed");
+        userspace::write_line(console, "mount: mount syscall failed");
         return false;
     }
     return true;
@@ -237,13 +181,13 @@ int main(uint64_t arg_ptr, uint64_t) {
 
     bool ok = mount_handle(console, partition, mount_name);
     if (ok) {
-        print(console, "mount: mounted ");
-        print(console, args.first);
+        userspace::write(console, "mount: mounted ");
+        userspace::write(console, args.first);
         if (mount_name != nullptr && mount_name[0] != '\0') {
-            print(console, " as ");
-            print(console, mount_name);
+            userspace::write(console, " as ");
+            userspace::write(console, mount_name);
         }
-        print_line(console, "");
+        userspace::write_line(console, "");
     }
     descriptor_close(static_cast<uint32_t>(partition));
     return ok ? 0 : 1;

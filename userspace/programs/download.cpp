@@ -6,32 +6,18 @@
 #include <neutrino.h>
 
 #include "../crt/syscall.hpp"
+#include "../helpers/http.hpp"
 #include "../net/dns.hpp"
 #include "../net/tcpd_protocol.hpp"
 
 namespace {
 
 constexpr size_t kMaxUrl = 512;
-constexpr size_t kMaxHost = 256;
-constexpr size_t kMaxPath = 512;
-constexpr size_t kMaxLocation = 512;
 constexpr size_t kIoBufferSize = 32768;
 constexpr size_t kProgressBarWidth = 20;
 constexpr uint32_t kConnectWaitLimit = 200000;
 constexpr uint32_t kMaxRedirects = 5;
 constexpr uint32_t kNetDebugDeviceIndex = 0;
-
-enum class Scheme : uint8_t {
-    Http,
-    Https,
-};
-
-struct Url {
-    Scheme scheme;
-    char host[kMaxHost];
-    char path[kMaxPath];
-    uint16_t port;
-};
 
 struct TcpConnection {
     uint32_t server_pipe = 0;
@@ -77,14 +63,6 @@ struct Stream {
     InsecureX509Context insecure_x509;
 };
 
-struct HttpResponseMeta {
-    int status_code = 0;
-    bool chunked = false;
-    bool have_content_length = false;
-    size_t content_length = 0;
-    char location[kMaxLocation];
-};
-
 struct ProgressState {
     bool known_total = false;
     size_t total = 0;
@@ -112,6 +90,10 @@ long g_console = -1;
 TrustStore* g_trust_store = reinterpret_cast<TrustStore*>(1);
 uint8_t g_file_read_buffer[8192];
 uint8_t g_body_buffer[kIoBufferSize];
+
+using HttpResponseMeta = userspace::http::ResponseMeta;
+using Scheme = userspace::http::Scheme;
+using Url = userspace::http::Url;
 
 void print_raw(const void* data, size_t length) {
     if (g_console >= 0 && data != nullptr && length != 0) {
@@ -250,64 +232,6 @@ BodyResult fail_progress(ProgressState& progress) {
     return BodyResult::Error;
 }
 
-bool ascii_is_digit(char ch) {
-    return ch >= '0' && ch <= '9';
-}
-
-char ascii_to_lower(char ch) {
-    if (ch >= 'A' && ch <= 'Z') {
-        return static_cast<char>(ch - 'A' + 'a');
-    }
-    return ch;
-}
-
-bool starts_with_ci(const char* text, const char* prefix) {
-    if (text == nullptr || prefix == nullptr) {
-        return false;
-    }
-    while (*prefix != '\0') {
-        if (*text == '\0' || ascii_to_lower(*text) != ascii_to_lower(*prefix)) {
-            return false;
-        }
-        ++text;
-        ++prefix;
-    }
-    return true;
-}
-
-void copy_range(char* dest, size_t capacity, const char* begin, const char* end) {
-    if (dest == nullptr || capacity == 0) {
-        return;
-    }
-    size_t length = 0;
-    if (begin != nullptr && end != nullptr && begin <= end) {
-        length = static_cast<size_t>(end - begin);
-        if (length >= capacity) {
-            length = capacity - 1;
-        }
-        if (length != 0) {
-            memcpy(dest, begin, length);
-        }
-    }
-    dest[length] = '\0';
-}
-
-bool append_cstr(char* dest, size_t capacity, const char* src) {
-    if (dest == nullptr || capacity == 0 || src == nullptr) {
-        return false;
-    }
-    size_t length = strlen(dest);
-    if (length >= capacity) {
-        return false;
-    }
-    size_t i = 0;
-    while (src[i] != '\0' && length + 1 < capacity) {
-        dest[length++] = src[i++];
-    }
-    dest[length] = '\0';
-    return src[i] == '\0';
-}
-
 bool buffer_reserve(Buffer& buffer, size_t required) {
     if (required <= buffer.capacity) {
         return true;
@@ -345,77 +269,6 @@ bool buffer_append(Buffer& buffer, const void* data, size_t length) {
 
 void buffer_clear(Buffer& buffer) {
     buffer.size = 0;
-}
-
-bool parse_u16_range(const char* begin, const char* end, uint16_t& out) {
-    if (begin == nullptr || end == nullptr || begin == end) {
-        return false;
-    }
-    uint32_t value = 0;
-    for (const char* cursor = begin; cursor != end; ++cursor) {
-        if (!ascii_is_digit(*cursor)) {
-            return false;
-        }
-        value = value * 10u + static_cast<uint32_t>(*cursor - '0');
-        if (value > 65535u) {
-            return false;
-        }
-    }
-    out = static_cast<uint16_t>(value);
-    return true;
-}
-
-bool parse_decimal(const char* text, size_t& out) {
-    if (text == nullptr || *text == '\0') {
-        return false;
-    }
-    size_t value = 0;
-    while (*text != '\0') {
-        if (!ascii_is_digit(*text)) {
-            return false;
-        }
-        value = value * 10u + static_cast<size_t>(*text - '0');
-        ++text;
-    }
-    out = value;
-    return true;
-}
-
-bool parse_decimal_range(const char* begin, const char* end, int& out) {
-    if (begin == nullptr || end == nullptr || begin >= end) {
-        return false;
-    }
-    int value = 0;
-    for (const char* cursor = begin; cursor != end; ++cursor) {
-        if (!ascii_is_digit(*cursor)) {
-            return false;
-        }
-        value = value * 10 + static_cast<int>(*cursor - '0');
-    }
-    out = value;
-    return true;
-}
-
-bool parse_hex_size(const char* text, size_t& out) {
-    if (text == nullptr || *text == '\0') {
-        return false;
-    }
-    size_t value = 0;
-    while (*text != '\0' && *text != ';') {
-        char ch = ascii_to_lower(*text);
-        uint8_t digit = 0;
-        if (ch >= '0' && ch <= '9') {
-            digit = static_cast<uint8_t>(ch - '0');
-        } else if (ch >= 'a' && ch <= 'f') {
-            digit = static_cast<uint8_t>(10 + ch - 'a');
-        } else {
-            return false;
-        }
-        value = (value << 4) | digit;
-        ++text;
-    }
-    out = value;
-    return true;
 }
 
 const char* skip_spaces(const char* text) {
@@ -473,17 +326,17 @@ bool parse_size_arg(const char* text, size_t& out) {
     }
     size_t value = 0;
     const char* cursor = text;
-    if (!ascii_is_digit(*cursor)) {
+    if (!userspace::http::is_digit(*cursor)) {
         return false;
     }
-    while (ascii_is_digit(*cursor)) {
+    while (userspace::http::is_digit(*cursor)) {
         value = value * 10u + static_cast<size_t>(*cursor - '0');
         ++cursor;
     }
 
     size_t multiplier = 1;
     if (*cursor != '\0') {
-        char suffix = ascii_to_lower(*cursor++);
+        char suffix = userspace::http::to_lower(*cursor++);
         if (suffix == 'k') {
             multiplier = 1024u;
         } else if (suffix == 'm') {
@@ -493,7 +346,7 @@ bool parse_size_arg(const char* text, size_t& out) {
         } else {
             return false;
         }
-        if (ascii_to_lower(*cursor) == 'b') {
+        if (userspace::http::to_lower(*cursor) == 'b') {
             ++cursor;
         }
         if (*cursor != '\0') {
@@ -585,34 +438,6 @@ bool parse_args(const char* raw,
            (output[0] != '\0' || options.discard);
 }
 
-void trim_spaces(char* text) {
-    if (text == nullptr) {
-        return;
-    }
-    size_t start = 0;
-    while (text[start] == ' ' || text[start] == '\t') {
-        ++start;
-    }
-    size_t length = strlen(text + start);
-    memmove(text, text + start, length + 1);
-    while (length != 0 &&
-           (text[length - 1] == ' ' || text[length - 1] == '\t')) {
-        text[--length] = '\0';
-    }
-}
-
-int find_char(const char* text, char ch) {
-    if (text == nullptr) {
-        return -1;
-    }
-    for (size_t i = 0; text[i] != '\0'; ++i) {
-        if (text[i] == ch) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
-}
-
 void append_port(char* out, size_t out_size, uint16_t port) {
     size_t length = strlen(out);
     if (length + 1 >= out_size) {
@@ -629,154 +454,6 @@ void append_port(char* out, size_t out_size, uint16_t port) {
         out[length++] = digits[--count];
     }
     out[length] = '\0';
-}
-
-bool parse_url(const char* text, Url& out) {
-    if (text == nullptr || *text == '\0') {
-        return false;
-    }
-
-    const char* cursor = text;
-    if (starts_with_ci(cursor, "http://")) {
-        out.scheme = Scheme::Http;
-        out.port = 80;
-        cursor += 7;
-    } else if (starts_with_ci(cursor, "https://")) {
-        out.scheme = Scheme::Https;
-        out.port = 443;
-        cursor += 8;
-    } else {
-        return false;
-    }
-
-    const char* host_begin = cursor;
-    while (*cursor != '\0' && *cursor != '/' && *cursor != ':') {
-        ++cursor;
-    }
-    if (cursor == host_begin) {
-        return false;
-    }
-    copy_range(out.host, sizeof(out.host), host_begin, cursor);
-
-    if (*cursor == ':') {
-        ++cursor;
-        const char* port_begin = cursor;
-        while (*cursor != '\0' && *cursor != '/') {
-            ++cursor;
-        }
-        if (!parse_u16_range(port_begin, cursor, out.port) || out.port == 0) {
-            return false;
-        }
-    }
-
-    if (*cursor == '\0') {
-        strlcpy(out.path, "/", sizeof(out.path));
-    } else {
-        strlcpy(out.path, cursor, sizeof(out.path));
-    }
-    return true;
-}
-
-bool url_to_string(const Url& url, char* out, size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-    const char* scheme = url.scheme == Scheme::Https ? "https://" : "http://";
-    if (strlen(scheme) + strlen(url.host) + strlen(url.path) + 8 >= out_size) {
-        return false;
-    }
-    strlcpy(out, scheme, out_size);
-    if (!append_cstr(out, out_size, url.host)) {
-        return false;
-    }
-    bool need_port = (url.scheme == Scheme::Http && url.port != 80) ||
-                     (url.scheme == Scheme::Https && url.port != 443);
-    if (need_port) {
-        append_port(out, out_size, url.port);
-    }
-    return append_cstr(out, out_size, url.path);
-}
-
-bool build_redirect_url(const Url& current, const char* location, char* out, size_t out_size) {
-    if (location == nullptr || out == nullptr || out_size == 0 || *location == '\0') {
-        return false;
-    }
-    if (starts_with_ci(location, "http://") || starts_with_ci(location, "https://")) {
-        strlcpy(out, location, out_size);
-        return strlen(location) < out_size;
-    }
-    char base[kMaxUrl];
-    if (location[0] == '/' && location[1] == '/') {
-        const char* scheme = current.scheme == Scheme::Https ? "https:" : "http:";
-        if (strlen(scheme) + strlen(location) >= out_size) {
-            return false;
-        }
-        strlcpy(out, scheme, out_size);
-        return append_cstr(out, out_size, location);
-    }
-    if (location[0] == '/') {
-        Url root = current;
-        strlcpy(root.path, location, sizeof(root.path));
-        return url_to_string(root, out, out_size);
-    }
-
-    Url relative = current;
-    const char* slash = relative.path + strlen(relative.path);
-    while (slash > relative.path && slash[-1] != '/') {
-        --slash;
-    }
-    copy_range(base, sizeof(base), relative.path, slash);
-    if (strlen(base) + strlen(location) >= sizeof(relative.path)) {
-        return false;
-    }
-    strlcpy(relative.path, base, sizeof(relative.path));
-    if (!append_cstr(relative.path, sizeof(relative.path), location)) {
-        return false;
-    }
-    return url_to_string(relative, out, out_size);
-}
-
-bool parse_ipv4_component(const char* begin, const char* end, uint8_t& out) {
-    if (begin == end) {
-        return false;
-    }
-    uint32_t value = 0;
-    for (const char* cursor = begin; cursor != end; ++cursor) {
-        if (!ascii_is_digit(*cursor)) {
-            return false;
-        }
-        value = value * 10u + static_cast<uint32_t>(*cursor - '0');
-        if (value > 255u) {
-            return false;
-        }
-    }
-    out = static_cast<uint8_t>(value);
-    return true;
-}
-
-bool parse_ipv4_literal(const char* text, uint8_t out[4]) {
-    if (text == nullptr || *text == '\0') {
-        return false;
-    }
-    const char* component = text;
-    for (size_t i = 0; i < 4; ++i) {
-        const char* cursor = component;
-        while (*cursor != '\0' && *cursor != '.') {
-            ++cursor;
-        }
-        if (!parse_ipv4_component(component, cursor, out[i])) {
-            return false;
-        }
-        if (i != 3) {
-            if (*cursor != '.') {
-                return false;
-            }
-            component = cursor + 1;
-        } else if (*cursor != '\0') {
-            return false;
-        }
-    }
-    return true;
 }
 
 bool open_tcpd_registry(uint32_t& handle, tcpd_protocol::Registry*& registry) {
@@ -1415,7 +1092,8 @@ int tcp_low_write(void* context, const unsigned char* data, size_t len) {
 
 bool stream_connect(Stream& stream, const Url& url) {
     uint8_t ip[4];
-    if (!parse_ipv4_literal(url.host, ip) && !usernet::dns::resolve_a(url.host, ip)) {
+    if (!userspace::http::parse_ipv4_literal(url.host, ip) &&
+        !usernet::dns::resolve_a(url.host, ip)) {
         print_line("download: dns lookup failed");
         return false;
     }
@@ -1519,53 +1197,15 @@ bool send_http_request(Stream& stream, const Url& url) {
     return stream_write_all(stream, reinterpret_cast<const uint8_t*>(request), length);
 }
 
+bool read_response_headers_adapter(void* context, char* out, size_t out_size) {
+    return stream_read_line(*static_cast<Stream*>(context), out, out_size);
+}
+
 bool read_response_headers(Stream& stream, HttpResponseMeta& meta) {
-    meta = HttpResponseMeta{};
-    meta.location[0] = '\0';
-    char line[1024];
-    if (!stream_read_line(stream, line, sizeof(line))) {
-        return false;
-    }
-    int first_space = find_char(line, ' ');
-    if (first_space >= 0) {
-        const char* status_begin = line + first_space + 1;
-        const char* status_end = status_begin;
-        while (*status_end != '\0' && *status_end != ' ') {
-            ++status_end;
-        }
-        int status_code = 0;
-        if (parse_decimal_range(status_begin, status_end, status_code)) {
-            meta.status_code = status_code;
-        }
-    }
-    for (;;) {
-        if (!stream_read_line(stream, line, sizeof(line))) {
-            return false;
-        }
-        if (line[0] == '\0') {
-            return true;
-        }
-        int colon = find_char(line, ':');
-        if (colon <= 0) {
-            continue;
-        }
-        line[colon] = '\0';
-        char* value = line + colon + 1;
-        trim_spaces(value);
-        if (starts_with_ci(line, "content-length")) {
-            size_t parsed = 0;
-            if (parse_decimal(value, parsed)) {
-                meta.have_content_length = true;
-                meta.content_length = parsed;
-            }
-        } else if (starts_with_ci(line, "transfer-encoding")) {
-            if (starts_with_ci(value, "chunked")) {
-                meta.chunked = true;
-            }
-        } else if (starts_with_ci(line, "location")) {
-            strlcpy(meta.location, value, sizeof(meta.location));
-        }
-    }
+    return userspace::http::read_response_headers(
+        &stream,
+        read_response_headers_adapter,
+        meta);
 }
 
 bool write_file_all(uint32_t file, const uint8_t* data, size_t length) {
@@ -1578,6 +1218,64 @@ bool write_file_all(uint32_t file, const uint8_t* data, size_t length) {
         written_total += static_cast<size_t>(written);
     }
     return true;
+}
+
+bool ensure_dir(const char* path) {
+    long dir = directory_open(path);
+    if (dir >= 0) {
+        directory_close(static_cast<uint32_t>(dir));
+        return true;
+    }
+    return directory_create(path) == 0;
+}
+
+bool ensure_parent_dir(const char* path) {
+    if (path == nullptr) {
+        return false;
+    }
+    char parent[256];
+    strlcpy(parent, path, sizeof(parent));
+    size_t len = strlen(parent);
+    while (len > 0 && parent[len - 1] != '/') {
+        --len;
+    }
+    if (len == 0 || len == 1 || (len == 4 && strncmp(parent, ".../", 4) == 0)) {
+        return true;
+    }
+    parent[len - 1] = '\0';
+
+    char partial[256];
+    size_t used = 0;
+    size_t i = 0;
+    if (strncmp(parent, ".../", 4) == 0) {
+        strlcpy(partial, "...", sizeof(partial));
+        used = 3;
+        i = 3;
+    } else if (parent[0] == '/') {
+        partial[used++] = '/';
+        partial[used] = '\0';
+        i = 1;
+    } else {
+        return true;
+    }
+
+    for (; parent[i] != '\0'; ++i) {
+        if (used + 1 >= sizeof(partial)) {
+            return false;
+        }
+        partial[used++] = parent[i];
+        partial[used] = '\0';
+        if (parent[i] == '/') {
+            if (strcmp(partial, ".../") != 0) {
+                partial[used - 1] = '\0';
+                if (!ensure_dir(partial)) {
+                    return false;
+                }
+                partial[used - 1] = '/';
+            }
+        }
+    }
+    return ensure_dir(partial);
 }
 
 bool write_output_all(uint32_t file,
@@ -1643,7 +1341,7 @@ BodyResult write_response_body(Stream& stream,
                 return fail_progress(progress);
             }
             size_t chunk_size = 0;
-            if (!parse_hex_size(line, chunk_size)) {
+            if (!userspace::http::parse_hex_size(line, chunk_size)) {
                 return fail_progress(progress);
             }
             if (chunk_size == 0) {
@@ -1739,6 +1437,11 @@ BodyResult write_response_body(Stream& stream,
 }
 
 bool prepare_output_file(const char* path, uint32_t& out_file) {
+    if (!ensure_parent_dir(path)) {
+        print("download: unable to create output directory for ");
+        print_line(path);
+        return false;
+    }
     long directory = directory_open(path);
     if (directory >= 0) {
         directory_close(static_cast<uint32_t>(directory));
@@ -1755,7 +1458,8 @@ bool prepare_output_file(const char* path, uint32_t& out_file) {
     }
     long file = file_create(path);
     if (file < 0) {
-        print_line("download: unable to create output file");
+        print("download: unable to create output file ");
+        print_line(path);
         return false;
     }
     out_file = static_cast<uint32_t>(file);
@@ -1777,7 +1481,10 @@ bool fetch_to_file(const char* url_text,
 
     for (uint32_t redirect = 0; redirect <= kMaxRedirects; ++redirect) {
         Url url{};
-        if (!parse_url(current_url, url)) {
+        if (!userspace::http::parse_url(
+                current_url,
+                url,
+                userspace::http::UrlParseMode::RequireScheme)) {
             print_line("download: invalid url");
             return false;
         }
@@ -1812,7 +1519,11 @@ bool fetch_to_file(const char* url_text,
 
         if (meta.status_code >= 300 && meta.status_code < 400 && meta.location[0] != '\0') {
             char next_url[kMaxUrl];
-            bool ok = build_redirect_url(url, meta.location, next_url, sizeof(next_url));
+            bool ok = userspace::http::build_redirect_url(
+                url,
+                meta.location,
+                next_url,
+                sizeof(next_url));
             stream_close(*stream);
             unmap(stream, sizeof(*stream));
             if (!ok) {
@@ -1841,6 +1552,7 @@ bool fetch_to_file(const char* url_text,
         BodyResult body_result =
             write_response_body(*stream, meta, file, options, bytes_written);
         if (!options.discard) {
+            (void)file_sync(file);
             file_close(file);
         }
         stream_close(*stream);

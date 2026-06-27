@@ -5,6 +5,7 @@
 #include "descriptors.hpp"
 #include "keyboard_scancode.hpp"
 #include "../crt/syscall.hpp"
+#include "../helpers/console.hpp"
 
 namespace {
 
@@ -118,39 +119,6 @@ bool set_kernel_log_console(long console, bool enabled) {
     return res == 0;
 }
 
-void print(long console, const char* text) {
-    if (console < 0 || text == nullptr) {
-        return;
-    }
-    descriptor_write(static_cast<uint32_t>(console),
-                     text,
-                     strlen(text));
-}
-
-void print_line(long console, const char* text) {
-    print(console, text);
-    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-}
-
-char digit(uint64_t value) {
-    return static_cast<char>('0' + value);
-}
-
-void print_u64(long console, uint64_t value) {
-    char buffer[32];
-    size_t pos = sizeof(buffer);
-    buffer[--pos] = '\0';
-    if (value == 0) {
-        buffer[--pos] = '0';
-    } else {
-        while (value != 0 && pos > 0) {
-            buffer[--pos] = digit(value % 10);
-            value /= 10;
-        }
-    }
-    print(console, &buffer[pos]);
-}
-
 char read_char_blocking(uint32_t keyboard) {
     descriptor_defs::KeyboardEvent events[8]{};
     while (true) {
@@ -210,8 +178,8 @@ size_t read_line(uint32_t keyboard,
 
 bool prompt_yes_no_line(uint32_t keyboard, long console, const char* prompt) {
     char buf[8];
-    print(console, prompt);
-    print(console, " [y/N]: ");
+    userspace::write(console, prompt);
+    userspace::write(console, " [y/N]: ");
     drain_keyboard(keyboard);
     size_t len = read_line(keyboard, console, buf, sizeof(buf));
     if (len == 0) {
@@ -660,7 +628,7 @@ bool write_gpt(uint32_t handle,
     uint64_t backup_entries_lba = backup_header_lba - kGptEntrySectors;
     layout.root_last_lba = backup_entries_lba - 1;
     if (layout.root_first_lba >= layout.root_last_lba) {
-        print_line(console, "target too small for ESP + NEUFS GPT layout");
+        userspace::write_line(console, "target too small for ESP + NEUFS GPT layout");
         return false;
     }
 
@@ -771,7 +739,7 @@ void render_table(long console,
             set_console_color(console, kDefaultFg, kDefaultBg);
         }
 
-        print(console, " ");
+        userspace::write(console, " ");
         char idx_buf[6];
         idx_buf[0] = '#';
         idx_buf[1] = '\0';
@@ -788,15 +756,15 @@ void render_table(long console,
             idx_buf[idx_len++] = digits[digit_count - 1 - d];
         }
         idx_buf[idx_len] = '\0';
-        print(console, idx_buf);
-        print(console, "  ");
-        print(console, devices[i].name);
-        print(console, "  ");
-        print(console, size_buf);
-        print(console, "  ");
-        print(console, devices[i].writable ? "[rw]" : "[ro]");
+        userspace::write(console, idx_buf);
+        userspace::write(console, "  ");
+        userspace::write(console, devices[i].name);
+        userspace::write(console, "  ");
+        userspace::write(console, size_buf);
+        userspace::write(console, "  ");
+        userspace::write(console, devices[i].writable ? "[rw]" : "[ro]");
         if (devices[i].is_memdisk) {
-            print(console, "  (source)");
+            userspace::write(console, "  (source)");
         }
         descriptor_write(static_cast<uint32_t>(console), "\n", 1);
     }
@@ -814,11 +782,11 @@ bool copy_image(const char* src_name,
 
     if (dst.geom.sector_size == 0 || src.geom.sector_size == 0 ||
         src.geom.sector_size != dst.geom.sector_size) {
-        print_line(console, "sector size mismatch");
+        userspace::write_line(console, "sector size mismatch");
         return false;
     }
     if (dst.geom.sector_count < src.geom.sector_count) {
-        print_line(console, "destination too small for image");
+        userspace::write_line(console, "destination too small for image");
         return false;
     }
     uint64_t sector_size = src.geom.sector_size;
@@ -833,7 +801,7 @@ bool copy_image(const char* src_name,
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst_name)),
         0, 0);
     if (src_handle < 0 || dst_handle < 0) {
-        print_line(console, "failed to open block devices");
+        userspace::write_line(console, "failed to open block devices");
         if (src_handle >= 0) descriptor_close(static_cast<uint32_t>(src_handle));
         if (dst_handle >= 0) descriptor_close(static_cast<uint32_t>(dst_handle));
         return false;
@@ -844,7 +812,7 @@ bool copy_image(const char* src_name,
     uint8_t* buffer = static_cast<uint8_t*>(
         map_anonymous(static_cast<size_t>(chunk_bytes), MAP_WRITE));
     if (buffer == nullptr) {
-        print_line(console, "failed to allocate buffer");
+        userspace::write_line(console, "failed to allocate buffer");
         descriptor_close(static_cast<uint32_t>(src_handle));
         descriptor_close(static_cast<uint32_t>(dst_handle));
         return false;
@@ -852,7 +820,7 @@ bool copy_image(const char* src_name,
 
     uint64_t copied = 0;
     uint64_t last_pct = UINT64_MAX;
-    print_line(console, "Starting install...");
+    userspace::write_line(console, "Starting install...");
     while (copied < total_sectors) {
         uint64_t batch = kChunkSectors;
         if (batch > total_sectors - copied) {
@@ -866,7 +834,7 @@ bool copy_image(const char* src_name,
                                  static_cast<size_t>(bytes),
                                  offset);
         if (r < 0 || static_cast<uint64_t>(r) != bytes) {
-            print_line(console, "read failed");
+            userspace::write_line(console, "read failed");
             unmap(buffer, static_cast<size_t>(chunk_bytes));
             descriptor_close(static_cast<uint32_t>(src_handle));
             descriptor_close(static_cast<uint32_t>(dst_handle));
@@ -877,7 +845,7 @@ bool copy_image(const char* src_name,
                                   static_cast<size_t>(bytes),
                                   offset);
         if (w < 0 || static_cast<uint64_t>(w) != bytes) {
-            print_line(console, "write failed");
+            userspace::write_line(console, "write failed");
             unmap(buffer, static_cast<size_t>(chunk_bytes));
             descriptor_close(static_cast<uint32_t>(src_handle));
             descriptor_close(static_cast<uint32_t>(dst_handle));
@@ -889,13 +857,13 @@ bool copy_image(const char* src_name,
         if (percent != last_pct) {
             last_pct = percent;
             set_cursor(console, 0, 6);
-            print(console, "Installing... ");
+            userspace::write(console, "Installing... ");
             char pct[8];
             pct[0] = static_cast<char>('0' + (percent / 10));
             pct[1] = static_cast<char>('0' + (percent % 10));
             pct[2] = '%';
             pct[3] = '\0';
-            print(console, pct);
+            userspace::write(console, pct);
             descriptor_write(static_cast<uint32_t>(console), "   \r", 4);
             yield();
         }
@@ -905,7 +873,7 @@ bool copy_image(const char* src_name,
     descriptor_close(static_cast<uint32_t>(src_handle));
     descriptor_close(static_cast<uint32_t>(dst_handle));
     set_cursor(console, 0, 6);
-    print_line(console, "Install complete.              ");
+    userspace::write_line(console, "Install complete.              ");
     return true;
 }
 
@@ -933,14 +901,14 @@ bool zero_region(uint32_t handle,
         done += chunk;
         if (done >= next_mib || size == 0) {
             set_cursor(console, 0, 6);
-            print(console, "Formatting NEUFS... ");
+            userspace::write(console, "Formatting NEUFS... ");
             char size_buf[32];
             format_size(done, size_buf, sizeof(size_buf));
-            print(console, size_buf);
-            print(console, " / ");
+            userspace::write(console, size_buf);
+            userspace::write(console, " / ");
             format_size(total, size_buf, sizeof(size_buf));
-            print(console, size_buf);
-            print(console, "       ");
+            userspace::write(console, size_buf);
+            userspace::write(console, "       ");
             while (next_mib <= done) {
                 next_mib += 1024ull * 1024ull;
             }
@@ -1029,14 +997,14 @@ bool bitmap_set_range(uint8_t* sector,
 bool format_neufs_device(const Device& dst, long console) {
     if (dst.geom.sector_size == 0 || dst.geom.sector_count == 0 ||
         dst.geom.sector_size > 4096) {
-        print_line(console, "unsupported geometry for NEUFS");
+        userspace::write_line(console, "unsupported geometry for NEUFS");
         return false;
     }
     uint64_t total_bytes = dst.geom.sector_size * dst.geom.sector_count;
     uint64_t meta_size =
         default_neufs_meta_size(total_bytes, dst.geom.sector_size);
     if (meta_size >= total_bytes) {
-        print_line(console, "target too small for NEUFS metadata area");
+        userspace::write_line(console, "target too small for NEUFS metadata area");
         return false;
     }
 
@@ -1049,7 +1017,7 @@ bool format_neufs_device(const Device& dst, long console) {
     uint64_t root_offset =
         align_up(meta_bitmap_offset + meta_bitmap_size, dst.geom.sector_size);
     if (root_offset + sizeof(NeufsNdir) > meta_size) {
-        print_line(console, "metadata area cannot fit NEUFS root directory");
+        userspace::write_line(console, "metadata area cannot fit NEUFS root directory");
         return false;
     }
 
@@ -1059,7 +1027,7 @@ bool format_neufs_device(const Device& dst, long console) {
         0,
         0);
     if (handle < 0) {
-        print_line(console, "failed to open target for formatting");
+        userspace::write_line(console, "failed to open target for formatting");
         return false;
     }
 
@@ -1068,7 +1036,7 @@ bool format_neufs_device(const Device& dst, long console) {
         map_anonymous(static_cast<size_t>(scratch_size), MAP_WRITE));
     if (sector == nullptr) {
         descriptor_close(static_cast<uint32_t>(handle));
-        print_line(console, "failed to allocate format buffer");
+        userspace::write_line(console, "failed to allocate format buffer");
         return false;
     }
 
@@ -1148,7 +1116,7 @@ bool format_neufs_device(const Device& dst, long console) {
     unmap(sector, static_cast<size_t>(scratch_size));
     descriptor_close(static_cast<uint32_t>(handle));
     if (!ok) {
-        print_line(console, "NEUFS format failed");
+        userspace::write_line(console, "NEUFS format failed");
     }
     return ok;
 }
@@ -1219,25 +1187,25 @@ void render_copy_progress(CopyProgress& progress, bool force) {
     progress.last_percent = percent;
 
     set_cursor(progress.console, 0, 7);
-    print(progress.console, "Copying live system... ");
-    print_u64(progress.console, percent);
-    print(progress.console, "%  files ");
-    print_u64(progress.console, progress.copied_files);
-    print(progress.console, "/");
-    print_u64(progress.console, progress.total_files);
-    print(progress.console, "  bytes ");
+    userspace::write(progress.console, "Copying live system... ");
+    userspace::write_u64(progress.console, percent);
+    userspace::write(progress.console, "%  files ");
+    userspace::write_u64(progress.console, progress.copied_files);
+    userspace::write(progress.console, "/");
+    userspace::write_u64(progress.console, progress.total_files);
+    userspace::write(progress.console, "  bytes ");
     char size_buf[32];
     format_size(progress.copied_bytes, size_buf, sizeof(size_buf));
-    print(progress.console, size_buf);
-    print(progress.console, "/");
+    userspace::write(progress.console, size_buf);
+    userspace::write(progress.console, "/");
     format_size(progress.total_bytes, size_buf, sizeof(size_buf));
-    print(progress.console, size_buf);
-    print(progress.console, "          ");
+    userspace::write(progress.console, size_buf);
+    userspace::write(progress.console, "          ");
 
     set_cursor(progress.console, 0, 8);
-    print(progress.console, "Current: ");
-    print(progress.console, progress.current);
-    print(progress.console,
+    userspace::write(progress.console, "Current: ");
+    userspace::write(progress.console, progress.current);
+    userspace::write(progress.console,
           "                                                            ");
     yield();
 }
@@ -1274,13 +1242,13 @@ bool scan_tree(const char* source_dir,
                long console,
                size_t depth = 0) {
     if (depth > 16) {
-        print_line(console, "copy depth exceeded while scanning");
+        userspace::write_line(console, "copy depth exceeded while scanning");
         return false;
     }
     long dir = directory_open(source_dir);
     if (dir < 0) {
-        print(console, "directory scan failed: ");
-        print_line(console, source_dir);
+        userspace::write(console, "directory scan failed: ");
+        userspace::write_line(console, source_dir);
         return false;
     }
 
@@ -1324,15 +1292,15 @@ bool copy_file_path(const char* source,
 
     long in = file_open(source);
     if (in < 0) {
-        print(console, "open failed: ");
-        print_line(console, source);
+        userspace::write(console, "open failed: ");
+        userspace::write_line(console, source);
         return false;
     }
     long out = file_create(dest);
     if (out < 0) {
         file_close(static_cast<uint32_t>(in));
-        print(console, "create failed: ");
-        print_line(console, dest);
+        userspace::write(console, "create failed: ");
+        userspace::write_line(console, dest);
         return false;
     }
     uint8_t buffer[4096];
@@ -1392,21 +1360,21 @@ bool copy_tree(const char* source_dir,
                CopyProgress* progress,
                size_t depth = 0) {
     if (depth > 16) {
-        print_line(console, "copy depth exceeded");
+        userspace::write_line(console, "copy depth exceeded");
         return false;
     }
     long dir = directory_open(source_dir);
     if (dir < 0) {
-        print(console, "directory open failed: ");
-        print_line(console, source_dir);
+        userspace::write(console, "directory open failed: ");
+        userspace::write_line(console, source_dir);
         return false;
     }
     if (depth != 0) {
         set_copy_status(progress, "mkdir", dest_dir);
         if (directory_create(dest_dir) < 0) {
             descriptor_close(static_cast<uint32_t>(dir));
-            print(console, "directory create failed: ");
-            print_line(console, dest_dir);
+            userspace::write(console, "directory create failed: ");
+            userspace::write_line(console, dest_dir);
             return false;
         }
     }
@@ -1449,15 +1417,15 @@ bool copy_tree(const char* source_dir,
 bool install_neufs(const Device& src, const Device& dst, long console) {
     clear_console(console);
     set_cursor(console, 0, 0);
-    print_line(console, "Neutrino Installer");
-    print_line(console, "Installing to UEFI GPT + NEUFS target.");
-    print(console, "Target: ");
-    print_line(console, dst.name);
+    userspace::write_line(console, "Neutrino Installer");
+    userspace::write_line(console, "Installing to UEFI GPT + NEUFS target.");
+    userspace::write(console, "Target: ");
+    userspace::write_line(console, dst.name);
 
     char root_name[64];
     if (is_partition_device_name(dst.name) ||
         !append_partition_suffix(dst.name, 1, root_name, sizeof(root_name))) {
-        print_line(console, "target name is not a whole-disk install target");
+        userspace::write_line(console, "target name is not a whole-disk install target");
         return false;
     }
 
@@ -1467,7 +1435,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
         0,
         0);
     if (esp < 0) {
-        print_line(console, "missing installer ESP image module");
+        userspace::write_line(console, "missing installer ESP image module");
         return false;
     }
     descriptor_defs::BlockGeometry esp_geom{};
@@ -1478,7 +1446,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
             sizeof(esp_geom)) != 0 ||
         esp_geom.sector_size == 0 || esp_geom.sector_count == 0) {
         descriptor_close(static_cast<uint32_t>(esp));
-        print_line(console, "invalid installer ESP image geometry");
+        userspace::write_line(console, "invalid installer ESP image geometry");
         return false;
     }
 
@@ -1489,7 +1457,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
         0);
     if (disk < 0) {
         descriptor_close(static_cast<uint32_t>(esp));
-        print_line(console, "failed to open target disk");
+        userspace::write_line(console, "failed to open target disk");
         return false;
     }
 
@@ -1502,13 +1470,13 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     if (scratch == nullptr) {
         descriptor_close(static_cast<uint32_t>(disk));
         descriptor_close(static_cast<uint32_t>(esp));
-        print_line(console, "failed to allocate install buffer");
+        userspace::write_line(console, "failed to allocate install buffer");
         return false;
     }
 
     GptLayout layout{};
     set_cursor(console, 0, 6);
-    print_line(console, "Writing GPT...");
+    userspace::write_line(console, "Writing GPT...");
     bool ok = write_gpt(static_cast<uint32_t>(disk),
                         dst.geom.sector_count,
                         esp_geom.sector_count,
@@ -1518,7 +1486,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
                         console);
     if (ok) {
         set_cursor(console, 0, 6);
-        print_line(console, "Writing EFI system partition...");
+        userspace::write_line(console, "Writing EFI system partition...");
         ok = copy_block_device(static_cast<uint32_t>(esp),
                                static_cast<uint32_t>(disk),
                                0,
@@ -1532,12 +1500,12 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     descriptor_close(static_cast<uint32_t>(disk));
     descriptor_close(static_cast<uint32_t>(esp));
     if (!ok) {
-        print_line(console, "failed to install GPT/ESP");
+        userspace::write_line(console, "failed to install GPT/ESP");
         return false;
     }
 
     if (rescan_block_devices() != 0) {
-        print_line(console, "failed to rescan GPT partitions");
+        userspace::write_line(console, "failed to rescan GPT partitions");
         return false;
     }
 
@@ -1557,13 +1525,13 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
         0,
         0);
     if (target < 0) {
-        print_line(console, "failed to open formatted target");
+        userspace::write_line(console, "failed to open formatted target");
         return false;
     }
     bool mounted = mount_descriptor(static_cast<uint32_t>(target), nullptr) == 0;
     descriptor_close(static_cast<uint32_t>(target));
     if (!mounted) {
-        print_line(console, "failed to mount formatted NEUFS target");
+        userspace::write_line(console, "failed to mount formatted NEUFS target");
         return false;
     }
     char source_root[80];
@@ -1575,7 +1543,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     target_root[1] = '\0';
     strlcpy(target_root + 1, root.name, sizeof(target_root) - 1);
 
-    print_line(console, "Scanning live system...");
+    userspace::write_line(console, "Scanning live system...");
     uint64_t total_files = 0;
     uint64_t total_bytes = 0;
     if (!scan_tree(source_root, total_files, total_bytes, console)) {
@@ -1600,7 +1568,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
         strlcpy(progress.current, "complete", sizeof(progress.current));
         render_copy_progress(progress, true);
         set_cursor(console, 0, 10);
-        print_line(console, "NEUFS install complete.");
+        userspace::write_line(console, "NEUFS install complete.");
     }
     return ok;
 }
@@ -1633,11 +1601,11 @@ bool remove_installer_from_mounted_target(const Device& dst) {
 }
 
 InstallFs choose_filesystem(uint32_t keyboard, long console) {
-    print_line(console, "");
-    print_line(console, "Choose target filesystem:");
-    print_line(console, "  1. NEUFS (recommended)");
-    print_line(console, "  2. FAT32 (legacy image clone, discouraged)");
-    print(console, "Selection [1]: ");
+    userspace::write_line(console, "");
+    userspace::write_line(console, "Choose target filesystem:");
+    userspace::write_line(console, "  1. NEUFS (recommended)");
+    userspace::write_line(console, "  2. FAT32 (legacy image clone, discouraged)");
+    userspace::write(console, "Selection [1]: ");
     char input[8];
     drain_keyboard(keyboard);
     size_t len = read_line(keyboard, console, input, sizeof(input));
@@ -1659,13 +1627,13 @@ int main(uint64_t, uint64_t) {
     clear_console(console);
     set_console_color(console, kDefaultFg, kDefaultBg);
     set_kernel_log_console(console, false);
-    print_line(console, "Neutrino Installer");
-    print_line(console, "Live installer for MEMDISK boot sessions.");
+    userspace::write_line(console, "Neutrino Installer");
+    userspace::write_line(console, "Live installer for MEMDISK boot sessions.");
 
     Device devices[16];
     size_t device_count = 0;
     if (!fetch_devices(devices, 16, device_count) || device_count == 0) {
-        print_line(console, "No block devices detected.");
+        userspace::write_line(console, "No block devices detected.");
         return 1;
     }
 
@@ -1677,8 +1645,8 @@ int main(uint64_t, uint64_t) {
         }
     }
     if (source_index == device_count) {
-        print_line(console, "Installer is only available from a live MEMDISK root.");
-        print_line(console, "This system appears to be running from an installed disk.");
+        userspace::write_line(console, "Installer is only available from a live MEMDISK root.");
+        userspace::write_line(console, "This system appears to be running from an installed disk.");
         return 1;
     }
 
@@ -1686,17 +1654,17 @@ int main(uint64_t, uint64_t) {
     size_t target_count =
         collect_install_targets(devices, device_count, targets, 16);
     if (target_count == 0) {
-        print_line(console, "No installable whole disks detected.");
+        userspace::write_line(console, "No installable whole disks detected.");
         return 1;
     }
 
     while (true) {
         set_cursor(console, 0, 3);
-        print_line(console, "Available drives:");
+        userspace::write_line(console, "Available drives:");
         render_table(console, targets, target_count, target_count, 4);
 
-        print_line(console, "");
-        print(console, "Enter target index (or q to quit): ");
+        userspace::write_line(console, "");
+        userspace::write(console, "Enter target index (or q to quit): ");
         char input[8];
         size_t len = read_line(static_cast<uint32_t>(keyboard),
                                console,
@@ -1707,11 +1675,11 @@ int main(uint64_t, uint64_t) {
         }
         size_t choice = 0;
         if (!parse_uint(input, choice) || choice >= target_count) {
-            print_line(console, "Invalid selection.");
+            userspace::write_line(console, "Invalid selection.");
             continue;
         }
         if (!targets[choice].writable) {
-            print_line(console, "Drive is read-only.");
+            userspace::write_line(console, "Drive is read-only.");
             continue;
         }
 
@@ -1719,7 +1687,7 @@ int main(uint64_t, uint64_t) {
                                           console,
                                           "This will erase the drive. Proceed");
         if (!proceed) {
-            print_line(console, "Cancelled.");
+            userspace::write_line(console, "Cancelled.");
             continue;
         }
 
@@ -1731,8 +1699,8 @@ int main(uint64_t, uint64_t) {
         } else {
             clear_console(console);
             set_cursor(console, 0, 0);
-            print_line(console, "Neutrino Installer");
-            print_line(console, "Installing FAT32 by cloning the live image...");
+            userspace::write_line(console, "Neutrino Installer");
+            userspace::write_line(console, "Installing FAT32 by cloning the live image...");
             ok = copy_image(devices[source_index].name,
                             devices[source_index],
                             targets[choice].name,
@@ -1743,7 +1711,7 @@ int main(uint64_t, uint64_t) {
             }
         }
         if (!ok) {
-            print_line(console, "Install failed.");
+            userspace::write_line(console, "Install failed.");
         }
 
         bool again = prompt_yes_no_line(static_cast<uint32_t>(keyboard),

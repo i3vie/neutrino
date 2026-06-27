@@ -4,6 +4,8 @@
 
 #include "descriptors.hpp"
 #include "../crt/syscall.hpp"
+#include "../helpers/args.hpp"
+#include "../helpers/console.hpp"
 
 namespace {
 
@@ -48,81 +50,18 @@ struct Args {
     char label[16];
 };
 
-void print(long console, const char* text) {
-    if (console < 0 || text == nullptr) {
-        return;
-    }
-    descriptor_write(static_cast<uint32_t>(console), text, strlen(text));
-}
-
-void print_line(long console, const char* text) {
-    print(console, text);
-    descriptor_write(static_cast<uint32_t>(console), "\n", 1);
-}
-
-char digit(uint64_t value) {
-    return static_cast<char>('0' + value);
-}
-
-void print_u64(long console, uint64_t value) {
-    char buffer[32];
-    size_t pos = sizeof(buffer);
-    buffer[--pos] = '\0';
-    if (value == 0) {
-        buffer[--pos] = '0';
-    } else {
-        while (value != 0 && pos > 0) {
-            buffer[--pos] = digit(value % 10);
-            value /= 10;
-        }
-    }
-    print(console, &buffer[pos]);
-}
-
 void print_progress(long console, const char* action, uint64_t done, uint64_t total) {
     uint64_t percent = total == 0 ? 100 : (done * 100) / total;
     constexpr uint64_t mib = 1024ull * 1024ull;
-    print(console, "mkneufs: ");
-    print(console, action);
-    print(console, " ");
-    print_u64(console, percent);
-    print(console, "% (");
-    print_u64(console, done / mib);
-    print(console, "/");
-    print_u64(console, (total + mib - 1) / mib);
-    print_line(console, " MiB)");
-}
-
-const char* skip_spaces(const char* text) {
-    while (text != nullptr && (*text == ' ' || *text == '\t' ||
-                               *text == '\n' || *text == '\r')) {
-        ++text;
-    }
-    return text;
-}
-
-bool copy_token(const char*& cursor, char* out, size_t out_size) {
-    if (out == nullptr || out_size == 0) {
-        return false;
-    }
-    cursor = skip_spaces(cursor);
-    if (cursor == nullptr || *cursor == '\0') {
-        return false;
-    }
-
-    size_t len = 0;
-    while (cursor[len] != '\0' && cursor[len] != ' ' &&
-           cursor[len] != '\t' && cursor[len] != '\n' &&
-           cursor[len] != '\r') {
-        if (len + 1 >= out_size) {
-            return false;
-        }
-        out[len] = cursor[len];
-        ++len;
-    }
-    out[len] = '\0';
-    cursor += len;
-    return true;
+    userspace::write(console, "mkneufs: ");
+    userspace::write(console, action);
+    userspace::write(console, " ");
+    userspace::write_u64(console, percent);
+    userspace::write(console, "% (");
+    userspace::write_u64(console, done / mib);
+    userspace::write(console, "/");
+    userspace::write_u64(console, (total + mib - 1) / mib);
+    userspace::write_line(console, " MiB)");
 }
 
 bool parse_args(const char* raw, Args& out) {
@@ -132,17 +71,17 @@ bool parse_args(const char* raw, Args& out) {
     }
 
     const char* cursor = raw;
-    if (!copy_token(cursor, out.device, sizeof(out.device))) {
+    if (!userspace::copy_token(cursor, out.device, sizeof(out.device))) {
         return false;
     }
 
-    const char* after_device = skip_spaces(cursor);
+    const char* after_device = userspace::skip_spaces(cursor);
     if (after_device != nullptr && *after_device != '\0') {
         cursor = after_device;
-        if (!copy_token(cursor, out.label, sizeof(out.label))) {
+        if (!userspace::copy_token(cursor, out.label, sizeof(out.label))) {
             return false;
         }
-        cursor = skip_spaces(cursor);
+        cursor = userspace::skip_spaces(cursor);
         return cursor == nullptr || *cursor == '\0';
     }
 
@@ -324,14 +263,14 @@ bool format_neufs(long console,
                   const descriptor_defs::BlockGeometry& geom) {
     if (geom.sector_size == 0 || geom.sector_count == 0 ||
         geom.sector_size > 4096) {
-        print_line(console, "mkneufs: unsupported block geometry");
+        userspace::write_line(console, "mkneufs: unsupported block geometry");
         return false;
     }
 
     uint64_t total_bytes = geom.sector_size * geom.sector_count;
     uint64_t meta_size = default_meta_size(total_bytes, geom.sector_size);
     if (meta_size >= total_bytes) {
-        print_line(console, "mkneufs: device too small for spec default metadata area");
+        userspace::write_line(console, "mkneufs: device too small for spec default metadata area");
         return false;
     }
 
@@ -344,7 +283,7 @@ bool format_neufs(long console,
     uint64_t bitmap_end = meta_bitmap_offset + meta_bitmap_size;
     uint64_t root_offset = align_up(bitmap_end, geom.sector_size);
     if (root_offset + sizeof(NeufsNdir) > meta_size) {
-        print_line(console, "mkneufs: metadata area cannot fit root directory");
+        userspace::write_line(console, "mkneufs: metadata area cannot fit root directory");
         return false;
     }
 
@@ -353,17 +292,17 @@ bool format_neufs(long console,
     uint8_t* sector = static_cast<uint8_t*>(
         map_anonymous(static_cast<size_t>(scratch_size), MAP_WRITE));
     if (sector == nullptr) {
-        print_line(console, "mkneufs: allocation failed");
+        userspace::write_line(console, "mkneufs: allocation failed");
         return false;
     }
 
     if (!zero_region(console, handle, 0, meta_size, sector, scratch_size)) {
-        print_line(console, "mkneufs: failed to clear metadata area");
+        userspace::write_line(console, "mkneufs: failed to clear metadata area");
         unmap(sector, static_cast<size_t>(scratch_size));
         return false;
     }
 
-    print_line(console, "mkneufs: writing RVT");
+    userspace::write_line(console, "mkneufs: writing RVT");
     NeufsRvt rvt{};
     for (size_t i = 0; i < sizeof(kNeufsMagic); ++i) {
         rvt.magic[i] = static_cast<char>(kNeufsMagic[i]);
@@ -372,12 +311,12 @@ bool format_neufs(long console,
     memcpy(rvt.name, args.label, strlen(args.label));
     rvt.root = root_offset;
     if (!write_bytes(handle, 0, &rvt, sizeof(rvt), sector, geom.sector_size)) {
-        print_line(console, "mkneufs: failed to write RVT");
+        userspace::write_line(console, "mkneufs: failed to write RVT");
         unmap(sector, static_cast<size_t>(scratch_size));
         return false;
     }
 
-    print_line(console, "mkneufs: writing root directory");
+    userspace::write_line(console, "mkneufs: writing root directory");
     NeufsNdir root{};
     root.type = kTypeNdir;
     root.name[0] = '/';
@@ -388,21 +327,21 @@ bool format_neufs(long console,
                      sizeof(root),
                      sector,
                      geom.sector_size)) {
-        print_line(console, "mkneufs: failed to write root directory");
+        userspace::write_line(console, "mkneufs: failed to write root directory");
         unmap(sector, static_cast<size_t>(scratch_size));
         return false;
     }
 
     uint64_t used_data_sectors = align_up(meta_size, geom.sector_size) /
                                  geom.sector_size;
-    print_line(console, "mkneufs: initializing data bitmap");
+    userspace::write_line(console, "mkneufs: initializing data bitmap");
     if (!bitmap_set_range(sector,
                           handle,
                           data_bitmap_offset,
                           0,
                           used_data_sectors,
                           geom.sector_size)) {
-        print_line(console, "mkneufs: failed to initialize data bitmap");
+        userspace::write_line(console, "mkneufs: failed to initialize data bitmap");
         unmap(sector, static_cast<size_t>(scratch_size));
         return false;
     }
@@ -411,7 +350,7 @@ bool format_neufs(long console,
     uint64_t data_bitmap_blocks = align_up(data_bitmap_size, 8) / 8;
     uint64_t meta_bitmap_blocks = align_up(meta_bitmap_size, 8) / 8;
     uint64_t root_blocks = align_up(sizeof(NeufsNdir), 8) / 8;
-    print_line(console, "mkneufs: initializing metadata bitmap");
+    userspace::write_line(console, "mkneufs: initializing metadata bitmap");
     if (!bitmap_set_range(sector, handle, meta_bitmap_offset, 0,
                           rvt_blocks, geom.sector_size) ||
         !bitmap_set_range(sector, handle, meta_bitmap_offset,
@@ -426,26 +365,26 @@ bool format_neufs(long console,
                           root_offset / 8,
                           root_blocks,
                           geom.sector_size)) {
-        print_line(console, "mkneufs: failed to initialize metadata bitmap");
+        userspace::write_line(console, "mkneufs: failed to initialize metadata bitmap");
         unmap(sector, static_cast<size_t>(scratch_size));
         return false;
     }
 
     unmap(sector, static_cast<size_t>(scratch_size));
 
-    print(console, "mkneufs: formatted ");
-    print(console, args.device);
-    print(console, " label=");
-    print_line(console, args.label);
-    print(console, "mkneufs: sectors=");
-    print_u64(console, geom.sector_count);
-    print(console, " sector_size=");
-    print_u64(console, geom.sector_size);
-    print(console, " meta_bytes=");
-    print_u64(console, meta_size);
-    print(console, " root=");
-    print_u64(console, root_offset);
-    print_line(console, "");
+    userspace::write(console, "mkneufs: formatted ");
+    userspace::write(console, args.device);
+    userspace::write(console, " label=");
+    userspace::write_line(console, args.label);
+    userspace::write(console, "mkneufs: sectors=");
+    userspace::write_u64(console, geom.sector_count);
+    userspace::write(console, " sector_size=");
+    userspace::write_u64(console, geom.sector_size);
+    userspace::write(console, " meta_bytes=");
+    userspace::write_u64(console, meta_size);
+    userspace::write(console, " root=");
+    userspace::write_u64(console, root_offset);
+    userspace::write_line(console, "");
     return true;
 }
 
@@ -460,8 +399,8 @@ int main(uint64_t arg_ptr, uint64_t) {
     Args args{};
     const char* raw = reinterpret_cast<const char*>(arg_ptr);
     if (!parse_args(raw, args)) {
-        print_line(console, "usage: mkneufs <block-device> [label]");
-        print_line(console, "example: mkneufs IDE_SM_0 scratch");
+        userspace::write_line(console, "usage: mkneufs <block-device> [label]");
+        userspace::write_line(console, "example: mkneufs IDE_SM_0 scratch");
         return 1;
     }
 
@@ -472,15 +411,15 @@ int main(uint64_t arg_ptr, uint64_t) {
         0);
 
     if (device < 0) {
-        print(console, "mkneufs: unable to open ");
-        print_line(console, args.device);
+        userspace::write(console, "mkneufs: unable to open ");
+        userspace::write_line(console, args.device);
         return 1;
     }
 
     if (descriptor_test_flag(static_cast<uint32_t>(device),
                              static_cast<uint64_t>(
                                  descriptor_defs::Flag::Writable)) != 1) {
-        print_line(console, "mkneufs: block device is not writable");
+        userspace::write_line(console, "mkneufs: block device is not writable");
         descriptor_close(static_cast<uint32_t>(device));
         return 1;
     }
@@ -491,7 +430,7 @@ int main(uint64_t arg_ptr, uint64_t) {
             static_cast<uint32_t>(descriptor_defs::Property::BlockGeometry),
             &geom,
             sizeof(geom)) != 0) {
-        print_line(console, "mkneufs: failed to query block geometry");
+        userspace::write_line(console, "mkneufs: failed to query block geometry");
         descriptor_close(static_cast<uint32_t>(device));
         return 1;
     }

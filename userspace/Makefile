@@ -11,6 +11,7 @@ MOUNT_SUDO ?= sudo
 
 CRT_DIR  := crt
 LIBC_DIR := libc
+HELPER_DIR := helpers
 DEPS_DIR := deps
 BEARSSL_DIR := $(DEPS_DIR)/BearSSL
 OBJ_DIR  := build
@@ -43,6 +44,15 @@ BEARSSL_LIB := $(OBJ_DIR)/libbearssl.a
 PROGRAM_LIBS_browse += $(BEARSSL_LIB)
 PROGRAM_LIBS_download += $(BEARSSL_LIB)
 PROGRAM_LIBS_netget += $(BEARSSL_LIB)
+PROGRAM_HELPERS_browse += http
+PROGRAM_HELPERS_installer += console
+PROGRAM_HELPERS_lsdisk += console
+PROGRAM_HELPERS_mount += args console
+PROGRAM_HELPERS_mkneufs += args console
+PROGRAM_HELPERS_mkpart += args console
+PROGRAM_HELPERS_neupak += args text
+PROGRAM_HELPERS_download += http
+PROGRAM_HELPERS_netget += http
 PROGRAM_DEPS_font += ../shared/include/TOSH-SAT.F14
 
 HDD_IMAGE ?= ../hdd.img
@@ -78,6 +88,9 @@ $(OBJ_DIR)/libc_ctype.o: $(LIBC_DIR)/ctype.cpp $(LIBC_DIR)/include/ctype.h | $(O
 $(OBJ_DIR)/libc_neutrino.o: $(LIBC_DIR)/neutrino.cpp $(LIBC_DIR)/include/neutrino.h $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
 	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
 
+$(OBJ_DIR)/helper_%.o: $(HELPER_DIR)/%.cpp $(HELPER_DIR)/%.hpp $(CRT_DIR)/syscall.hpp | $(OBJ_DIR)
+	$(CXX) $(PROGRAM_CXXFLAGS) -c $< -o $@
+
 $(OBJ_DIR)/bearssl/%.o: $(BEARSSL_DIR)/src/%.c $(BEARSSL_DIR)/inc/bearssl.h | $(OBJ_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(PROGRAM_CFLAGS) -c $< -o $@
@@ -88,10 +101,11 @@ $(BEARSSL_LIB): $(BEARSSL_DIR)/inc/bearssl.h $(BEARSSL_OBJECTS) | $(OBJ_DIR)
 bearssl: $(BEARSSL_LIB)
 
 INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all
+program_helper_objects = $(addprefix $(OBJ_DIR)/helper_,$(addsuffix .o,$(PROGRAM_HELPERS_$(1))))
 
-$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_DEPS_$$*) $$(PROGRAM_LIBS_$$*) | $(OUT_DIR)
+$(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_DEPS_$$*) $$(PROGRAM_LIBS_$$*) $$(call program_helper_objects,$$*) | $(OUT_DIR)
 	@mkdir -p $(OUT_DIR) $(BIN_DIR)
-	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $< $(PROGRAM_LIBS_$*) -o $@
+	$(CXX) $(PROGRAM_CXXFLAGS) $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(call program_helper_objects,$*) $< $(PROGRAM_LIBS_$*) -o $@
 	@cp $@ $(BIN_DIR)/$*.elf
 
 install: $(INSTALL_PREREQS)
