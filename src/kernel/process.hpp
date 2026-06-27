@@ -79,6 +79,7 @@ struct Process {
 
 void init();
 Process* allocate();
+Process* allocate_init_task();
 Process* allocate_kernel_task(void (*entry)(Process&));
 Process* current();
 void set_current(Process* proc);

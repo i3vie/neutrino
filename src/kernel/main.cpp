@@ -668,7 +668,7 @@ static void kernel_main_stage2() {
 
     if (init_loaded) {
         loader::ProgramImage image{init_buffer, init_size, 0};
-        process::Process* proc = process::allocate();
+        process::Process* proc = process::allocate_init_task();
         bool init_started = false;
         if (proc != nullptr) {
             string_util::copy(proc->cwd, sizeof(proc->cwd), boot_cwd);
@@ -691,8 +691,7 @@ static void kernel_main_stage2() {
                 scheduler::enqueue(proc);
                 init_started = true;
             } else {
-                proc->state = process::State::Unused;
-                proc->pid = 0;
+                process::reclaim(*proc);
             }
         }
         if (!init_started) {

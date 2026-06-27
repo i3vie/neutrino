@@ -13,7 +13,9 @@ namespace {
 process::Process g_process_table[process::kMaxProcesses];
 alignas(16) uint8_t g_kernel_stacks[process::kMaxProcesses][process::kKernelStackSize];
 uint32_t g_next_pid = 1;
-uint32_t g_next_kernel_pid = 0x80000000u;
+bool g_init_pid_reserved = true;
+
+constexpr uint32_t kInitPid = 1;
 
 void reset_process_resources(process::Process& proc) {
     proc.fs_base = 0;
@@ -60,6 +62,53 @@ void reset_process_resources(process::Process& proc) {
     }
 }
 
+bool pid_in_use(uint32_t pid) {
+    if (pid == 0) {
+        return true;
+    }
+    for (size_t i = 0; i < process::kMaxProcesses; ++i) {
+        const process::Process& proc = g_process_table[i];
+        if (proc.state != process::State::Unused && proc.pid == pid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t allocate_pid() {
+    for (uint32_t attempts = 0; attempts < UINT32_MAX; ++attempts) {
+        uint32_t pid = g_next_pid++;
+        if (g_next_pid == 0) {
+            g_next_pid = 1;
+        }
+        if (pid == 0 || (g_init_pid_reserved && pid == kInitPid)) {
+            continue;
+        }
+        if (!pid_in_use(pid)) {
+            return pid;
+        }
+    }
+    return 0;
+}
+
+process::Process* allocate_slot(uint32_t pid) {
+    if (pid == 0 || pid_in_use(pid)) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < process::kMaxProcesses; ++i) {
+        process::Process& proc = g_process_table[i];
+        if (proc.state != process::State::Unused) {
+            continue;
+        }
+        memset(&proc.context, 0, sizeof(proc.context));
+        proc.state = process::State::Ready;
+        proc.pid = pid;
+        reset_process_resources(proc);
+        return &proc;
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 namespace process {
@@ -67,6 +116,7 @@ namespace process {
 void init() {
     memset(g_process_table, 0, sizeof(g_process_table));
     g_next_pid = 1;
+    g_init_pid_reserved = true;
     for (size_t i = 0; i < kMaxProcesses; ++i) {
         g_process_table[i].state = State::Unused;
         g_process_table[i].has_context = false;
@@ -84,25 +134,40 @@ void init() {
 }
 
 Process* allocate() {
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& proc = g_process_table[i];
-        if (proc.state != State::Unused) {
-            continue;
-        }
-        memset(&proc.context, 0, sizeof(proc.context));
-        proc.state = State::Ready;
-        proc.pid = g_next_kernel_pid++;
-        uint64_t new_cr3 = paging_create_address_space();
-        if (new_cr3 == 0) {
-            proc.state = State::Unused;
-            proc.pid = 0;
-            return nullptr;
-        }
-        proc.cr3 = new_cr3;
-        reset_process_resources(proc);
-        return &proc;
+    Process* proc = allocate_slot(allocate_pid());
+    if (proc == nullptr) {
+        return nullptr;
     }
-    return nullptr;
+    uint64_t new_cr3 = paging_create_address_space();
+    if (new_cr3 == 0) {
+        proc->state = State::Unused;
+        proc->pid = 0;
+        return nullptr;
+    }
+    proc->cr3 = new_cr3;
+    return proc;
+}
+
+Process* allocate_init_task() {
+    if (!g_init_pid_reserved || pid_in_use(kInitPid)) {
+        return nullptr;
+    }
+    Process* proc = allocate_slot(kInitPid);
+    if (proc == nullptr) {
+        return nullptr;
+    }
+    uint64_t new_cr3 = paging_create_address_space();
+    if (new_cr3 == 0) {
+        proc->state = State::Unused;
+        proc->pid = 0;
+        return nullptr;
+    }
+    proc->cr3 = new_cr3;
+    g_init_pid_reserved = false;
+    if (g_next_pid <= kInitPid) {
+        g_next_pid = kInitPid + 1;
+    }
+    return proc;
 }
 
 Process* current() {
@@ -208,21 +273,14 @@ Process* allocate_kernel_task(void (*entry)(Process&)) {
     if (entry == nullptr) {
         return nullptr;
     }
-    for (size_t i = 0; i < kMaxProcesses; ++i) {
-        Process& proc = g_process_table[i];
-        if (proc.state != State::Unused) {
-            continue;
-        }
-        memset(&proc.context, 0, sizeof(proc.context));
-        proc.state = State::Ready;
-        proc.pid = g_next_pid++;
-        proc.cr3 = paging_kernel_cr3();
-        reset_process_resources(proc);
-        proc.is_kernel_task = true;
-        proc.kernel_entry = entry;
-        return &proc;
+    Process* proc = allocate_slot(allocate_pid());
+    if (proc == nullptr) {
+        return nullptr;
     }
-    return nullptr;
+    proc->cr3 = paging_kernel_cr3();
+    proc->is_kernel_task = true;
+    proc->kernel_entry = entry;
+    return proc;
 }
 
 void reclaim(Process& proc) {
