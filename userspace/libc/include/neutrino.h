@@ -23,6 +23,8 @@ long neutrino_open_stdout();
 void neutrino_write(long console, const char* text);
 void neutrino_write_line(long console, const char* text);
 bool neutrino_get_time(struct NeutrinoWallTime* out_time);
+bool neutrino_sync();
+bool neutrino_shutdown();
 
 #ifdef __cplusplus
 }

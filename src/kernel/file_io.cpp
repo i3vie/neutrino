@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "drivers/log/logging.hpp"
+#include "drivers/fs/block_cache.hpp"
 #include "fs/vfs.hpp"
 #include "lib/mem.hpp"
 #include "path_util.hpp"
@@ -169,6 +170,14 @@ bool close_file(process::Process& proc, uint32_t handle) {
     entry->handle = {};
     entry->position = 0;
     return true;
+}
+
+bool sync_file(process::Process& proc, uint32_t handle) {
+    process::FileHandle* entry = get_file_handle(proc, handle);
+    if (entry == nullptr) {
+        return false;
+    }
+    return fs::block_cache::flush_all();
 }
 
 int64_t read_file(process::Process& proc, uint32_t handle, uint64_t user_addr,

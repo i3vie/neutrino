@@ -171,3 +171,11 @@ extern "C" void neutrino_write_line(long console, const char* text) {
 extern "C" bool neutrino_get_time(NeutrinoWallTime* out_time) {
     return time_get(out_time) == 0;
 }
+
+extern "C" bool neutrino_sync() {
+    return system_sync() == 0;
+}
+
+extern "C" bool neutrino_shutdown() {
+    return system_shutdown() == 0;
+}

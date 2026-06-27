@@ -1,6 +1,7 @@
 #include "arch/x86_64/syscall_table.hpp"
 
 #include "../../drivers/log/logging.hpp"
+#include "../../drivers/fs/block_cache.hpp"
 #include "../../drivers/fs/mount_manager.hpp"
 #include "../../kernel/descriptor.hpp"
 #include "../../kernel/capabilities.hpp"
@@ -660,6 +661,41 @@ Result handle_syscall(SyscallFrame& frame) {
                 file_io::close_file(*proc, static_cast<uint32_t>(frame.rdi));
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
+        }
+        case SystemCall::FileSync: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool ok =
+                file_io::sync_file(*proc, static_cast<uint32_t>(frame.rdi));
+            frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::Sync: {
+            bool ok = fs::block_cache::flush_all();
+            frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
+        case SystemCall::Shutdown: {
+            process::Process* proc = process::current();
+            if (proc != nullptr &&
+                !require_capability(*proc,
+                                    capabilities::CapabilityKind::SysSettingsWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            bool ok = fs::block_cache::flush_all();
+            log_message(ok ? LogLevel::Info : LogLevel::Error,
+                        ok ? "Shutdown: block cache flushed"
+                           : "Shutdown: block cache flush failed");
+            log_message(LogLevel::Info, "Shutdown: halted");
+            asm volatile("cli");
+            for (;;) {
+                asm volatile("hlt");
+            }
         }
         case SystemCall::FileRead: {
             process::Process* proc = process::current();

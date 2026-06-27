@@ -57,6 +57,9 @@ enum class SystemCall : long {
     UserBumpGeneration   = 47,
     UserSetPassword      = 48,
     UserInfo             = 49,
+    FileSync             = 50,
+    Sync                 = 51,
+    Shutdown             = 52,
 };
 
 enum : uint32_t {
@@ -678,6 +681,19 @@ static inline long file_open(const char* path) {
 static inline long file_close(uint32_t handle) {
     return raw_syscall1(SystemCall::FileClose,
                         static_cast<long>(handle));
+}
+
+static inline long file_sync(uint32_t handle) {
+    return raw_syscall1(SystemCall::FileSync,
+                        static_cast<long>(handle));
+}
+
+static inline long system_sync() {
+    return raw_syscall0(SystemCall::Sync);
+}
+
+static inline long system_shutdown() {
+    return raw_syscall0(SystemCall::Shutdown);
 }
 
 static inline long file_read(uint32_t handle,

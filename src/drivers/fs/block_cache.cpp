@@ -147,7 +147,7 @@ bool flush_one_dirty() {
         break;
     }
     unlock();
-    return true;
+    return status == BlockIoStatus::Ok;
 }
 
 CacheEntry* find_or_prepare_entry_locked(CachedDevice& cached,
@@ -315,10 +315,29 @@ void service_idle_flush() {
     }
 }
 
+bool flush_all() {
+    for (;;) {
+        bool has_dirty = false;
+        lock();
+        for (auto& entry : g_entries) {
+            if (entry.valid && entry.dirty && !entry.flushing) {
+                has_dirty = true;
+                break;
+            }
+        }
+        unlock();
+        if (!has_dirty) {
+            return true;
+        }
+        if (!flush_one_dirty()) {
+            return false;
+        }
+    }
+}
+
 void set_enabled(bool enabled) {
     if (!enabled) {
-        while (flush_one_dirty()) {
-        }
+        (void)flush_all();
     }
     LockGuard guard;
     g_enabled = enabled;

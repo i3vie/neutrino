@@ -7,6 +7,7 @@ namespace block_cache {
 
 void init();
 void service_idle_flush();
+bool flush_all();
 void set_enabled(bool enabled);
 bool enabled();
 

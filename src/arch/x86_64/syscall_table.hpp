@@ -57,6 +57,9 @@ enum class SystemCall : uint64_t {
     UserBumpGeneration   = 47,
     UserSetPassword      = 48,
     UserInfo             = 49,
+    FileSync             = 50,
+    Sync                 = 51,
+    Shutdown             = 52,
 };
 
 Result handle_syscall(SyscallFrame& frame);
