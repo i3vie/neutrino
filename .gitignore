@@ -4,6 +4,7 @@ out/
 build/
 userspace/programs/**/**.elf
 userspace/binary/
+userspace/include/
 userspace/lib/
 userspace/library/
 userspace/deps/
