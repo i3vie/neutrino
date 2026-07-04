@@ -160,22 +160,30 @@ static bool ends_with(const char* text, const char* suffix) {
 }
 
 static bool default_root_from_rootfs_module(char (&root_spec)[kMaxSpecLen]) {
-    const volatile struct limine_module_response* response =
-        module_request.response;
-    if (response == nullptr || response->modules == nullptr) {
+    size_t module_count = preserved_limine_module_count();
+    if (module_count == 0) {
+        log_message(LogLevel::Warn,
+                    "boot: no Limine modules available for live root lookup");
         return false;
     }
-    for (uint64_t i = 0; i < response->module_count; ++i) {
-        volatile struct limine_file* file = response->modules[i];
-        if (file == nullptr) {
+    size_t fallback_index = module_count;
+    for (size_t i = 0; i < module_count; ++i) {
+        const PreservedLimineModule* module = preserved_limine_module(i);
+        if (module == nullptr) {
             continue;
         }
-#if LIMINE_API_REVISION >= 3
-        const char* module_string = file->string;
-#else
-        const char* module_string = file->cmdline;
-#endif
-        const char* module_path = file->path;
+        if (fallback_index == module_count &&
+            module->address != nullptr && module->size != 0) {
+            fallback_index = i;
+        }
+        const char* module_string = module->string;
+        const char* module_path = module->path;
+        log_message(LogLevel::Info,
+                    "boot: module %zu path=%s string=%s size=%llu",
+                    i,
+                    module_path != nullptr ? module_path : "(null)",
+                    module_string != nullptr ? module_string : "(null)",
+                    static_cast<unsigned long long>(module->size));
         bool is_rootfs_module =
             (module_string != nullptr &&
              string_util::equals(module_string, "rootfs")) ||
@@ -193,6 +201,32 @@ static bool default_root_from_rootfs_module(char (&root_spec)[kMaxSpecLen]) {
             root_spec[index++] = prefix[j];
         }
         if (!append_decimal(root_spec, kMaxSpecLen, index, static_cast<size_t>(i))) {
+            return false;
+        }
+        if (index + 3 >= kMaxSpecLen) {
+            return false;
+        }
+        root_spec[index++] = '_';
+        root_spec[index++] = '0';
+        root_spec[index] = '\0';
+        return true;
+    }
+    if (fallback_index < module_count) {
+        log_message(LogLevel::Warn,
+                    "boot: rootfs module not labelled, falling back to module %zu",
+                    fallback_index);
+        const char prefix[] = "MEMDISK_";
+        size_t index = 0;
+        for (size_t j = 0; prefix[j] != '\0'; ++j) {
+            if (index + 1 >= kMaxSpecLen) {
+                return false;
+            }
+            root_spec[index++] = prefix[j];
+        }
+        if (!append_decimal(root_spec,
+                            kMaxSpecLen,
+                            index,
+                            static_cast<size_t>(fallback_index))) {
             return false;
         }
         if (index + 3 >= kMaxSpecLen) {
@@ -250,6 +284,7 @@ static void kernel_main_stage2() {
     if (early_cmdline != nullptr) {
         string_util::copy(boot_cmdline, sizeof(boot_cmdline), early_cmdline);
     }
+    preserve_limine_modules();
 
     auto fb = *framebuffer_request.response->framebuffers[0];
     uint8_t* fb_virtual = static_cast<uint8_t*>(fb.address);
@@ -373,8 +408,13 @@ static void kernel_main_stage2() {
                 (unsigned long long)kernel_addr_request.response->virtual_base);
     log_message(
         LogLevel::Debug, "Kernel size: %u KB (%x)",
+#if LIMINE_API_REVISION >= 2
+        (unsigned int)(kernel_file_request.response->executable_file->size / 1024),
+        (unsigned int)kernel_file_request.response->executable_file->size);
+#else
         (unsigned int)(kernel_file_request.response->kernel_file->size / 1024),
         (unsigned int)kernel_file_request.response->kernel_file->size);
+#endif
 
     log_message(LogLevel::Debug, "HHDM offset: %016x",
                 (unsigned long long)hhdm_request.response->offset);

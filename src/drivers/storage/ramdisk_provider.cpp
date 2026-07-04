@@ -193,16 +193,6 @@ fs::BlockIoStatus ramdisk_read(void* context,
     return fs::BlockIoStatus::Ok;
 }
 
-fs::BlockIoStatus ramdisk_write(void* context,
-                                uint32_t,
-                                uint8_t,
-                                const void*) {
-    if (context == nullptr) {
-        return fs::BlockIoStatus::NoDevice;
-    }
-    return fs::BlockIoStatus::IoError;
-}
-
 const uint8_t* module_data_pointer(uintptr_t module_address) {
     if (module_address == 0) {
         return nullptr;
@@ -220,33 +210,18 @@ const uint8_t* module_data_pointer(uintptr_t module_address) {
     return reinterpret_cast<const uint8_t*>(module_address);
 }
 
-const char* module_label(const volatile struct limine_file* file) {
-    if (file == nullptr) {
+const char* module_label(const PreservedLimineModule* module) {
+    if (module == nullptr) {
         return "(null)";
     }
 
-    if (file->path != nullptr) {
-        const char* path = reinterpret_cast<const char*>(file->path);
-        if (path[0] != '\0') {
-            return path;
-        }
+    if (module->path != nullptr && module->path[0] != '\0') {
+        return module->path;
     }
 
-#if LIMINE_API_REVISION >= 3
-    if (file->string != nullptr) {
-        const char* str = reinterpret_cast<const char*>(file->string);
-        if (str[0] != '\0') {
-            return str;
-        }
+    if (module->string != nullptr && module->string[0] != '\0') {
+        return module->string;
     }
-#else
-    if (file->cmdline != nullptr) {
-        const char* cmd = reinterpret_cast<const char*>(file->cmdline);
-        if (cmd[0] != '\0') {
-            return cmd;
-        }
-    }
-#endif
 
     return "(unnamed module)";
 }
@@ -256,41 +231,39 @@ size_t enumerate_ramdisks(fs::BlockDevice* out_devices, size_t max_devices) {
         return 0;
     }
 
-    const volatile struct limine_module_response* response =
-        module_request.response;
-    if (response == nullptr || response->module_count == 0 ||
-        response->modules == nullptr) {
+    size_t module_count = preserved_limine_module_count();
+    if (module_count == 0) {
         return 0;
     }
 
     size_t device_count = 0;
-    uint64_t module_count = response->module_count;
 
-    for (uint64_t module_index = 0; module_index < module_count; ++module_index) {
+    for (size_t module_index = 0; module_index < module_count; ++module_index) {
         if (device_count >= max_devices) {
             break;
         }
 
-        volatile struct limine_file* file = response->modules[module_index];
-        if (file == nullptr || file->address == nullptr || file->size == 0) {
+        const PreservedLimineModule* module =
+            preserved_limine_module(module_index);
+        if (module == nullptr || module->address == nullptr || module->size == 0) {
             continue;
         }
 
-        uintptr_t module_address = reinterpret_cast<uintptr_t>(file->address);
+        uintptr_t module_address = reinterpret_cast<uintptr_t>(module->address);
         const uint8_t* module_base = module_data_pointer(module_address);
         if (module_base == nullptr) {
             log_message(LogLevel::Warn,
-                        "Ramdisk: module %llu (%s) not accessible",
-                        static_cast<unsigned long long>(module_index),
-                        module_label(file));
+                        "Ramdisk: module %zu (%s) not accessible",
+                        module_index,
+                        module_label(module));
             continue;
         }
 
-        uint64_t total_bytes = file->size;
+        uint64_t total_bytes = module->size;
         if (total_bytes < kSectorSize) {
             log_message(LogLevel::Warn,
                         "Ramdisk: module %s smaller than one sector",
-                        module_label(file));
+                        module_label(module));
             continue;
         }
 
@@ -342,11 +315,11 @@ size_t enumerate_ramdisks(fs::BlockDevice* out_devices, size_t max_devices) {
                 use_entire_disk ? 0 : part.ordinal;
             if (!format_memdisk_name(name_buffer,
                                      kMaxNameLen,
-                                     static_cast<size_t>(module_index),
+                                     module_index,
                                      logical_partition)) {
                 log_message(LogLevel::Warn,
-                            "Ramdisk: failed to format name for module %llu part %zu",
-                            static_cast<unsigned long long>(module_index),
+                            "Ramdisk: failed to format name for module %zu part %zu",
+                            module_index,
                             logical_partition);
                 continue;
             }
@@ -356,14 +329,19 @@ size_t enumerate_ramdisks(fs::BlockDevice* out_devices, size_t max_devices) {
             device.sector_size = kSectorSize;
             device.sector_count = sectors;
             device.read = ramdisk_read;
-            device.write = ramdisk_write;
+            device.write = nullptr;
             device.context = &context;
 
             log_message(LogLevel::Info,
-                        "Ramdisk: registered %s (%s, %llu sectors)",
+                        "Ramdisk: registered %s (%s, start=%llu sectors=%llu bpb=%02x%02x sig=%02x%02x)",
                         device.name,
-                        module_label(file),
-                        static_cast<unsigned long long>(sectors));
+                        module_label(module),
+                        static_cast<unsigned long long>(start_sector),
+                        static_cast<unsigned long long>(sectors),
+                        static_cast<unsigned int>(partition_base[11]),
+                        static_cast<unsigned int>(partition_base[12]),
+                        static_cast<unsigned int>(partition_base[510]),
+                        static_cast<unsigned int>(partition_base[511]));
 
             ++device_count;
         }
