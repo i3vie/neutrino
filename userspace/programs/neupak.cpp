@@ -23,6 +23,7 @@ constexpr size_t kMaxDeps = 16;
 constexpr size_t kMaxFiles = 256;
 constexpr size_t kMaxInstallQueue = 96;
 constexpr size_t kCopyBufferSize = 4096;
+constexpr uint64_t kLockStaleSeconds = 30ull;
 
 constexpr const char* kSysrootPrefix = "...";
 constexpr const char* kConfigDir = ".../config/neupak";
@@ -38,6 +39,7 @@ constexpr const char* kLockPath = ".../config/neupak/db.lck";
 constexpr const char* kDownloadPath = ".../binary/download.elf";
 
 long g_console = -1;
+long g_lock = -1;
 uint8_t g_copy_buffer[kCopyBufferSize];
 
 struct StringList {
@@ -146,6 +148,21 @@ void print_u64(uint64_t value) {
         char ch = digits[--count];
         descriptor_write(static_cast<uint32_t>(g_console), &ch, 1);
     }
+}
+
+bool append_u64(char* out, size_t out_size, size_t& len, uint64_t value) {
+    char digits[24];
+    size_t count = 0;
+    do {
+        digits[count++] = static_cast<char>('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && count < sizeof(digits));
+    while (count != 0) {
+        if (!userspace::text::append_char(out, out_size, len, digits[--count])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool sysroot_path_for_logical(const char* logical_path, char* out, size_t out_size) {
@@ -1230,18 +1247,131 @@ bool write_files_db(const FilesDb& db) {
     return ok;
 }
 
-bool acquire_lock() {
-    long lock = file_create(kLockPath);
-    if (lock < 0) {
-        print_line("neupak: package database is locked");
+void release_lock();
+
+bool current_time_seconds(uint64_t& out) {
+    NeutrinoWallTime now{};
+    if (!neutrino_get_time(&now)) {
         return false;
     }
-    file_close(static_cast<uint32_t>(lock));
+    out = now.unix_seconds;
     return true;
 }
 
+bool write_lock_metadata(uint32_t lock) {
+    uint64_t now = 0;
+    bool has_time = current_time_seconds(now);
+
+    char text[80];
+    size_t len = 0;
+    text[0] = '\0';
+    if (!userspace::text::append_text(text, sizeof(text), len, "neupak lock\nstarted=")) {
+        return false;
+    }
+    if (has_time) {
+        if (!append_u64(text, sizeof(text), len, now)) {
+            return false;
+        }
+    } else if (!userspace::text::append_text(text, sizeof(text), len, "unknown")) {
+        return false;
+    }
+    if (!userspace::text::append_char(text, sizeof(text), len, '\n') ||
+        !userspace::text::append_char(text, sizeof(text), len, '\n')) {
+        return false;
+    }
+    return file_write(lock, text, len) == static_cast<long>(len) &&
+           file_sync(lock) == 0;
+}
+
+bool read_lock_started(uint64_t& started, bool& legacy_empty) {
+    started = 0;
+    legacy_empty = false;
+
+    long file = file_open(kLockPath);
+    if (file < 0) {
+        return false;
+    }
+
+    char text[96];
+    long got = file_read(static_cast<uint32_t>(file), text, sizeof(text) - 1);
+    file_close(static_cast<uint32_t>(file));
+    if (got < 0) {
+        return false;
+    }
+    if (got == 0) {
+        legacy_empty = true;
+        return true;
+    }
+    text[static_cast<size_t>(got)] = '\0';
+
+    const char* key = "started=";
+    const char* cursor = text;
+    while (*cursor != '\0') {
+        if (strncmp(cursor, key, strlen(key)) == 0) {
+            return parse_u64(cursor + strlen(key), started);
+        }
+        while (*cursor != '\0' && *cursor != '\n') {
+            ++cursor;
+        }
+        if (*cursor == '\n') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+bool lock_is_stale() {
+    uint64_t started = 0;
+    bool legacy_empty = false;
+    if (!read_lock_started(started, legacy_empty)) {
+        return false;
+    }
+    if (legacy_empty) {
+        return true;
+    }
+
+    uint64_t now = 0;
+    if (!current_time_seconds(now)) {
+        return false;
+    }
+    return started > now || now - started >= kLockStaleSeconds;
+}
+
+bool acquire_lock() {
+    for (size_t attempt = 0; attempt < 2; ++attempt) {
+        long lock = file_create(kLockPath);
+        if (lock >= 0) {
+            g_lock = lock;
+            if (!write_lock_metadata(static_cast<uint32_t>(g_lock))) {
+                release_lock();
+                print_line("neupak: failed to write package database lock");
+                return false;
+            }
+            return true;
+        }
+
+        if (attempt == 0 && lock_is_stale()) {
+            print_line("neupak: removing stale package database lock");
+            file_remove(kLockPath);
+            system_sync();
+            continue;
+        }
+        break;
+    }
+
+    print_line("neupak: package database is locked");
+    return false;
+}
+
 void release_lock() {
-    file_remove(kLockPath);
+    if (g_lock >= 0) {
+        file_sync(static_cast<uint32_t>(g_lock));
+        file_close(static_cast<uint32_t>(g_lock));
+        g_lock = -1;
+    }
+    if (file_remove(kLockPath) == 0) {
+        system_sync();
+    }
 }
 
 bool hex_digit(char ch, uint8_t& value) {
@@ -1628,17 +1758,23 @@ bool temp_payload_path(const char* package, const char* final_path, char* out, s
 
 bool copy_entry_data_to_path(uint32_t zip, const ZipEntry& entry, const char* path) {
     if (!ensure_parent_dir(path)) {
+        print("neupak: unable to create temp parent for ");
+        print_line(path);
         return false;
     }
     long existing = file_open(path);
     if (existing >= 0) {
         file_close(static_cast<uint32_t>(existing));
         if (file_remove(path) < 0) {
+            print("neupak: unable to replace temp file ");
+            print_line(path);
             return false;
         }
     }
     long out = file_create(path);
     if (out < 0) {
+        print("neupak: unable to create temp file ");
+        print_line(path);
         return false;
     }
     uint32_t remaining = entry.uncompressed_size;
@@ -1648,6 +1784,8 @@ bool copy_entry_data_to_path(uint32_t zip, const ZipEntry& entry, const char* pa
         if (!read_exact(zip, g_copy_buffer, want) ||
             !write_all(static_cast<uint32_t>(out), g_copy_buffer, want)) {
             file_close(static_cast<uint32_t>(out));
+            print("neupak: unable to write temp file ");
+            print_line(path);
             return false;
         }
         remaining -= static_cast<uint32_t>(want);
@@ -1714,11 +1852,15 @@ bool extract_zip_to_temp(const char* path, const char* package) {
         }
         char temp_path[kMaxPath];
         if (!temp_payload_path(package, entry.final_path, temp_path, sizeof(temp_path))) {
+            print("neupak: temp path too long for ");
+            print_line(entry.final_path);
             file_close(static_cast<uint32_t>(file));
             return false;
         }
         if (entry.is_dir) {
             if (!ensure_dir_tree(temp_path)) {
+                print("neupak: unable to create temp dir ");
+                print_line(temp_path);
                 file_close(static_cast<uint32_t>(file));
                 return false;
             }
