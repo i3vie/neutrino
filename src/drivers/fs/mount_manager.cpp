@@ -139,13 +139,14 @@ bool mount_requested_filesystems(const char* root_spec,
         device_count += added;
         for (size_t j = 0; j < added; ++j) {
             log_message(LogLevel::Info,
-                        "MountManager: discovered block device %s type=%02x start=%llu sectors=%llu",
+                        "MountManager: discovered block device %s type=%02x start=%llu sectors=%llu sector_size=%zu",
                         discovered[start_index + j].name != nullptr
                             ? discovered[start_index + j].name
                             : "(unnamed)",
                         static_cast<unsigned int>(discovered[start_index + j].partition_type),
                         static_cast<unsigned long long>(discovered[start_index + j].start_lba),
-                        static_cast<unsigned long long>(discovered[start_index + j].sector_count));
+                        static_cast<unsigned long long>(discovered[start_index + j].sector_count),
+                        discovered[start_index + j].sector_size);
             // Allow user processes (e.g., installer) to access block devices,
             // so do not lock them to kernel-only.
             if (!descriptor::register_block_device(discovered[start_index + j], false)) {

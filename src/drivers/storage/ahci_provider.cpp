@@ -10,8 +10,8 @@ namespace {
 struct PartitionInfo {
     uint8_t type;
     uint8_t ordinal;
-    uint32_t start_lba;
-    uint32_t sector_count;
+    uint64_t start_lba;
+    uint64_t sector_count;
 };
 
 struct AhciPartitionContext {
@@ -34,6 +34,29 @@ uint32_t read_u32_le(const uint8_t* data) {
            (static_cast<uint32_t>(data[1]) << 8) |
            (static_cast<uint32_t>(data[2]) << 16) |
            (static_cast<uint32_t>(data[3]) << 24);
+}
+
+uint64_t read_u64_le(const uint8_t* data) {
+    return static_cast<uint64_t>(data[0]) |
+           (static_cast<uint64_t>(data[1]) << 8) |
+           (static_cast<uint64_t>(data[2]) << 16) |
+           (static_cast<uint64_t>(data[3]) << 24) |
+           (static_cast<uint64_t>(data[4]) << 32) |
+           (static_cast<uint64_t>(data[5]) << 40) |
+           (static_cast<uint64_t>(data[6]) << 48) |
+           (static_cast<uint64_t>(data[7]) << 56);
+}
+
+bool guid_is_zero(const uint8_t* guid) {
+    if (guid == nullptr) {
+        return true;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        if (guid[i] != 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 size_t copy_string(char* dest, size_t dest_size, const char* src) {
@@ -115,9 +138,9 @@ fs::BlockIoStatus ahci_partition_write(void* context,
     }
 }
 
-size_t scan_partitions(size_t device_index,
-                       PartitionInfo* partitions,
-                       size_t max_partitions) {
+size_t scan_mbr_partitions(size_t device_index,
+                           PartitionInfo* partitions,
+                           size_t max_partitions) {
     if (partitions == nullptr || max_partitions == 0) {
         return 0;
     }
@@ -139,8 +162,8 @@ size_t scan_partitions(size_t device_index,
     for (size_t entry = 0; entry < 4; ++entry) {
         const uint8_t* record = g_partition_buffer + 446 + (entry * 16);
         uint8_t type = record[4];
-        uint32_t start_lba = read_u32_le(record + 8);
-        uint32_t sectors = read_u32_le(record + 12);
+        uint64_t start_lba = read_u32_le(record + 8);
+        uint64_t sectors = read_u32_le(record + 12);
 
         if (type == 0 || sectors == 0) {
             continue;
@@ -153,6 +176,86 @@ size_t scan_partitions(size_t device_index,
                                sectors};
     }
     return count;
+}
+
+size_t scan_gpt_partitions(size_t device_index,
+                           uint64_t disk_sectors,
+                           PartitionInfo* partitions,
+                           size_t max_partitions) {
+    if (partitions == nullptr || max_partitions == 0 || disk_sectors < 64) {
+        return 0;
+    }
+
+    ahci::Status status =
+        ahci::read_sectors(device_index, 1, 1, g_partition_buffer);
+    if (status != ahci::Status::Ok) {
+        return 0;
+    }
+
+    const uint8_t kGptMagic[8] = {'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'};
+    for (size_t i = 0; i < sizeof(kGptMagic); ++i) {
+        if (g_partition_buffer[i] != kGptMagic[i]) {
+            return 0;
+        }
+    }
+
+    uint64_t entries_lba = read_u64_le(g_partition_buffer + 72);
+    uint32_t entry_count = read_u32_le(g_partition_buffer + 80);
+    uint32_t entry_size = read_u32_le(g_partition_buffer + 84);
+    if (entries_lba == 0 || entry_count == 0 || entry_size < 128 ||
+        entry_size > 512) {
+        return 0;
+    }
+
+    size_t count = 0;
+    uint8_t entry_sector[512];
+    for (uint32_t entry = 0;
+         entry < entry_count && count < max_partitions;
+         ++entry) {
+        uint64_t byte_offset = static_cast<uint64_t>(entry) * entry_size;
+        uint64_t lba = entries_lba + (byte_offset / 512);
+        size_t in_sector = static_cast<size_t>(byte_offset % 512);
+        if (in_sector + entry_size > 512 || lba >= disk_sectors) {
+            continue;
+        }
+
+        status = ahci::read_sectors(device_index, lba, 1, entry_sector);
+        if (status != ahci::Status::Ok) {
+            return count;
+        }
+
+        const uint8_t* record = entry_sector + in_sector;
+        if (guid_is_zero(record)) {
+            continue;
+        }
+
+        uint64_t first_lba = read_u64_le(record + 32);
+        uint64_t last_lba = read_u64_le(record + 40);
+        if (first_lba == 0 || last_lba < first_lba ||
+            last_lba >= disk_sectors) {
+            continue;
+        }
+
+        partitions[count++] = {
+            0xEE,
+            static_cast<uint8_t>(entry),
+            first_lba,
+            last_lba - first_lba + 1,
+        };
+    }
+    return count;
+}
+
+size_t scan_partitions(size_t device_index,
+                       uint64_t disk_sectors,
+                       PartitionInfo* partitions,
+                       size_t max_partitions) {
+    size_t gpt_count =
+        scan_gpt_partitions(device_index, disk_sectors, partitions, max_partitions);
+    if (gpt_count != 0) {
+        return gpt_count;
+    }
+    return scan_mbr_partitions(device_index, partitions, max_partitions);
 }
 
 size_t enumerate_ahci_devices(fs::BlockDevice* out_devices, size_t max_devices) {
@@ -193,8 +296,10 @@ size_t enumerate_ahci_devices(fs::BlockDevice* out_devices, size_t max_devices) 
         ++exported_count;
 
         PartitionInfo partitions[kMaxPartitionsPerDevice]{};
-        size_t partition_count =
-            scan_partitions(device_index, partitions, kMaxPartitionsPerDevice);
+        size_t partition_count = scan_partitions(device_index,
+                                                 identify.sector_count,
+                                                 partitions,
+                                                 kMaxPartitionsPerDevice);
 
         if (partition_count == 0) {
             log_message(LogLevel::Info,

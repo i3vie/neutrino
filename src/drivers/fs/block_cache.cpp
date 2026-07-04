@@ -102,13 +102,43 @@ CacheEntry* choose_clean_victim() {
     return oldest;
 }
 
-bool flush_one_dirty() {
+bool flush_dirty_entry(CacheEntry* target) {
     CachedDevice* owner = nullptr;
     uint32_t lba = 0;
     uint64_t generation = 0;
     size_t sector_size = 0;
     alignas(512) uint8_t sector_buffer[kCacheSectorSize];
 
+    lock();
+    if (target == nullptr || !target->valid || !target->dirty ||
+        target->flushing) {
+        unlock();
+        return true;
+    }
+
+    owner = target->owner;
+    lba = target->lba;
+    generation = target->generation;
+    sector_size = target->sector_size;
+    target->flushing = true;
+    memcpy(sector_buffer, target->data, sector_size);
+    unlock();
+
+    BlockIoStatus status = write_uncached(*owner, lba, 1, sector_buffer);
+
+    lock();
+    if (target->valid && target->owner == owner && target->lba == lba &&
+        target->generation == generation) {
+        target->flushing = false;
+        if (status == BlockIoStatus::Ok) {
+            target->dirty = false;
+        }
+    }
+    unlock();
+    return status == BlockIoStatus::Ok;
+}
+
+bool flush_one_dirty() {
     lock();
     CacheEntry* entry = nullptr;
     for (auto& candidate : g_entries) {
@@ -119,35 +149,12 @@ bool flush_one_dirty() {
             entry = &candidate;
         }
     }
+    unlock();
+
     if (entry == nullptr) {
-        unlock();
         return false;
     }
-
-    owner = entry->owner;
-    lba = entry->lba;
-    generation = entry->generation;
-    sector_size = entry->sector_size;
-    entry->flushing = true;
-    memcpy(sector_buffer, entry->data, sector_size);
-    unlock();
-
-    BlockIoStatus status = write_uncached(*owner, lba, 1, sector_buffer);
-
-    lock();
-    for (auto& candidate : g_entries) {
-        if (!candidate.valid || candidate.owner != owner ||
-            candidate.lba != lba || candidate.generation != generation) {
-            continue;
-        }
-        candidate.flushing = false;
-        if (status == BlockIoStatus::Ok) {
-            candidate.dirty = false;
-        }
-        break;
-    }
-    unlock();
-    return status == BlockIoStatus::Ok;
+    return flush_dirty_entry(entry);
 }
 
 CacheEntry* find_or_prepare_entry_locked(CachedDevice& cached,
@@ -318,18 +325,29 @@ void service_idle_flush() {
 bool flush_all() {
     for (;;) {
         bool has_dirty = false;
-        lock();
+        bool flushed_any = false;
+        bool failed_any = false;
+
         for (auto& entry : g_entries) {
-            if (entry.valid && entry.dirty && !entry.flushing) {
-                has_dirty = true;
-                break;
+            lock();
+            bool dirty = entry.valid && entry.dirty && !entry.flushing;
+            unlock();
+            if (!dirty) {
+                continue;
+            }
+
+            has_dirty = true;
+            if (flush_dirty_entry(&entry)) {
+                flushed_any = true;
+            } else {
+                failed_any = true;
             }
         }
-        unlock();
+
         if (!has_dirty) {
             return true;
         }
-        if (!flush_one_dirty()) {
+        if (failed_any && !flushed_any) {
             return false;
         }
     }
@@ -363,7 +381,7 @@ bool wrap_device(const BlockDevice& backing, BlockDevice& out_device) {
         device.in_use = true;
 
         out_device.read = cached_read;
-        out_device.write = cached_write;
+        out_device.write = backing.write != nullptr ? cached_write : nullptr;
         out_device.context = &device;
         out_device.descriptor_handle = descriptor::kInvalidHandle;
         return true;

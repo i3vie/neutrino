@@ -1354,6 +1354,105 @@ bool copy_file_path(const char* source,
     return ok;
 }
 
+bool write_all(uint32_t file, const char* text) {
+    if (text == nullptr) {
+        return true;
+    }
+    size_t len = strlen(text);
+    size_t written = 0;
+    while (written < len) {
+        long w = file_write(file, text + written, len - written);
+        if (w <= 0) {
+            return false;
+        }
+        written += static_cast<size_t>(w);
+    }
+    return true;
+}
+
+bool write_config_chunk(uint32_t file,
+                        const char* text,
+                        const char* label,
+                        long console) {
+    if (write_all(file, text)) {
+        return true;
+    }
+    userspace::write(console, "failed to write installed ESP config ");
+    userspace::write_line(console, label);
+    return false;
+}
+
+bool write_installed_esp_config(const char* esp_name,
+                                const char* root_name,
+                                long console) {
+    if (esp_name == nullptr || root_name == nullptr) {
+        return false;
+    }
+
+    long esp = descriptor_open(
+        kDescBlock,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(esp_name)),
+        0,
+        0);
+    if (esp < 0) {
+        userspace::write_line(console, "failed to open installed ESP");
+        return false;
+    }
+    bool mounted = mount_descriptor(static_cast<uint32_t>(esp), nullptr) == 0;
+    descriptor_close(static_cast<uint32_t>(esp));
+    if (!mounted) {
+        userspace::write_line(console, "failed to mount installed ESP");
+        return false;
+    }
+
+    char config_path[96];
+    config_path[0] = '/';
+    config_path[1] = '\0';
+    strlcpy(config_path + 1, esp_name, sizeof(config_path) - 1);
+    size_t len = strlen(config_path);
+    if (len + strlen("/limine.conf") + 1 >= sizeof(config_path)) {
+        userspace::write_line(console, "installed ESP config path too long");
+        return false;
+    }
+    strlcpy(config_path + len, "/limine.conf", sizeof(config_path) - len);
+
+    long config = file_open(config_path);
+    if (config < 0) {
+        strlcpy(config_path + len, "/LIMINE.CNF", sizeof(config_path) - len);
+        config = file_open(config_path);
+    }
+    if (config < 0) {
+        file_remove(config_path);
+        config = file_create(config_path);
+    }
+    if (config < 0) {
+        userspace::write_line(console, "failed to create installed ESP config");
+        return false;
+    }
+
+    uint32_t config_handle = static_cast<uint32_t>(config);
+    bool ok =
+        write_config_chunk(config_handle, "timeout: 1\n\n", "timeout", console) &&
+        write_config_chunk(config_handle, "/Neutrino\n", "entry", console) &&
+        write_config_chunk(config_handle, "    protocol: limine\n", "protocol", console) &&
+        write_config_chunk(config_handle,
+                           "    path: boot():/boot/kernel.elf\n",
+                           "kernel path",
+                           console) &&
+        write_config_chunk(config_handle, "    cmdline: ROOT=", "cmdline", console) &&
+        write_config_chunk(config_handle, root_name, "root device", console) &&
+        write_config_chunk(config_handle, "\n", "newline", console);
+    if (ok && file_sync(config_handle) != 0) {
+        userspace::write_line(console,
+                              "warning: installed ESP config sync reported an error");
+    }
+    file_close(config_handle);
+    if (!ok) {
+        return false;
+    }
+    return true;
+}
+
 bool copy_tree(const char* source_dir,
                const char* dest_dir,
                long console,
@@ -1422,8 +1521,10 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     userspace::write(console, "Target: ");
     userspace::write_line(console, dst.name);
 
+    char esp_name[64];
     char root_name[64];
     if (is_partition_device_name(dst.name) ||
+        !append_partition_suffix(dst.name, 0, esp_name, sizeof(esp_name)) ||
         !append_partition_suffix(dst.name, 1, root_name, sizeof(root_name))) {
         userspace::write_line(console, "target name is not a whole-disk install target");
         return false;
@@ -1506,6 +1607,9 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
 
     if (rescan_block_devices() != 0) {
         userspace::write_line(console, "failed to rescan GPT partitions");
+        return false;
+    }
+    if (!write_installed_esp_config(esp_name, root_name, console)) {
         return false;
     }
 

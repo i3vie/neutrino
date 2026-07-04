@@ -12,6 +12,8 @@ SRC_DIR    := src
 
 TARGET_ELF := $(OUT_DIR)/kernel.elf
 TARGET_ISO := $(OUT_DIR)/neutrino.iso
+TARGET_DISK_IMG ?= hdd.img
+TARGET_DISK_SIZE ?= 4G
 
 CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
@@ -22,8 +24,9 @@ QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
 QEMU_NET_DEVICE ?= virtio-net-pci
-QEMU_STORAGE ?= ide
-QEMU_PRIMARY_IMG ?= hdd.img
+QEMU_STORAGE ?= ahci
+QEMU_PRIMARY_IMG ?= $(TARGET_DISK_IMG)
+QEMU_PRIMARY_IMG := $(if $(strip $(QEMU_PRIMARY_IMG)),$(QEMU_PRIMARY_IMG),$(TARGET_DISK_IMG))
 QEMU_EXTRA_IDE_IMG ?=
 QEMU_EXTRA_AHCI_IMG ?=
 QEMU_XHCI ?= 0
@@ -31,6 +34,8 @@ QEMU_USB_STORAGE_IMG ?=
 QEMU_HDA ?= 1
 QEMU_AUDIO_DRIVER ?= sdl
 QEMU_HOSTFWD ?= tcp::2222-:2222
+QEMU_LIVE_BOOT_ARGS ?= -boot order=d
+QEMU_INSTALLED_BOOT_ARGS ?= -boot order=c
 QEMU_TAP_IFACE ?= tap0
 QEMU_TAP_SCRIPT ?= no
 QEMU_TAP_DOWN_SCRIPT ?= no
@@ -78,7 +83,7 @@ ifeq ($(QEMU_HDA),1)
 QEMU_AUDIO_ARGS := -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 \
 		-device ich9-intel-hda -device hda-output,audiodev=audio0
 endif
-QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
+QEMU_BASE_ARGS := -m 1G -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		$(QEMU_STORAGE_ARGS) \
 		-enable-kvm -display sdl \
@@ -86,17 +91,18 @@ QEMU_COMMON_ARGS := -m 1G -cdrom $(TARGET_ISO) -serial stdio \
 		$(QEMU_USB_ARGS) \
 		$(QEMU_AUDIO_ARGS) \
 		$(QEMU_NET_ARGS)
+QEMU_COMMON_ARGS := $(QEMU_BASE_ARGS) -cdrom $(TARGET_ISO)
+QEMU_INSTALLED_ARGS := $(QEMU_BASE_ARGS)
 QEMU_DEBUG_ARGS := -d int \
 		-monitor unix:./qemu-monitor-socket,server,nowait -no-shutdown -no-reboot
 QEMU_DEBUG_WAIT_ARGS := -s -S
-
-TARGET_DISK_IMG := hdd_target.img
-TARGET_DISK_SIZE ?= 128M
 
 TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
 LIVE_ROOTFS_SIZE ?= 128M
+LIVE_ROOTFS_PROGRAMS ?= init shell neupak installer shutdown dmesg lsdisk mount mkneufs mkpart ls cat cp mv rm mkdir rmdir pwd echo clear touch sync date
+LIVE_ROOTFS_CONFIG_DIR ?= config/live-base
 LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
 LIVE_ESP_SIZE ?= 64M
 
@@ -150,14 +156,9 @@ $(TARGET_ISO): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-esp
 	cp -v $(LIMINE_DIR)/limine-bios.sys $(LIMINE_DIR)/limine-bios-cd.bin $(LIMINE_DIR)/limine-uefi-cd.bin $(ISO_ROOT)/boot/limine/
 	
 	printf 'timeout: 1\n\n' > $(ISO_ROOT)/limine.conf
-	printf '/Neutrino (disk install)\n' >> $(ISO_ROOT)/limine.conf
+	printf '/Neutrino Live\n' >> $(ISO_ROOT)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
-	printf '    cmdline: ROOT=$(QEMU_ROOT_DEVICE)\n\n' >> $(ISO_ROOT)/limine.conf
-	printf '/Neutrino (live ISO)\n' >> $(ISO_ROOT)/limine.conf
-	printf '    protocol: limine\n' >> $(ISO_ROOT)/limine.conf
-	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT)/limine.conf
-	printf '    cmdline: ROOT=MEMDISK_0_0\n' >> $(ISO_ROOT)/limine.conf
 	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT)/limine.conf
 	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT)/limine.conf
 	printf '    module_path: boot():/boot/esp.img\n' >> $(ISO_ROOT)/limine.conf
@@ -188,14 +189,9 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-e
 	cp -v $(LIVE_ESP_IMG) $(ISO_ROOT_RAMFS)/boot/esp.img
 
 	printf 'timeout: 1\n\n' > $(ISO_ROOT_RAMFS)/limine.conf
-	printf '/Neutrino\n' >> $(ISO_ROOT_RAMFS)/limine.conf
+	printf '/Neutrino Live\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf
-	printf '    cmdline: ROOT=$(QEMU_ROOT_DEVICE)\n\n' >> $(ISO_ROOT_RAMFS)/limine.conf
-	printf '/Neutrino (rootfs in memory)\n' >> $(ISO_ROOT_RAMFS)/limine.conf
-	printf '    protocol: limine\n' >> $(ISO_ROOT_RAMFS)/limine.conf
-	printf '    path: boot():/boot/kernel.elf\n' >> $(ISO_ROOT_RAMFS)/limine.conf
-	printf '    cmdline: ROOT=MEMDISK_0_0\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_path: boot():/boot/rootfs.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_cmdline: rootfs\n' >> $(ISO_ROOT_RAMFS)/limine.conf
 	printf '    module_path: boot():/boot/esp.img\n' >> $(ISO_ROOT_RAMFS)/limine.conf
@@ -214,16 +210,27 @@ $(TARGET_ISO_RAMFS): $(TARGET_ELF) $(LIMINE_DIR) $(LIVE_ROOTFS_IMG) force-live-e
 	
 	$(LIMINE_DIR)/limine bios-install $(TARGET_ISO_RAMFS)
 
-run: $(TARGET_ISO)
-	$(QEMU) $(QEMU_COMMON_ARGS)
+run: $(TARGET_ISO) target-disk
+	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_LIVE_BOOT_ARGS)
+
+run-live: run
+
+run-installed: target-disk
+	$(QEMU) $(QEMU_INSTALLED_ARGS) $(QEMU_INSTALLED_BOOT_ARGS)
 
 # === Run but wait for debugger to attach ===
-debug: $(TARGET_ISO)
-	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_DEBUG_ARGS) $(QEMU_DEBUG_WAIT_ARGS)
+debug: $(TARGET_ISO) target-disk
+	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_LIVE_BOOT_ARGS) $(QEMU_DEBUG_ARGS) $(QEMU_DEBUG_WAIT_ARGS)
+
+debug-installed: target-disk
+	$(QEMU) $(QEMU_INSTALLED_ARGS) $(QEMU_INSTALLED_BOOT_ARGS) $(QEMU_DEBUG_ARGS) $(QEMU_DEBUG_WAIT_ARGS)
 
 # === Run with -d int, do not wait for debugger to attach ===
-debug-nostop: $(TARGET_ISO)
-	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_DEBUG_ARGS)
+debug-nostop: $(TARGET_ISO) target-disk
+	$(QEMU) $(QEMU_COMMON_ARGS) $(QEMU_LIVE_BOOT_ARGS) $(QEMU_DEBUG_ARGS)
+
+debug-installed-nostop: target-disk
+	$(QEMU) $(QEMU_INSTALLED_ARGS) $(QEMU_INSTALLED_BOOT_ARGS) $(QEMU_DEBUG_ARGS)
 
 # === Utility targets ===
 iso: $(TARGET_ISO)
@@ -236,8 +243,7 @@ iso-ramfs: $(TARGET_ISO_RAMFS)
 	@echo ISO with RAMFS created at $(TARGET_ISO_RAMFS)
 
 .PHONY: userspace-rootfs
-userspace-rootfs: hdd.img
-	$(MAKE) -C userspace install
+userspace-rootfs: live-rootfs
 
 .PHONY: live-rootfs
 live-rootfs: $(LIVE_ROOTFS_IMG)
@@ -255,7 +261,7 @@ $(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(shell find 
 	rm -f $@
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
 	mkfs.fat -F 32 --mbr=y $@
-	$(MAKE) -C userspace install HDD_IMAGE=$(abspath $@)
+	$(MAKE) -C userspace install-mtools HDD_IMAGE=$(abspath $@) PROGRAMS="$(LIVE_ROOTFS_PROGRAMS)" CONFIG_DIR="$(LIVE_ROOTFS_CONFIG_DIR)"
 
 $(LIVE_ESP_IMG): $(TARGET_ELF) $(LIMINE_DIR)
 	@mkdir -p $(dir $@)
@@ -278,6 +284,5 @@ target-disk: $(TARGET_DISK_IMG)
 
 $(TARGET_DISK_IMG):
 	truncate -s $(TARGET_DISK_SIZE) $(TARGET_DISK_IMG)
-	mkfs.fat -F 32 --mbr=y $(TARGET_DISK_IMG)
 
-.PHONY: all clean iso iso-ramfs run userspace-rootfs live-rootfs live-esp
+.PHONY: all clean iso iso-ramfs run run-live run-installed debug debug-installed debug-nostop debug-installed-nostop userspace-rootfs live-rootfs live-esp

@@ -17,6 +17,7 @@
 #include "../../kernel/string_util.hpp"
 #include "../../kernel/users.hpp"
 #include "arch/x86_64/percpu.hpp"
+#include "arch/x86_64/io.hpp"
 
 namespace syscall {
 
@@ -53,6 +54,34 @@ struct UserInfo {
 static_assert(sizeof(UserInfo) == 72, "UserInfo size mismatch");
 
 constexpr uint64_t kProcessChildFlagStdioConfig = 1ull << 0;
+
+[[noreturn]] void halt_forever() {
+    asm volatile("cli");
+    for (;;) {
+        asm volatile("hlt");
+    }
+}
+
+void request_cpu_reset() {
+    log_message(LogLevel::Info, "Shutdown: requesting CPU reset");
+
+    uint8_t port92 = inb(0x92);
+    outb(0x92, static_cast<uint8_t>(port92 | 0x01));
+    io_wait();
+
+    outb(0xCF9, 0x02);
+    io_wait();
+    outb(0xCF9, 0x06);
+    io_wait();
+
+    for (uint32_t i = 0; i < 0x10000; ++i) {
+        if ((inb(0x64) & 0x02) == 0) {
+            outb(0x64, 0xFE);
+            break;
+        }
+        io_wait();
+    }
+}
 
 uint64_t place_args_on_stack(process::Process& child, const char* args) {
     if (args == nullptr) {
@@ -691,11 +720,11 @@ Result handle_syscall(SyscallFrame& frame) {
             log_message(ok ? LogLevel::Info : LogLevel::Error,
                         ok ? "Shutdown: block cache flushed"
                            : "Shutdown: block cache flush failed");
-            log_message(LogLevel::Info, "Shutdown: halted");
-            asm volatile("cli");
-            for (;;) {
-                asm volatile("hlt");
+            if (ok) {
+                request_cpu_reset();
             }
+            log_message(LogLevel::Info, "Shutdown: halted");
+            halt_forever();
         }
         case SystemCall::FileRead: {
             process::Process* proc = process::current();
