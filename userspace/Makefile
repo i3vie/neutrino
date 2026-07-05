@@ -33,17 +33,17 @@ PROGRAM_OUTPUTS := $(addprefix $(OUT_DIR)/,$(addsuffix .elf,$(PROGRAMS)))
 
 ASFLAGS  := -f elf64
 PROGRAM_CXXFLAGS := -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
-                    -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
+                    -m64 -mno-red-zone -mno-avx -mno-avx512f \
                     -fPIE -pie -Wall -Wextra -I. -I$(CRT_DIR) -I$(LIBC_DIR)/include -I../shared/include \
                     -I$(DEPENDENCY_INCLUDE_DIR)
 PROGRAM_LDFLAGS := -Wl,--no-dynamic-linker
 SHARED_CXXFLAGS := $(filter-out -fPIE -pie,$(PROGRAM_CXXFLAGS)) -fPIC
 PROGRAM_CFLAGS := -std=c99 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
-                  -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-avx -mno-avx512f \
+                  -m64 -mno-red-zone -mno-avx -mno-avx512f \
                   -fPIE -Wall -Wextra -I$(BEARSSL_DIR)/inc -I$(BEARSSL_DIR)/src \
                   -DBR_RDRAND=0 -DBR_USE_GETENTROPY=0 -DBR_USE_URANDOM=0 \
                   -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0 \
-                  -DBR_AES_X86NI=0 -DBR_SSE2=0 -DBR_POWER8=0
+                  -DBR_AES_X86NI=0 -DBR_SSE2=1 -DBR_POWER8=0
 SHARED_CFLAGS := $(filter-out -fPIE,$(PROGRAM_CFLAGS)) -fPIC
 SHARED_LDFLAGS := -shared -nostdlib
 

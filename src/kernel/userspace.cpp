@@ -1,5 +1,6 @@
 #include "userspace.hpp"
 
+#include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "process.hpp"
@@ -35,6 +36,7 @@ namespace userspace {
 
 [[noreturn]] void enter_process(process::Process& proc) {
     set_rsp0(proc.kernel_stack_top);
+    cpu::restore_fpu_state(proc.fpu_state);
     if (proc.has_context) {
         userspace_enter_frame(&proc.context);
     }

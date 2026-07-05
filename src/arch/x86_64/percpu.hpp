@@ -31,6 +31,10 @@ struct Cpu {
     uint64_t kernel_ticks;
     uint64_t idle_ticks;
     uint64_t irq_ticks;
+    uint32_t kernel_fpu_depth;
+    uint32_t kernel_fpu_reserved;
+    uint64_t kernel_fpu_rflags;
+    process::Process* kernel_fpu_process;
 };
 
 static_assert(offsetof(Cpu, syscall_user_rsp) == 16,

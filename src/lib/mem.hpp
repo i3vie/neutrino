@@ -9,3 +9,5 @@ extern "C" int memcmp(const void *s1, const void *s2, size_t n);
 
 extern "C" void *memcpy_fast(void *dest, const void *src, size_t n);
 extern "C" void *memmove_fast(void *dest, const void *src, size_t n);
+extern "C" void *memcpy_simd(void *dest, const void *src, size_t n);
+extern "C" void *memmove_simd(void *dest, const void *src, size_t n);

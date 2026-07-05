@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/idt.hpp"
 #include "arch/x86_64/percpu.hpp"
@@ -37,6 +38,8 @@ extern "C" void smp_ap_entry(struct LIMINE_MP(info)* info) {
         percpu::setup_cpu_tss(*cpu);
         percpu::setup_cpu_gdt(*cpu);
     }
+
+    cpu::init_current_cpu_features();
 
     idt_install();
 

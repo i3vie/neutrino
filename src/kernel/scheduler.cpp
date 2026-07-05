@@ -5,6 +5,7 @@
 #include "drivers/fs/block_cache.hpp"
 #include "drivers/log/logging.hpp"
 #include "lib/mem.hpp"
+#include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/gdt.hpp"
 #include "arch/x86_64/tss.hpp"
 #include "arch/x86_64/registers.hpp"
@@ -187,6 +188,7 @@ void prepare_frame_for_process(process::Process& proc,
     }
 
     set_rsp0(proc.kernel_stack_top);
+    cpu::restore_fpu_state(proc.fpu_state);
 }
 
 void capture_from_interrupt(const InterruptFrame& in,
@@ -400,6 +402,7 @@ void reschedule(syscall::SyscallFrame& frame) {
     bool terminated = current_proc->state == process::State::Terminated;
 
     if (!terminated) {
+        cpu::save_fpu_state(current_proc->fpu_state);
         current_proc->context = frame;
         current_proc->has_context = true;
         current_proc->user_ip = frame.user_rip;

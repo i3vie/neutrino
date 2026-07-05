@@ -1,5 +1,7 @@
 #include "mem.hpp"
 
+#include "arch/x86_64/cpu_features.hpp"
+
 extern "C" void *memcpy(void *dest, const void *src, size_t n) {
     uint8_t *d = (uint8_t*)dest;
     const uint8_t *s = (const uint8_t*)src;
@@ -41,6 +43,9 @@ extern "C" int memcmp(const void *s1, const void *s2, size_t n) {
 namespace {
 
 constexpr size_t kWordSize = sizeof(uint64_t);
+constexpr size_t kSimdBlockSize = 64;
+constexpr size_t kSimdThreshold = 1024;
+constexpr size_t kSimdChunkSize = 16 * 1024;
 
 inline void copy_forward_align(uint8_t*& dst,
                                const uint8_t*& src,
@@ -62,6 +67,28 @@ inline void copy_backward_align(uint8_t*& dst,
         *dst = *src;
         --remaining;
     }
+}
+
+inline void copy_sse2_blocks(uint8_t*& dst,
+                             const uint8_t*& src,
+                             size_t block_count) {
+    asm volatile(
+        "1:\n"
+        "movdqu 0(%[src]), %%xmm0\n"
+        "movdqu 16(%[src]), %%xmm1\n"
+        "movdqu 32(%[src]), %%xmm2\n"
+        "movdqu 48(%[src]), %%xmm3\n"
+        "movdqu %%xmm0, 0(%[dst])\n"
+        "movdqu %%xmm1, 16(%[dst])\n"
+        "movdqu %%xmm2, 32(%[dst])\n"
+        "movdqu %%xmm3, 48(%[dst])\n"
+        "add $64, %[src]\n"
+        "add $64, %[dst]\n"
+        "dec %[count]\n"
+        "jnz 1b\n"
+        : [dst] "+r"(dst), [src] "+r"(src), [count] "+r"(block_count)
+        :
+        : "memory");
 }
 
 }  // namespace
@@ -158,4 +185,42 @@ extern "C" void *memmove_fast(void *dest, const void *src, size_t n) {
     }
 
     return dest;
+}
+
+extern "C" void *memcpy_simd(void *dest, const void *src, size_t n) {
+    if (n < kSimdThreshold || dest == src) {
+        return memcpy_fast(dest, src, n);
+    }
+
+    auto* d = static_cast<uint8_t*>(dest);
+    auto* s = static_cast<const uint8_t*>(src);
+    size_t remaining = n;
+
+    while (remaining >= kSimdThreshold) {
+        size_t bytes = remaining;
+        if (bytes > kSimdChunkSize) {
+            bytes = kSimdChunkSize;
+        }
+        bytes &= ~(kSimdBlockSize - 1);
+        if (bytes == 0 || !cpu::kernel_fpu_begin()) {
+            break;
+        }
+        copy_sse2_blocks(d, s, bytes / kSimdBlockSize);
+        cpu::kernel_fpu_end();
+        remaining -= bytes;
+    }
+
+    if (remaining != 0) {
+        memcpy_fast(d, s, remaining);
+    }
+    return dest;
+}
+
+extern "C" void *memmove_simd(void *dest, const void *src, size_t n) {
+    auto* d = static_cast<uint8_t*>(dest);
+    auto* s = static_cast<const uint8_t*>(src);
+    if (d < s) {
+        return memcpy_simd(dest, src, n);
+    }
+    return memmove_fast(dest, src, n);
 }

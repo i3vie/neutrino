@@ -241,7 +241,7 @@ void Console::flush_region(size_t x, size_t y, size_t width, size_t height) {
             break;
         }
 
-        memcpy_fast(primary_fb.base + offset, back_buffer + offset, to_copy);
+        memcpy_simd(primary_fb.base + offset, back_buffer + offset, to_copy);
     }
 }
 
@@ -269,7 +269,7 @@ void Console::flush_all() {
         return;
     }
 
-    memcpy_fast(primary_fb.base, back_buffer, bytes);
+    memcpy_simd(primary_fb.base, back_buffer, bytes);
 }
 
 void Console::present() {
@@ -699,7 +699,7 @@ void Console::scroll() {
     size_t rows_to_copy = text_height - row_height;
     size_t bytes_to_copy = rows_to_copy * target->pitch;
     if (bytes_to_copy > 0) {
-        memmove_fast(target->base,
+        memmove_simd(target->base,
                      target->base + row_height * target->pitch,
                      bytes_to_copy);
     }

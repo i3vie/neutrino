@@ -22,6 +22,7 @@
 #include "../fs/vfs.hpp"
 #include "../net/network.hpp"
 #include "arch/x86_64/gdt.hpp"
+#include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/idt.hpp"
 #include "arch/x86_64/io.hpp"
 #include "arch/x86_64/lapic.hpp"
@@ -343,6 +344,10 @@ static void kernel_main_stage2() {
 #endif
 
     log_message(LogLevel::Info, "Compiler: %s", compiler_string);
+
+    if (!cpu::init_boot_features()) {
+        hcf();
+    }
 
     log_message(LogLevel::Info, "Installing IDT");
     idt_install();

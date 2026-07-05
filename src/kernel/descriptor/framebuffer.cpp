@@ -64,7 +64,7 @@ void copy_to_hardware(const FramebufferSlot& slot) {
     if (slot.buffer_bytes < bytes) {
         bytes = slot.buffer_bytes;
     }
-    memcpy_fast(g_hw_base, slot.buffer, bytes);
+    memcpy_simd(g_hw_base, slot.buffer, bytes);
 }
 
 bool copy_rect_to_hardware(const FramebufferSlot& slot,
@@ -99,7 +99,7 @@ bool copy_rect_to_hardware(const FramebufferSlot& slot,
     for (uint32_t row = 0; row < height; ++row) {
         size_t offset = static_cast<size_t>(y + row) * fb->pitch +
                         static_cast<size_t>(x) * bytes_per_pixel;
-        memcpy_fast(g_hw_base + offset, slot.buffer + offset, row_bytes);
+        memcpy_simd(g_hw_base + offset, slot.buffer + offset, row_bytes);
     }
     return true;
 }
@@ -196,7 +196,7 @@ int64_t framebuffer_write(process::Process&,
         static_cast<uint32_t>(slot - g_framebuffers);
     if (g_active_slot == slot_index && g_hw_base != nullptr &&
         slot->buffer != g_hw_base) {
-        memcpy_fast(g_hw_base + offset, dest + offset, length);
+        memcpy_simd(g_hw_base + offset, dest + offset, length);
     }
     return static_cast<int64_t>(length);
 }

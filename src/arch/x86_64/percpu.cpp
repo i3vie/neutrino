@@ -56,6 +56,10 @@ Cpu* register_cpu(uint32_t lapic_id, uint32_t processor_id) {
     cpu.kernel_ticks = 0;
     cpu.idle_ticks = 0;
     cpu.irq_ticks = 0;
+    cpu.kernel_fpu_depth = 0;
+    cpu.kernel_fpu_reserved = 0;
+    cpu.kernel_fpu_rflags = 0;
+    cpu.kernel_fpu_process = nullptr;
     return &cpu;
 }
 

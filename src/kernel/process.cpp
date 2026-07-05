@@ -21,6 +21,7 @@ void reset_process_resources(process::Process& proc) {
     proc.fs_base = 0;
     proc.user_ip = 0;
     proc.user_sp = 0;
+    cpu::init_fpu_state(proc.fpu_state);
     proc.code_region = vm::Region{0, 0};
     proc.stack_region = vm::Stack{0, 0, 0};
     memset(&proc.context, 0, sizeof(proc.context));

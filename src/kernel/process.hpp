@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/x86_64/cpu_features.hpp"
 #include "arch/x86_64/syscall.hpp"
 #include "descriptor.hpp"
 #include "fs/vfs.hpp"
@@ -44,6 +45,7 @@ struct Process {
     uint64_t fs_base;
     uint64_t user_ip;
     uint64_t user_sp;
+    alignas(cpu::kFpuStateAlign) uint8_t fpu_state[cpu::kFpuStateSize];
     uint64_t kernel_stack_base;
     uint64_t kernel_stack_top;
     vm::Region code_region;

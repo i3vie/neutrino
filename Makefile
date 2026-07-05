@@ -111,11 +111,16 @@ SRC_CPP := $(shell find $(SRC_DIR) -type f -name '*.cpp')
 SRC_ASM := $(shell find $(SRC_DIR) -type f -name '*.S')
 OBJ     := $(SRC_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o) \
            $(SRC_ASM:$(SRC_DIR)/%.S=$(BUILD_DIR)/%.o)
+KERNEL_SIMD_CPP ?=
+KERNEL_SIMD_OBJ := $(KERNEL_SIMD_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
+KERNEL_SIMD_CFLAGS := $(filter-out -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) -mmmx -msse -msse2
 
 # === Default target ===
 all: $(TARGET_ELF)
 
 # === Object build rules ===
+$(KERNEL_SIMD_OBJ): CFLAGS := $(KERNEL_SIMD_CFLAGS)
+
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "[C++] $<"
