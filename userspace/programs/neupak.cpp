@@ -519,6 +519,33 @@ bool valid_sha256_hex(const char* text) {
     return true;
 }
 
+char ascii_lower(char ch) {
+    if (ch >= 'A' && ch <= 'Z') {
+        return static_cast<char>(ch - 'A' + 'a');
+    }
+    return ch;
+}
+
+bool contains_case_insensitive(const char* text, const char* needle) {
+    if (text == nullptr || needle == nullptr) {
+        return false;
+    }
+    if (needle[0] == '\0') {
+        return true;
+    }
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        size_t j = 0;
+        while (needle[j] != '\0' && text[i + j] != '\0' &&
+               ascii_lower(text[i + j]) == ascii_lower(needle[j])) {
+            ++j;
+        }
+        if (needle[j] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool parse_string_list_line(const char* value, StringList& out) {
     out.count = 0;
     value = userspace::skip_spaces(value);
@@ -988,7 +1015,7 @@ bool derive_package_url(const char* indexurl,
            userspace::text::append_text(out, out_size, len, ".zip");
 }
 
-bool run_download(const char* url, const char* output) {
+bool run_download(const char* url, const char* output, bool quiet) {
     if (!ensure_parent_dir(output)) {
         print_line("neupak: invalid download output path");
         return false;
@@ -996,7 +1023,8 @@ bool run_download(const char* url, const char* output) {
     char args[900];
     size_t len = 0;
     args[0] = '\0';
-    if (!userspace::text::append_text(args, sizeof(args), len, "--quiet ") ||
+    if ((quiet &&
+         !userspace::text::append_text(args, sizeof(args), len, "--quiet ")) ||
         !userspace::text::append_text(args, sizeof(args), len, url) ||
         !userspace::text::append_char(args, sizeof(args), len, ' ') ||
         !userspace::text::append_text(args, sizeof(args), len, output)) {
@@ -1060,7 +1088,7 @@ bool update_index() {
         }
         print("neupak: updating ");
         print_line(g_repos[i].name);
-        if (!run_download(g_repos[i].indexurl, path)) {
+        if (!run_download(g_repos[i].indexurl, path, true)) {
             print("neupak: failed to download ");
             print_line(g_repos[i].name);
             return false;
@@ -1245,6 +1273,39 @@ bool write_files_db(const FilesDb& db) {
     bool ok = replace_file(kFilesPath, text);
     unmap(text, kMaxText);
     return ok;
+}
+
+void remove_installed_record(InstalledDb& db, const char* name) {
+    for (size_t i = 0; i < db.count; ++i) {
+        if (strcmp(db.packages[i].name, name) == 0) {
+            for (size_t j = i + 1; j < db.count; ++j) {
+                db.packages[j - 1] = db.packages[j];
+            }
+            --db.count;
+            return;
+        }
+    }
+}
+
+void remove_files_record(FilesDb& db, const char* name) {
+    for (size_t i = 0; i < db.count; ++i) {
+        if (strcmp(db.packages[i].name, name) == 0) {
+            for (size_t j = i + 1; j < db.count; ++j) {
+                db.packages[j - 1] = db.packages[j];
+            }
+            --db.count;
+            return;
+        }
+    }
+}
+
+bool package_is_installed(const InstalledDb& db, const char* name) {
+    for (size_t i = 0; i < db.count; ++i) {
+        if (strcmp(db.packages[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void release_lock();
@@ -1986,6 +2047,174 @@ bool check_installed_dependencies(const Package& pkg, const InstalledDb& install
     return true;
 }
 
+bool check_reverse_dependencies(const char* name, const InstalledDb& installed) {
+    g_index.count = 0;
+    if (!load_indexes(g_index)) {
+        print_line("neupak: warning: unable to check reverse dependencies");
+        return true;
+    }
+    for (size_t i = 0; i < installed.count; ++i) {
+        if (strcmp(installed.packages[i].name, name) == 0) {
+            continue;
+        }
+        Package* pkg = find_package(g_index, installed.packages[i].name);
+        if (pkg == nullptr) {
+            continue;
+        }
+        for (size_t j = 0; j < pkg->depends.count; ++j) {
+            if (strcmp(pkg->depends.values[j], name) == 0) {
+                print("neupak: refusing to uninstall ");
+                print(name);
+                print("; required by ");
+                print_line(installed.packages[i].name);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool list_package_files(const char* name) {
+    if (!load_installed(g_installed) || !load_files_db(g_files)) {
+        print_line("neupak: unable to read package databases");
+        return false;
+    }
+    if (!package_is_installed(g_installed, name)) {
+        print("neupak: package is not installed: ");
+        print_line(name);
+        return false;
+    }
+    PackageFiles* package_files = find_package_files(g_files, name);
+    if (package_files == nullptr || package_files->file_count == 0) {
+        print("neupak: no files recorded for ");
+        print_line(name);
+        return true;
+    }
+    for (size_t i = 0; i < package_files->file_count; ++i) {
+        print_line(package_files->files[i].path);
+    }
+    return true;
+}
+
+bool remove_package_payload(const PackageFiles& package_files) {
+    for (size_t i = 0; i < package_files.file_count; ++i) {
+        char physical_path[kMaxPath];
+        if (!sysroot_path_for_logical(package_files.files[i].path,
+                                      physical_path,
+                                      sizeof(physical_path))) {
+            return false;
+        }
+        long existing = file_open(physical_path);
+        if (existing < 0) {
+            continue;
+        }
+        file_close(static_cast<uint32_t>(existing));
+        if (file_remove(physical_path) < 0) {
+            print("neupak: unable to remove ");
+            print_line(package_files.files[i].path);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool uninstall_package(const char* name) {
+    if (!load_installed(g_installed) || !load_files_db(g_files)) {
+        print_line("neupak: unable to read package databases");
+        return false;
+    }
+    if (!package_is_installed(g_installed, name)) {
+        print("neupak: package is not installed: ");
+        print_line(name);
+        return false;
+    }
+    if (!check_reverse_dependencies(name, g_installed)) {
+        return false;
+    }
+
+    if (!acquire_lock()) {
+        return false;
+    }
+    bool ok = true;
+    if (!load_installed(g_installed) || !load_files_db(g_files)) {
+        print_line("neupak: failed to reload package databases");
+        ok = false;
+    } else if (!package_is_installed(g_installed, name)) {
+        print("neupak: package is not installed: ");
+        print_line(name);
+        ok = false;
+    } else if (!check_reverse_dependencies(name, g_installed)) {
+        ok = false;
+    } else {
+        PackageFiles package_files{};
+        PackageFiles* found_files = find_package_files(g_files, name);
+        if (found_files != nullptr) {
+            package_files = *found_files;
+        } else {
+            strlcpy(package_files.name, name, sizeof(package_files.name));
+        }
+        if (!remove_package_payload(package_files)) {
+            ok = false;
+        } else {
+            remove_installed_record(g_installed, name);
+            remove_files_record(g_files, name);
+            if (!write_installed_db(g_installed)) {
+                print_line("neupak: failed to write installed database");
+                ok = false;
+            } else if (!write_files_db(g_files)) {
+                print_line("neupak: failed to write file database");
+                ok = false;
+            } else if (!neutrino_sync()) {
+                print_line("neupak: failed to sync package database");
+                ok = false;
+            }
+        }
+    }
+    release_lock();
+    if (!ok) {
+        print("neupak: uninstall failed for ");
+        print_line(name);
+        return false;
+    }
+    print("neupak: uninstalled ");
+    print_line(name);
+    return true;
+}
+
+void print_package_summary(const Package& pkg) {
+    print(pkg.name);
+    print(" ");
+    print(pkg.version);
+    if (pkg.description[0] != '\0') {
+        print(" - ");
+        print(pkg.description);
+    }
+    print("\n");
+}
+
+bool search_packages(const char* query) {
+    if (!prepare_dirs()) {
+        return false;
+    }
+    if (!load_indexes(g_index)) {
+        print_line("neupak: run `neupak update-index` first");
+        return false;
+    }
+    size_t matches = 0;
+    for (size_t i = 0; i < g_index.count; ++i) {
+        const Package& pkg = g_index.packages[i];
+        if (contains_case_insensitive(pkg.name, query) ||
+            contains_case_insensitive(pkg.description, query)) {
+            print_package_summary(pkg);
+            ++matches;
+        }
+    }
+    if (matches == 0) {
+        print_line("neupak: no matching packages");
+    }
+    return true;
+}
+
 bool install_zip_package(const char* zip_path, const Package& pkg, bool force) {
     if (!plan_zip(zip_path, g_plan)) {
         print("neupak: invalid package archive for ");
@@ -2060,7 +2289,7 @@ bool install_one(PackageSet& index, const char* name, bool force) {
     }
     print("neupak: downloading ");
     print_line(pkg->name);
-    if (!run_download(pkg->package_url, zip_path)) {
+    if (!run_download(pkg->package_url, zip_path, false)) {
         return false;
     }
     if (!verify_file_sha256(zip_path, pkg->sha256, pkg->size)) {
@@ -2122,8 +2351,11 @@ bool install_package(const char* name, bool force) {
 
 void usage() {
     print_line("usage: neupak update-index");
+    print_line("       neupak search <query>");
     print_line("       neupak install [--force-overwrite] <package>");
     print_line("       neupak install-local [--force-overwrite] <zip-path>");
+    print_line("       neupak files <package>");
+    print_line("       neupak uninstall <package>");
 }
 
 }  // namespace
@@ -2139,6 +2371,31 @@ int main(uint64_t arg_ptr, uint64_t) {
 
     if (strcmp(args.words[0], "update-index") == 0) {
         return update_index() ? 0 : 1;
+    }
+
+    if (strcmp(args.words[0], "search") == 0) {
+        if (args.count != 2) {
+            usage();
+            return 1;
+        }
+        return search_packages(args.words[1]) ? 0 : 1;
+    }
+
+    if (strcmp(args.words[0], "files") == 0 ||
+        strcmp(args.words[0], "list-files") == 0) {
+        if (args.count != 2 || !valid_name(args.words[1])) {
+            usage();
+            return 1;
+        }
+        return list_package_files(args.words[1]) ? 0 : 1;
+    }
+
+    if (strcmp(args.words[0], "uninstall") == 0) {
+        if (args.count != 2 || !valid_name(args.words[1])) {
+            usage();
+            return 1;
+        }
+        return uninstall_package(args.words[1]) ? 0 : 1;
     }
 
     if (strcmp(args.words[0], "install") == 0 ||

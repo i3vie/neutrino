@@ -60,6 +60,9 @@ enum class SystemCall : long {
     FileSync             = 50,
     Sync                 = 51,
     Shutdown             = 52,
+    ModuleLoad           = 53,
+    ModuleCount          = 54,
+    ModuleInfo           = 55,
 };
 
 enum : uint32_t {
@@ -97,6 +100,19 @@ struct UserInfo {
     uint64_t generation;
     uint32_t password_set;
     uint32_t active;
+};
+
+enum ModuleInfoFlag : uint32_t {
+    kModuleInfoBuiltin = 1u << 0,
+    kModuleInfoDynamic = 1u << 1,
+};
+
+struct ModuleInfo {
+    char name[64];
+    char path[128];
+    uint64_t image_size;
+    uint32_t flags;
+    uint32_t reserved;
 };
 
 struct DirEntry {
@@ -694,6 +710,24 @@ static inline long system_sync() {
 
 static inline long system_shutdown() {
     return raw_syscall0(SystemCall::Shutdown);
+}
+
+static inline long module_load(const char* path) {
+    return raw_syscall1(SystemCall::ModuleLoad,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long module_count() {
+    return raw_syscall0(SystemCall::ModuleCount);
+}
+
+static inline long module_info(size_t index, ModuleInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return raw_syscall2(SystemCall::ModuleInfo,
+                        static_cast<long>(index),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(info)));
 }
 
 static inline long file_read(uint32_t handle,

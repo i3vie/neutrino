@@ -17,6 +17,7 @@ constexpr size_t kMaxPendingConnects = 8;
 constexpr uint16_t kDefaultWindowSize = 65535;
 constexpr size_t kAckFlushBytes = 8192;
 constexpr uint8_t kAckFlushSegments = 4;
+constexpr size_t kNetworkRegistryPollSpins = 120000;
 constexpr uint16_t kEphemeralPortStart = 49152;
 constexpr uint16_t kEphemeralPortEnd = 65535;
 
@@ -1323,9 +1324,15 @@ bool wait_for_networkd(uint32_t& server_pipe_id) {
     }
     registry_handle = static_cast<uint32_t>(shm);
     registry = reinterpret_cast<networkd_protocol::Registry*>(info_base);
-    while (registry->magic != networkd_protocol::kRegistryMagic ||
-           registry->version != networkd_protocol::kRegistryVersion ||
-           registry->server_pipe_id == 0) {
+    for (size_t spins = 0;
+         registry->magic != networkd_protocol::kRegistryMagic ||
+         registry->version != networkd_protocol::kRegistryVersion ||
+         registry->server_pipe_id == 0;
+         ++spins) {
+        if (spins >= kNetworkRegistryPollSpins) {
+            descriptor_close(registry_handle);
+            return false;
+        }
         yield();
     }
     server_pipe_id = registry->server_pipe_id;

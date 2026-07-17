@@ -9,6 +9,7 @@
 #include "drivers/pci/pci.hpp"
 #include "drivers/usb/usb_core.hpp"
 #include "kernel/memory/physical_allocator.hpp"
+#include "kernel/module.hpp"
 #include "kernel/process.hpp"
 #include "kernel/scheduler.hpp"
 #include "kernel/time.hpp"
@@ -1718,6 +1719,18 @@ void register_driver() {
         sizeof(kPciMatches) / sizeof(kPciMatches[0]),
         init);
 }
+
+bool register_module() {
+    register_driver();
+    return true;
+}
+
+KERNEL_BUILTIN_MODULE(xhci_module,
+                      "xhci",
+                      kernel_module::Phase::Driver,
+                      register_module,
+                      kPciMatches,
+                      sizeof(kPciMatches) / sizeof(kPciMatches[0]));
 
 void init() {
     if (g_initialized) {

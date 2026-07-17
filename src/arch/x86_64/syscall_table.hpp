@@ -60,6 +60,9 @@ enum class SystemCall : uint64_t {
     FileSync             = 50,
     Sync                 = 51,
     Shutdown             = 52,
+    ModuleLoad           = 53,
+    ModuleCount          = 54,
+    ModuleInfo           = 55,
 };
 
 Result handle_syscall(SyscallFrame& frame);

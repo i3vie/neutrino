@@ -7,6 +7,7 @@
 #include "drivers/fs/mount_manager.hpp"
 #include "drivers/log/logging.hpp"
 #include "kernel/descriptor.hpp"
+#include "kernel/module.hpp"
 #include "lib/mem.hpp"
 
 namespace {
@@ -421,6 +422,18 @@ Status initialize_device(DeviceState& state) {
 void init() {
     (void)usb::register_class_driver("usb-storage", probe_device);
 }
+
+bool init_module() {
+    init();
+    return true;
+}
+
+KERNEL_BUILTIN_MODULE(usb_mass_storage_module,
+                      "usb-storage",
+                      kernel_module::Phase::Bus,
+                      init_module,
+                      nullptr,
+                      0);
 
 bool probe_device(const usb::Device& device) {
     bool mass_storage = false;

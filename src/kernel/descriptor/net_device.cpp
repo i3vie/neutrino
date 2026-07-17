@@ -1,6 +1,5 @@
 #include "../descriptor.hpp"
 
-#include "../../drivers/net/e1000e.hpp"
 #include "../../net/network.hpp"
 #include "../string_util.hpp"
 #include "../../lib/mem.hpp"
@@ -135,16 +134,7 @@ int get_property(DescriptorEntry& entry,
             }
             auto* debug =
                 reinterpret_cast<descriptor_defs::NetDeviceDebug*>(out);
-            bool ok = true;
-            if (device->name != nullptr &&
-                string_util::equals(device->name, "e1000e")) {
-                ok = e1000e::get_debug_info(*debug);
-            } else {
-                memset(debug, 0, sizeof(*debug));
-            }
-            if (!ok) {
-                return -1;
-            }
+            memset(debug, 0, sizeof(*debug));
             debug->rx_queued = static_cast<uint32_t>(net::queued_frame_count(*device));
             debug->rx_frames_received = device->rx_frames_received;
             debug->rx_frames_dropped = device->rx_frames_dropped;

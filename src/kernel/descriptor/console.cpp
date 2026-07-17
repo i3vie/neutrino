@@ -4,6 +4,7 @@
 #include "../../drivers/log/logging.hpp"
 #include "../../lib/mem.hpp"
 #include "../process.hpp"
+#include "../settings.hpp"
 
 namespace descriptor {
 int vty_get_property(uint32_t id,
@@ -188,6 +189,7 @@ int console_set_property(DescriptorEntry& entry,
             return -1;
         }
         if (changed) {
+            settings::persist_console_scale(scale);
             if (vty_id != 0) {
                 return vty_redraw_console(vty_id, *console) ? 0 : -1;
             }
@@ -207,6 +209,8 @@ int console_set_property(DescriptorEntry& entry,
                                reinterpret_cast<const uint8_t*>(font + 1))) {
             return -1;
         }
+        settings::persist_console_font(*font,
+                                       reinterpret_cast<const uint8_t*>(font + 1));
         if (vty_id != 0) {
             return vty_redraw_console(vty_id, *console) ? 0 : -1;
         }

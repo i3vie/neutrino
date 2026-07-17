@@ -75,7 +75,9 @@ SELECTED_BEARSSL_PROGRAMS := $(filter $(BEARSSL_PROGRAMS),$(PROGRAMS))
 INSTALL_STAGED_LIBRARIES ?= $(if $(SELECTED_BEARSSL_PROGRAMS),1,0)
 PROGRAM_HELPERS_browse += http
 PROGRAM_HELPERS_installer += console
+PROGRAM_HELPERS_insmod += args console
 PROGRAM_HELPERS_lsdisk += console
+PROGRAM_HELPERS_lsmod += console
 PROGRAM_HELPERS_mount += args console
 PROGRAM_HELPERS_mkneufs += args console
 PROGRAM_HELPERS_mkpart += args console
@@ -198,6 +200,9 @@ install: $(INSTALL_PREREQS)
 	if [[ -d "$(CONFIG_DIR)" ]]; then \
 		$(SUDO) cp -a "$(CONFIG_DIR)/." "$(MOUNT_DIR)/config/"; \
 	fi; \
+	if [[ -f "$(CONFIG_DIR)/KERNEL.CFG" ]]; then \
+		$(SUDO) install -m 0644 "$(CONFIG_DIR)/KERNEL.CFG" "$(MOUNT_DIR)/KERNEL.CFG"; \
+	fi; \
 	if [[ -f "$(OUT_DIR)/init.elf" ]]; then \
 		$(SUDO) install -m 0644 "$(OUT_DIR)/init.elf" "$(MOUNT_DIR)/init.elf"; \
 	fi; \
@@ -221,6 +226,9 @@ install-mtools: $(INSTALL_PREREQS)
 	fi; \
 	if [[ -d "$(CONFIG_DIR)" ]]; then \
 		mcopy -s -i "$(HDD_IMAGE)" "$(CONFIG_DIR)"/* ::/config/; \
+	fi; \
+	if [[ -f "$(CONFIG_DIR)/KERNEL.CFG" ]]; then \
+		mcopy -i "$(HDD_IMAGE)" "$(CONFIG_DIR)/KERNEL.CFG" ::/KERNEL.CFG; \
 	fi; \
 	if [[ -f "$(OUT_DIR)/init.elf" ]]; then \
 		mcopy -i "$(HDD_IMAGE)" "$(OUT_DIR)/init.elf" ::/init.elf; \

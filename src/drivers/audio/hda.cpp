@@ -5,6 +5,7 @@
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
 #include "kernel/memory/physical_allocator.hpp"
+#include "kernel/module.hpp"
 #include "lib/mem.hpp"
 
 namespace hda {
@@ -476,6 +477,18 @@ void register_driver() {
     (void)driver_registry::register_pci_driver(
         "intel-hda", kPciMatches, sizeof(kPciMatches) / sizeof(kPciMatches[0]), init);
 }
+
+bool register_module() {
+    register_driver();
+    return true;
+}
+
+KERNEL_BUILTIN_MODULE(intel_hda_module,
+                      "intel-hda",
+                      kernel_module::Phase::Driver,
+                      register_module,
+                      kPciMatches,
+                      sizeof(kPciMatches) / sizeof(kPciMatches[0]));
 
 void init() {
     if (g_state.initialized) return;

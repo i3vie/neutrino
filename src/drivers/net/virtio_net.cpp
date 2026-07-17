@@ -5,6 +5,7 @@
 #include "arch/x86_64/percpu.hpp"
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
+#include "kernel/module.hpp"
 #include "kernel/scheduler.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "lib/mem.hpp"
@@ -635,6 +636,18 @@ void register_driver() {
         sizeof(kPciMatches) / sizeof(kPciMatches[0]),
         init);
 }
+
+bool register_module() {
+    register_driver();
+    return true;
+}
+
+KERNEL_BUILTIN_MODULE(virtio_net_module,
+                      "virtio-net",
+                      kernel_module::Phase::Driver,
+                      register_module,
+                      kPciMatches,
+                      sizeof(kPciMatches) / sizeof(kPciMatches[0]));
 
 void init() {
     if (g_state.initialized) {

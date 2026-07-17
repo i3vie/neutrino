@@ -16,6 +16,9 @@ constexpr size_t kMaxUrl = 512;
 constexpr size_t kIoBufferSize = 32768;
 constexpr size_t kProgressBarWidth = 20;
 constexpr uint32_t kConnectWaitLimit = 200000;
+constexpr uint32_t kReadWaitLimit = 200000;
+constexpr uint64_t kConnectTimeoutNs = 30000000000ull;
+constexpr uint64_t kReadTimeoutNs = 30000000000ull;
 constexpr uint32_t kMaxRedirects = 5;
 constexpr uint32_t kNetDebugDeviceIndex = 0;
 
@@ -131,6 +134,17 @@ uint64_t wall_time_ns() {
         return 0;
     }
     return now.unix_seconds * 1000000000ull + now.nanoseconds;
+}
+
+bool timed_out(uint64_t start_ns,
+               uint64_t timeout_ns,
+               uint32_t waits,
+               uint32_t wait_limit) {
+    uint64_t now = wall_time_ns();
+    if (start_ns != 0 && now != 0 && now >= start_ns) {
+        return now - start_ns >= timeout_ns;
+    }
+    return waits >= wait_limit;
 }
 
 void print_net_debug(ProgressState& progress) {
@@ -521,9 +535,19 @@ bool tcp_connect(TcpConnection& conn, const uint8_t ip[4], uint16_t port) {
         print_line("download: failed to open tcpd registry");
         return false;
     }
+    uint64_t registry_start = wall_time_ns();
+    uint32_t registry_waits = 0;
     while (registry->magic != tcpd_protocol::kRegistryMagic ||
            registry->version != tcpd_protocol::kRegistryVersion ||
            registry->server_pipe_id == 0) {
+        if (timed_out(registry_start,
+                      kConnectTimeoutNs,
+                      registry_waits++,
+                      kConnectWaitLimit)) {
+            descriptor_close(registry_handle);
+            print_line("download: tcpd registry timeout");
+            return false;
+        }
         yield();
     }
     uint32_t server_pipe_id = registry->server_pipe_id;
@@ -583,10 +607,14 @@ bool tcp_connect(TcpConnection& conn, const uint8_t ip[4], uint16_t port) {
     }
 
     uint32_t connect_waits = 0;
+    uint64_t connect_start = wall_time_ns();
     for (;;) {
         tcpd_protocol::Message message{};
         if (!tcpd_protocol::read_message(static_cast<uint32_t>(reply_pipe), message)) {
-            if (connect_waits++ >= kConnectWaitLimit) {
+            if (timed_out(connect_start,
+                          kConnectTimeoutNs,
+                          connect_waits++,
+                          kConnectWaitLimit)) {
                 descriptor_close(static_cast<uint32_t>(endpoint));
                 descriptor_close(static_cast<uint32_t>(reply_pipe));
                 descriptor_close(static_cast<uint32_t>(server_pipe));
@@ -659,9 +687,18 @@ int tcp_read_some(TcpConnection& conn, uint8_t* out, size_t capacity) {
         return 0;
     }
     if (conn.endpoint != 0) {
+        uint32_t read_waits = 0;
+        uint64_t read_start = wall_time_ns();
         for (;;) {
             long result = descriptor_read(conn.endpoint, out, capacity);
             if (result == kDescriptorWouldBlock) {
+                if (timed_out(read_start,
+                              kReadTimeoutNs,
+                              read_waits++,
+                              kReadWaitLimit)) {
+                    print_line("download: tcp read timeout");
+                    return -1;
+                }
                 yield();
                 continue;
             }
@@ -675,15 +712,26 @@ int tcp_read_some(TcpConnection& conn, uint8_t* out, size_t capacity) {
             return static_cast<int>(result);
         }
     }
+    uint32_t read_waits = 0;
+    uint64_t read_start = wall_time_ns();
     while (conn.pending_offset == conn.pending_length) {
         if (conn.closed) {
             return -1;
         }
         tcpd_protocol::Message message{};
         if (!tcpd_protocol::read_message(conn.reply_pipe, message)) {
+            if (timed_out(read_start,
+                          kReadTimeoutNs,
+                          read_waits++,
+                          kReadWaitLimit)) {
+                print_line("download: tcp read timeout");
+                return -1;
+            }
             yield();
             continue;
         }
+        read_waits = 0;
+        read_start = wall_time_ns();
         if (message.type == tcpd_protocol::kDataEvent &&
             message.data_event.connection_id == conn.connection_id) {
             conn.pending_offset = 0;
@@ -1094,7 +1142,8 @@ bool stream_connect(Stream& stream, const Url& url) {
     uint8_t ip[4];
     if (!userspace::http::parse_ipv4_literal(url.host, ip) &&
         !usernet::dns::resolve_a(url.host, ip)) {
-        print_line("download: dns lookup failed");
+        print("download: dns lookup failed: ");
+        print_line(usernet::dns::status_text(usernet::dns::last_status()));
         return false;
     }
     if (!tcp_connect(stream.tcp, ip, url.port)) {
@@ -1595,6 +1644,9 @@ int main(uint64_t arg_ptr, uint64_t) {
     uint64_t end_ns = wall_time_ns();
     uint64_t elapsed_ns = (end_ns >= start_ns) ? end_ns - start_ns : 0;
 
+    if (options.quiet) {
+        return 0;
+    }
     print("download: ");
     print(options.discard ? "read " : "wrote ");
     print_u64(bytes_written);

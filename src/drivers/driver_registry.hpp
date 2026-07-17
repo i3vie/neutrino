@@ -3,23 +3,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kernel/module.hpp"
+
 namespace driver_registry {
 
 using InitFn = void (*)();
+using PciMatch = kernel_module::PciMatch;
 
-struct PciMatch {
-    uint16_t vendor;
-    uint16_t device;
-    uint8_t class_code;
-    uint8_t subclass;
-    uint8_t prog_if;
-};
-
-constexpr uint16_t kAnyVendor = 0xFFFFu;
-constexpr uint16_t kAnyDevice = 0xFFFFu;
-constexpr uint8_t kAnyClass = 0xFFu;
-constexpr uint8_t kAnySubclass = 0xFFu;
-constexpr uint8_t kAnyProgIf = 0xFFu;
+constexpr uint16_t kAnyVendor = kernel_module::kAnyVendor;
+constexpr uint16_t kAnyDevice = kernel_module::kAnyDevice;
+constexpr uint8_t kAnyClass = kernel_module::kAnyClass;
+constexpr uint8_t kAnySubclass = kernel_module::kAnySubclass;
+constexpr uint8_t kAnyProgIf = kernel_module::kAnyProgIf;
 
 bool register_pci_driver(const char* name,
                          const PciMatch* matches,

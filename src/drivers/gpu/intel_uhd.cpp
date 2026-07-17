@@ -10,6 +10,7 @@
 #include "drivers/pci/pci.hpp"
 #include "kernel/descriptor.hpp"
 #include "kernel/memory/physical_allocator.hpp"
+#include "kernel/module.hpp"
 #include "lib/mem.hpp"
 
 namespace intel_uhd {
@@ -825,6 +826,18 @@ void register_driver() {
         sizeof(kPciMatches) / sizeof(kPciMatches[0]),
         init);
 }
+
+bool register_module() {
+    register_driver();
+    return true;
+}
+
+KERNEL_BUILTIN_MODULE(intel_uhd_module,
+                      "intel-uhd",
+                      kernel_module::Phase::Driver,
+                      register_module,
+                      kPciMatches,
+                      sizeof(kPciMatches) / sizeof(kPciMatches[0]));
 
 void init() {
     if (g_state.initialized) {

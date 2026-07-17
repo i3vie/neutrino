@@ -30,6 +30,11 @@ SECTIONS
 
     .rodata : {
         *(.rodata .rodata.*)
+        . = ALIGN(8);
+        PROVIDE(__kernel_modules_start = .);
+        KEEP(*(.kernel_modules))
+        KEEP(*(.kernel_modules.*))
+        PROVIDE(__kernel_modules_end = .);
     } :rodata
 
     .note.gnu.build-id : {

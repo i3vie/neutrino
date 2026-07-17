@@ -1370,6 +1370,60 @@ bool write_all(uint32_t file, const char* text) {
     return true;
 }
 
+const char* basename_of(const char* path) {
+    if (path == nullptr) {
+        return "";
+    }
+    const char* name = path;
+    for (size_t i = 0; path[i] != '\0'; ++i) {
+        if (path[i] == '/') {
+            name = path + i + 1;
+        }
+    }
+    return name;
+}
+
+bool write_installed_module_loads(const char* target_root, long console) {
+    char loads_path[160];
+    if (!append_path(target_root, "modules/loads.txt", loads_path, sizeof(loads_path))) {
+        return false;
+    }
+
+    file_remove(loads_path);
+    long file = file_create(loads_path);
+    if (file < 0) {
+        userspace::write_line(console, "warning: unable to write module load list");
+        return false;
+    }
+
+    bool ok = true;
+    long count = module_count();
+    if (count < 0) {
+        ok = false;
+    }
+    for (long i = 0; ok && i < count; ++i) {
+        ModuleInfo info{};
+        if (module_info(static_cast<size_t>(i), &info) != 0 ||
+            (info.flags & kModuleInfoDynamic) == 0) {
+            continue;
+        }
+        const char* name = basename_of(info.path[0] != '\0' ? info.path : info.name);
+        if (name[0] == '\0') {
+            continue;
+        }
+        ok = write_all(static_cast<uint32_t>(file), name) &&
+             write_all(static_cast<uint32_t>(file), "\n");
+    }
+    if (ok && file_sync(static_cast<uint32_t>(file)) != 0) {
+        ok = false;
+    }
+    file_close(static_cast<uint32_t>(file));
+    if (!ok) {
+        userspace::write_line(console, "warning: module load list was not refreshed");
+    }
+    return ok;
+}
+
 bool write_config_chunk(uint32_t file,
                         const char* text,
                         const char* label,
@@ -1665,6 +1719,7 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
 
     ok = copy_tree(source_root, target_root, console, &progress);
     if (ok) {
+        (void)write_installed_module_loads(target_root, console);
         progress.copied_files = progress.total_files;
         if (progress.total_bytes > progress.copied_bytes) {
             progress.copied_bytes = progress.total_bytes;

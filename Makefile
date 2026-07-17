@@ -23,7 +23,7 @@ QEMU ?= qemu-system-x86_64
 QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
-QEMU_NET_DEVICE ?= virtio-net-pci
+QEMU_NET_DEVICE ?= e1000e
 QEMU_STORAGE ?= ahci
 QEMU_PRIMARY_IMG ?= $(TARGET_DISK_IMG)
 QEMU_PRIMARY_IMG := $(if $(strip $(QEMU_PRIMARY_IMG)),$(QEMU_PRIMARY_IMG),$(TARGET_DISK_IMG))
@@ -101,13 +101,17 @@ TARGET_ISO_RAMFS := $(OUT_DIR)/neutrino_ramfs.iso
 ISO_ROOT_RAMFS := $(OUT_DIR)/iso_root_ramfs
 LIVE_ROOTFS_IMG ?= $(OUT_DIR)/live_rootfs.img
 LIVE_ROOTFS_SIZE ?= 128M
-LIVE_ROOTFS_PROGRAMS ?= init shell neupak installer shutdown dmesg lsdisk mount mkneufs mkpart ls cat cp mv rm mkdir rmdir pwd echo clear touch sync date
+LIVE_ROOTFS_PROGRAMS ?= init shell neupak download networkd tcpd dhcp installer shutdown dmesg lsdisk mount mkneufs mkpart ls cat cp mv rm mkdir rmdir pwd echo clear touch sync date lsmod insmod
 LIVE_ROOTFS_CONFIG_DIR ?= config/live-base
 LIVE_ESP_IMG ?= $(OUT_DIR)/esp.img
 LIVE_ESP_SIZE ?= 64M
 
 # === Source discovery ===
-SRC_CPP := $(shell find $(SRC_DIR) -type f -name '*.cpp')
+KERNEL_MODULE_CPP := $(SRC_DIR)/drivers/net/e1000e.cpp
+KERNEL_MODULES := $(OUT_DIR)/modules/e1000e.ko
+KERNEL_MODULE_LOADS := $(OUT_DIR)/modules/loads.txt
+SRC_CPP_ALL := $(shell find $(SRC_DIR) -type f -name '*.cpp')
+SRC_CPP := $(filter-out $(KERNEL_MODULE_CPP),$(SRC_CPP_ALL))
 SRC_ASM := $(shell find $(SRC_DIR) -type f -name '*.S')
 OBJ     := $(SRC_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o) \
            $(SRC_ASM:$(SRC_DIR)/%.S=$(BUILD_DIR)/%.o)
@@ -116,7 +120,7 @@ KERNEL_SIMD_OBJ := $(KERNEL_SIMD_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
 KERNEL_SIMD_CFLAGS := $(filter-out -mno-mmx -mno-sse -mno-sse2,$(CFLAGS)) -mmmx -msse -msse2
 
 # === Default target ===
-all: $(TARGET_ELF)
+all: $(TARGET_ELF) $(KERNEL_MODULES)
 
 # === Object build rules ===
 $(KERNEL_SIMD_OBJ): CFLAGS := $(KERNEL_SIMD_CFLAGS)
@@ -130,6 +134,19 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 	@mkdir -p $(dir $@)
 	@echo "[ASM]  $<"
 	$(AS) $< -o $@
+
+$(OUT_DIR)/modules/e1000e.ko: $(SRC_DIR)/drivers/net/e1000e.cpp $(SRC_DIR)/kernel/module.hpp
+	@mkdir -p $(dir $@)
+	@echo "[KO]   $@"
+	$(CC) $(CFLAGS) -DNEUTRINO_DYNAMIC_MODULE_E1000E -c $< -o $@
+
+$(KERNEL_MODULE_LOADS): $(KERNEL_MODULES)
+	@mkdir -p $(dir $@)
+	@echo "[MODS] $@"
+	@rm -f $@
+	@for module in $(KERNEL_MODULES); do \
+		printf '%s\n' "$${module##*/}" >> $@; \
+	done
 
 # === Link kernel ELF ===
 $(TARGET_ELF): $(OBJ)
@@ -261,12 +278,15 @@ live-esp: $(LIVE_ESP_IMG)
 .PHONY: force-live-esp
 force-live-esp: $(LIVE_ESP_IMG)
 
-$(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(shell find userspace/programs userspace/crt userspace/libc userspace/config -type f 2>/dev/null)
+$(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(KERNEL_MODULES) $(KERNEL_MODULE_LOADS) $(shell find userspace/programs userspace/crt userspace/libc userspace/config -type f 2>/dev/null)
 	@mkdir -p $(dir $@)
 	rm -f $@
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
 	mkfs.fat -F 32 --mbr=y $@
 	$(MAKE) -C userspace install-mtools HDD_IMAGE=$(abspath $@) PROGRAMS="$(LIVE_ROOTFS_PROGRAMS)" CONFIG_DIR="$(LIVE_ROOTFS_CONFIG_DIR)"
+	mmd -i $@ ::/modules
+	mcopy -i $@ $(KERNEL_MODULES) ::/modules/
+	mcopy -i $@ $(KERNEL_MODULE_LOADS) ::/modules/loads.txt
 
 $(LIVE_ESP_IMG): $(TARGET_ELF) $(LIMINE_DIR)
 	@mkdir -p $(dir $@)

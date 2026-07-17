@@ -12,9 +12,23 @@ namespace usernet::dns {
 constexpr uint16_t kDnsPort = 53;
 constexpr uint16_t kFirstEphemeralPort = 53000;
 constexpr uint16_t kEphemeralPortCount = 32;
+constexpr size_t kRegistryPollSpins = 120000;
 constexpr size_t kReplyPollSpins = 60000;
 constexpr size_t kMaxDnsMessageSize = 512;
 constexpr size_t kResolveAttempts = 3;
+
+enum class ResolveStatus : uint8_t {
+    Ok,
+    NetworkRegistryUnavailable,
+    NetworkRegistryTimeout,
+    NoIpv4Config,
+    NoDnsServer,
+    ServerPipeUnavailable,
+    ReplyPipeUnavailable,
+    BindFailed,
+    QuerySendFailed,
+    NoResponse,
+};
 
 struct ResolverContext {
     uint32_t network_registry_handle = kInvalidDescriptor;
@@ -24,6 +38,38 @@ struct ResolverContext {
     uint8_t source_ip[4]{};
     uint8_t dns_server[4]{};
 };
+
+static ResolveStatus g_last_status = ResolveStatus::Ok;
+
+inline ResolveStatus last_status() {
+    return g_last_status;
+}
+
+inline const char* status_text(ResolveStatus status) {
+    switch (status) {
+        case ResolveStatus::Ok:
+            return "ok";
+        case ResolveStatus::NetworkRegistryUnavailable:
+            return "network registry unavailable";
+        case ResolveStatus::NetworkRegistryTimeout:
+            return "network registry timeout";
+        case ResolveStatus::NoIpv4Config:
+            return "no IPv4 config";
+        case ResolveStatus::NoDnsServer:
+            return "no DNS server configured";
+        case ResolveStatus::ServerPipeUnavailable:
+            return "networkd pipe unavailable";
+        case ResolveStatus::ReplyPipeUnavailable:
+            return "DNS reply pipe unavailable";
+        case ResolveStatus::BindFailed:
+            return "UDP bind failed";
+        case ResolveStatus::QuerySendFailed:
+            return "DNS query send failed";
+        case ResolveStatus::NoResponse:
+            return "no DNS response";
+    }
+    return "unknown DNS failure";
+}
 
 inline descriptor_defs::SharedMemoryInfo* allocate_shm_info_buffer() {
     auto* info = static_cast<descriptor_defs::SharedMemoryInfo*>(
@@ -357,17 +403,26 @@ inline bool parse_response(const uint8_t* message,
 inline bool prepare_context(ResolverContext& ctx) {
     networkd_protocol::Registry* registry = nullptr;
     if (!open_registry(ctx.network_registry_handle, registry)) {
+        g_last_status = ResolveStatus::NetworkRegistryUnavailable;
         return false;
     }
-    while (registry->magic != networkd_protocol::kRegistryMagic ||
-           registry->version != networkd_protocol::kRegistryVersion ||
-           registry->server_pipe_id == 0) {
+    for (size_t spins = 0;
+         registry->magic != networkd_protocol::kRegistryMagic ||
+         registry->version != networkd_protocol::kRegistryVersion ||
+         registry->server_pipe_id == 0;
+         ++spins) {
+        if (spins >= kRegistryPollSpins) {
+            close_context(ctx);
+            g_last_status = ResolveStatus::NetworkRegistryTimeout;
+            return false;
+        }
         yield();
     }
 
     long device_handle = net_device_open(0);
     if (device_handle < 0) {
         close_context(ctx);
+        g_last_status = ResolveStatus::NoIpv4Config;
         return false;
     }
 
@@ -379,6 +434,7 @@ inline bool prepare_context(ResolverContext& ctx) {
     descriptor_close(static_cast<uint32_t>(device_handle));
     if (!have_config) {
         close_context(ctx);
+        g_last_status = ResolveStatus::NoIpv4Config;
         return false;
     }
 
@@ -388,6 +444,7 @@ inline bool prepare_context(ResolverContext& ctx) {
     }
     if (ipv4_is_zero(ctx.dns_server)) {
         close_context(ctx);
+        g_last_status = ResolveStatus::NoDnsServer;
         return false;
     }
 
@@ -396,6 +453,7 @@ inline bool prepare_context(ResolverContext& ctx) {
     long server_pipe = pipe_open_existing(server_flags, registry->server_pipe_id);
     if (server_pipe < 0) {
         close_context(ctx);
+        g_last_status = ResolveStatus::ServerPipeUnavailable;
         return false;
     }
     ctx.server_pipe = static_cast<uint32_t>(server_pipe);
@@ -405,6 +463,7 @@ inline bool prepare_context(ResolverContext& ctx) {
     long reply_pipe = pipe_open_new(reply_flags);
     if (reply_pipe < 0) {
         close_context(ctx);
+        g_last_status = ResolveStatus::ReplyPipeUnavailable;
         return false;
     }
     ctx.reply_pipe = static_cast<uint32_t>(reply_pipe);
@@ -420,6 +479,7 @@ inline bool prepare_context(ResolverContext& ctx) {
     unmap(reply_info, sizeof(*reply_info));
     if (!have_reply_info) {
         close_context(ctx);
+        g_last_status = ResolveStatus::ReplyPipeUnavailable;
         return false;
     }
 
@@ -427,11 +487,13 @@ inline bool prepare_context(ResolverContext& ctx) {
         uint16_t candidate = static_cast<uint16_t>(kFirstEphemeralPort + i);
         if (!bind_udp(ctx.server_pipe, reply_pipe_id, candidate)) {
             close_context(ctx);
+            g_last_status = ResolveStatus::BindFailed;
             return false;
         }
         int32_t bind_status = networkd_protocol::kStatusIo;
         if (!wait_for_bind_response(ctx.reply_pipe, candidate, bind_status)) {
             close_context(ctx);
+            g_last_status = ResolveStatus::BindFailed;
             return false;
         }
         if (bind_status == networkd_protocol::kStatusOk) {
@@ -440,15 +502,18 @@ inline bool prepare_context(ResolverContext& ctx) {
         }
         if (bind_status != networkd_protocol::kStatusInUse) {
             close_context(ctx);
+            g_last_status = ResolveStatus::BindFailed;
             return false;
         }
     }
 
     close_context(ctx);
+    g_last_status = ResolveStatus::BindFailed;
     return false;
 }
 
 inline bool resolve_a(const char* host, uint8_t out_ip[4]) {
+    g_last_status = ResolveStatus::Ok;
     ResolverContext ctx{};
     if (!prepare_context(ctx)) {
         return false;
@@ -473,6 +538,7 @@ inline bool resolve_a(const char* host, uint8_t out_ip[4]) {
         unmap(query, kMaxDnsMessageSize);
         if (!ok) {
             close_context(ctx);
+            g_last_status = ResolveStatus::QuerySendFailed;
             return false;
         }
 
@@ -499,6 +565,7 @@ inline bool resolve_a(const char* host, uint8_t out_ip[4]) {
                                out_ip)) {
                 unmap(message, sizeof(*message));
                 close_context(ctx);
+                g_last_status = ResolveStatus::Ok;
                 return true;
             }
             unmap(message, sizeof(*message));
@@ -510,6 +577,7 @@ inline bool resolve_a(const char* host, uint8_t out_ip[4]) {
     }
 
     close_context(ctx);
+    g_last_status = ResolveStatus::NoResponse;
     return false;
 }
 

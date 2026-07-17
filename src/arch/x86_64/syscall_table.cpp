@@ -3,10 +3,12 @@
 #include "../../drivers/log/logging.hpp"
 #include "../../drivers/fs/block_cache.hpp"
 #include "../../drivers/fs/mount_manager.hpp"
+#include "../../drivers/driver_registry.hpp"
 #include "../../kernel/descriptor.hpp"
 #include "../../kernel/capabilities.hpp"
 #include "../../kernel/file_io.hpp"
 #include "../../kernel/loader.hpp"
+#include "../../kernel/module.hpp"
 #include "../../kernel/process.hpp"
 #include "../../kernel/path_util.hpp"
 #include "../../kernel/scheduler.hpp"
@@ -725,6 +727,74 @@ Result handle_syscall(SyscallFrame& frame) {
             }
             log_message(LogLevel::Info, "Shutdown: halted");
             halt_forever();
+        }
+        case SystemCall::ModuleLoad: {
+            process::Process* proc = process::current();
+            if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::HardwareAccess,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            const char* path_user = reinterpret_cast<const char*>(frame.rdi);
+            if (path_user == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            size_t path_len = string_util::length(path_user);
+            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            char path_input[path_util::kMaxPathLength];
+            char resolved[path_util::kMaxPathLength];
+            string_util::copy(path_input, sizeof(path_input), path_user);
+            if (!path_util::build_absolute_path(proc->cwd,
+                                                path_input,
+                                                resolved)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            if (!kernel_module::load_from_file(resolved)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            driver_registry::probe_pci_drivers();
+            frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::ModuleCount: {
+            frame.rax = static_cast<uint64_t>(kernel_module::loaded_count());
+            return Result::Continue;
+        }
+        case SystemCall::ModuleInfo: {
+            process::Process* proc = process::current();
+            if (proc == nullptr || frame.rsi == 0) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            kernel_module::ModuleInfo info{};
+            if (!kernel_module::info_at(static_cast<size_t>(frame.rdi), info)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!vm::copy_to_user(proc->cr3,
+                                  frame.rsi,
+                                  &info,
+                                  sizeof(info))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = 0;
+            return Result::Continue;
         }
         case SystemCall::FileRead: {
             process::Process* proc = process::current();

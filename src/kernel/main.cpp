@@ -4,21 +4,15 @@
 
 #include "../drivers/console/console.hpp"
 #include "../drivers/driver_registry.hpp"
-#include "../drivers/audio/hda.hpp"
 #include "../drivers/fs/mount_manager.hpp"
-#include "../drivers/gpu/intel_uhd.hpp"
 #include "../drivers/input/keyboard.hpp"
 #include "../drivers/input/mouse.hpp"
 #include "../drivers/interrupts/ioapic.hpp"
 #include "../drivers/interrupts/pic.hpp"
 #include "../drivers/limine/limine_requests.hpp"
 #include "../drivers/log/logging.hpp"
-#include "../drivers/net/e1000e.hpp"
-#include "../drivers/net/virtio_net.hpp"
 #include "../drivers/pci/pci.hpp"
 #include "../drivers/timer/pit.hpp"
-#include "../drivers/usb/usb_mass_storage.hpp"
-#include "../drivers/usb/xhci.hpp"
 #include "../fs/vfs.hpp"
 #include "../net/network.hpp"
 #include "arch/x86_64/gdt.hpp"
@@ -40,9 +34,11 @@
 #include "error.hpp"
 #include "loader.hpp"
 #include "memory/physical_allocator.hpp"
+#include "module.hpp"
 #include "path_util.hpp"
 #include "process.hpp"
 #include "scheduler.hpp"
+#include "settings.hpp"
 #include "string_util.hpp"
 #include "time.hpp"
 
@@ -241,6 +237,148 @@ static bool default_root_from_rootfs_module(char (&root_spec)[kMaxSpecLen]) {
     return false;
 }
 
+static bool module_config_key(const char* key) {
+    if (key == nullptr) {
+        return false;
+    }
+    const char prefix[] = "KERNEL.MODULE";
+    if (!string_util::starts_with(key, prefix)) {
+        return false;
+    }
+    const char* suffix = key + sizeof(prefix) - 1;
+    if (*suffix == '\0') {
+        return true;
+    }
+    while (*suffix != '\0') {
+        if (*suffix < '0' || *suffix > '9') {
+            return false;
+        }
+        ++suffix;
+    }
+    return true;
+}
+
+static void load_configured_kernel_modules(const config::Table& kernel_config,
+                                           const char* boot_cwd) {
+    for (size_t i = 0; i < kernel_config.count; ++i) {
+        const config::Entry& entry = kernel_config.entries[i];
+        if (!module_config_key(entry.key) || entry.value[0] == '\0') {
+            continue;
+        }
+
+        char path[path_util::kMaxPathLength];
+        if (!path_util::build_absolute_path(boot_cwd, entry.value, path)) {
+            log_message(LogLevel::Warn,
+                        "Module: invalid path in %s: %s",
+                        entry.key,
+                        entry.value);
+            continue;
+        }
+        if (!kernel_module::load_from_file(path)) {
+            log_message(LogLevel::Warn,
+                        "Module: failed to load %s",
+                        path);
+        }
+    }
+}
+
+static bool is_space(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+static bool build_module_load_path(const char* boot_cwd,
+                                   const char* entry,
+                                   char (&out)[path_util::kMaxPathLength]) {
+    if (entry == nullptr || entry[0] == '\0') {
+        return false;
+    }
+    if (entry[0] == '/' || string_util::starts_with(entry, ".../")) {
+        return path_util::build_absolute_path(boot_cwd, entry, out);
+    }
+
+    char relative[path_util::kMaxPathLength];
+    const char prefix[] = ".../modules/";
+    size_t used = sizeof(prefix) - 1;
+    if (used >= sizeof(relative)) {
+        return false;
+    }
+    for (size_t i = 0; i < used; ++i) {
+        relative[i] = prefix[i];
+    }
+    for (size_t i = 0; entry[i] != '\0'; ++i) {
+        if (used + 1 >= sizeof(relative)) {
+            return false;
+        }
+        relative[used++] = entry[i];
+    }
+    relative[used] = '\0';
+    return path_util::build_absolute_path(boot_cwd, relative, out);
+}
+
+static void load_module_list_file(const char* boot_cwd) {
+    char list_path[path_util::kMaxPathLength];
+    if (!path_util::build_absolute_path(boot_cwd,
+                                        ".../modules/loads.txt",
+                                        list_path)) {
+        return;
+    }
+
+    uint8_t buffer[2048];
+    size_t file_size = 0;
+    if (!vfs::read_file(list_path, buffer, sizeof(buffer), file_size)) {
+        log_message(LogLevel::Debug, "Module: %s not present", list_path);
+        return;
+    }
+
+    log_message(LogLevel::Info, "Module: loading list %s", list_path);
+    size_t offset = 0;
+    while (offset < file_size) {
+        char line[path_util::kMaxPathLength];
+        size_t len = 0;
+        while (offset < file_size &&
+               buffer[offset] != '\n' &&
+               len + 1 < sizeof(line)) {
+            line[len++] = static_cast<char>(buffer[offset++]);
+        }
+        while (offset < file_size && buffer[offset] != '\n') {
+            ++offset;
+        }
+        if (offset < file_size && buffer[offset] == '\n') {
+            ++offset;
+        }
+        line[len] = '\0';
+
+        size_t start = 0;
+        while (is_space(line[start])) {
+            ++start;
+        }
+        size_t end = start;
+        while (line[end] != '\0' && line[end] != '#') {
+            ++end;
+        }
+        while (end > start && is_space(line[end - 1])) {
+            --end;
+        }
+        if (end == start) {
+            continue;
+        }
+        line[end] = '\0';
+
+        char path[path_util::kMaxPathLength];
+        if (!build_module_load_path(boot_cwd, line + start, path)) {
+            log_message(LogLevel::Warn,
+                        "Module: invalid loads.txt entry '%s'",
+                        line + start);
+            continue;
+        }
+        if (!kernel_module::load_from_file(path)) {
+            log_message(LogLevel::Warn,
+                        "Module: failed to load %s from loads.txt",
+                        path);
+        }
+    }
+}
+
 extern "C" void kernel_main(void) {
     uint8_t* stack_top = bootstrap_stack + BOOTSTRAP_STACK_SIZE;
     asm volatile(
@@ -398,11 +536,11 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Info, "Mouse initialized");
 
     log_message(LogLevel::Info, "Configuring PIT");
-    pit::init(100);
+    pit::init(1000);
     log_message(LogLevel::Info, "PIT configured");
 
     log_message(LogLevel::Info, "Initializing wall clock");
-    if (!timekeeping::init_from_rtc(100)) {
+    if (!timekeeping::init_from_rtc(1000)) {
         log_message(LogLevel::Warn, "Wall clock unavailable");
     }
 
@@ -465,12 +603,10 @@ static void kernel_main_stage2() {
     pci::init();
     log_message(LogLevel::Info, "PCI subsystem initialized");
 
-    virtio_net::register_driver();
-    e1000e::register_driver();
-    intel_uhd::register_driver();
-    hda::register_driver();
-    usb::mass_storage::init();
-    xhci::register_driver();
+    log_message(LogLevel::Info, "Module: discovered %zu built-in modules",
+                kernel_module::count());
+    (void)kernel_module::initialize_phase(kernel_module::Phase::Bus);
+    (void)kernel_module::initialize_phase(kernel_module::Phase::Driver);
 
     vfs::init();
 
@@ -515,6 +651,11 @@ static void kernel_main_stage2() {
     if (root_ptr != nullptr && root_ok) {
         string_util::copy(boot_mount_name, sizeof(boot_mount_name), root_ptr);
         vfs::set_root_mount(root_ptr);
+        settings::set_storage_root(root_ptr);
+        settings::load_from_disk();
+        if (kconsole != nullptr) {
+            settings::apply_console_preferences(*kconsole);
+        }
         // Configure user storage path under the root mount.
         char user_path[128];
         user_path[0] = '\0';
@@ -641,6 +782,13 @@ static void kernel_main_stage2() {
     if (root_ptr != nullptr && root_ok && !kernel_config_loaded) {
         log_message(LogLevel::Warn, "Boot: KERNEL.CFG not found on '%s'",
                     root_ptr);
+    }
+
+    if (kernel_config_loaded) {
+        load_configured_kernel_modules(kernel_config, boot_cwd);
+    }
+    if (root_ptr != nullptr && root_ok) {
+        load_module_list_file(boot_cwd);
     }
 
     process::init();

@@ -32,6 +32,10 @@ constexpr size_t kMaxPollFns = 16;
 scheduler::PollFn g_poll_fns[kMaxPollFns]{};
 volatile int g_poll_lock = 0;
 process::Process* g_poll_worker = nullptr;
+constexpr uint64_t kTargetLatencyNs = 6'000'000ull;
+constexpr uint64_t kMinGranularityNs = 900'000ull;
+uint64_t g_slice_start_ticks[percpu::kMaxCpus]{};
+uint64_t g_slice_duration_ticks[percpu::kMaxCpus]{};
 
 [[maybe_unused]] void halt_system() {
     for (;;) {
@@ -163,6 +167,73 @@ process::Process* pop_locked() {
     return nullptr;
 }
 
+size_t current_cpu_index() {
+    percpu::Cpu* cpu = percpu::current_cpu();
+    if (cpu == nullptr || cpu->index >= percpu::kMaxCpus) {
+        return 0;
+    }
+    return cpu->index;
+}
+
+size_t runnable_user_task_count_locked(process::Process* current_proc) {
+    size_t total = 0;
+    for (size_t q = 0; q < percpu::kMaxCpus; ++q) {
+        RunQueue& rq = g_run_queues[q];
+        size_t idx = rq.head;
+        for (size_t i = 0; i < rq.count; ++i) {
+            process::Process* proc = rq.items[idx];
+            if (proc != nullptr &&
+                !proc->is_kernel_task &&
+                proc->state != process::State::Terminated) {
+                ++total;
+            }
+            idx = (idx + 1) % process::kMaxProcesses;
+        }
+    }
+    if (current_proc != nullptr &&
+        !current_proc->is_kernel_task &&
+        current_proc->state != process::State::Terminated) {
+        ++total;
+    }
+    return total == 0 ? 1 : total;
+}
+
+uint64_t timeslice_ticks_locked(process::Process* current_proc) {
+    size_t task_count = runnable_user_task_count_locked(current_proc);
+    uint64_t slice_ns = kTargetLatencyNs / static_cast<uint64_t>(task_count);
+    if (slice_ns < kMinGranularityNs) {
+        slice_ns = kMinGranularityNs;
+    }
+    return timekeeping::ticks_for_duration_ns(slice_ns);
+}
+
+void begin_timeslice_locked(process::Process* proc) {
+    if (proc == nullptr || proc->is_kernel_task) {
+        return;
+    }
+    size_t idx = current_cpu_index();
+    g_slice_start_ticks[idx] = timekeeping::tick_count();
+    g_slice_duration_ticks[idx] = timeslice_ticks_locked(proc);
+}
+
+bool timeslice_expired_locked(process::Process* proc) {
+    if (proc == nullptr || proc->is_kernel_task) {
+        return false;
+    }
+    if (runnable_user_task_count_locked(proc) <= 1) {
+        begin_timeslice_locked(proc);
+        return false;
+    }
+    size_t idx = current_cpu_index();
+    uint64_t duration = g_slice_duration_ticks[idx];
+    if (duration == 0) {
+        begin_timeslice_locked(proc);
+        duration = g_slice_duration_ticks[idx];
+    }
+    uint64_t now = timekeeping::tick_count();
+    return now - g_slice_start_ticks[idx] >= duration;
+}
+
 void prepare_frame_for_process(process::Process& proc,
                                syscall::SyscallFrame& frame) {
     if (proc.has_context) {
@@ -245,6 +316,8 @@ void init() {
     for (size_t i = 0; i < percpu::kMaxCpus; ++i) {
         g_run_queues[i].head = 0;
         g_run_queues[i].count = 0;
+        g_slice_start_ticks[i] = 0;
+        g_slice_duration_ticks[i] = 0;
     }
 }
 
@@ -267,6 +340,8 @@ void register_cpu(percpu::Cpu* cpu) {
     cpu->index = static_cast<uint32_t>(idx);
     g_run_queues[idx].head = 0;
     g_run_queues[idx].count = 0;
+    g_slice_start_ticks[idx] = 0;
+    g_slice_duration_ticks[idx] = 0;
     cpu->registered = true;
     log_message(LogLevel::Info,
                 "Scheduler: registered CPU (LAPIC=%u total=%u)",
@@ -385,6 +460,10 @@ void enqueue(process::Process* proc) {
             continue;
         }
         process::set_current(next);
+        {
+            QueueGuard guard;
+            begin_timeslice_locked(next);
+        }
         set_rsp0(next->kernel_stack_top);
         userspace::enter_process(*next);
         log_message(LogLevel::Error,
@@ -496,6 +575,10 @@ void reschedule(syscall::SyscallFrame& frame) {
     }
 
     process::set_current(next);
+    {
+        QueueGuard guard;
+        begin_timeslice_locked(next);
+    }
     if (terminated) {
         process::reclaim(*current_proc);
     }
@@ -517,7 +600,15 @@ void tick(InterruptFrame& frame) {
     descriptor::service_block_io();
     process::wake_ready_sleepers(timekeeping::tick_count());
     if ((frame.cs & 0x3) != 0) {
-        scheduler::reschedule_from_interrupt(frame);
+        process::Process* current_proc = process::current();
+        bool expired = false;
+        {
+            QueueGuard guard;
+            expired = timeslice_expired_locked(current_proc);
+        }
+        if (expired) {
+            scheduler::reschedule_from_interrupt(frame);
+        }
         return;
     }
     // If we interrupted kernel mode, avoid clobbering the kernel frame; the

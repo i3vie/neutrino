@@ -7,6 +7,7 @@
 #include "drivers/log/logging.hpp"
 #include "drivers/pci/pci.hpp"
 #include "kernel/interrupts.hpp"
+#include "kernel/module.hpp"
 #include "kernel/scheduler.hpp"
 #include "kernel/memory/physical_allocator.hpp"
 #include "lib/mem.hpp"
@@ -15,6 +16,10 @@
 namespace e1000e {
 
 namespace {
+
+#ifdef NEUTRINO_DYNAMIC_MODULE_E1000E
+const kernel_module::Api* g_module_api = nullptr;
+#endif
 
 constexpr uint16_t kIntelVendorId = 0x8086;
 
@@ -107,7 +112,7 @@ constexpr uint64_t kMmioVirtBase = 0xFFFFE10020000000ull;
 constexpr size_t kMmioWindowSize = 2ull * 1024 * 1024;
 constexpr size_t kPageSize = 4096;
 constexpr size_t kRegisterWindowSize = 128ull * 1024;
-constexpr size_t kRingCount = 128;
+constexpr size_t kRingCount = 32;
 constexpr size_t kPacketBufferSize = 2048;
 constexpr uint32_t kPollSpinCount = 100000;
 
@@ -571,10 +576,40 @@ uint64_t alloc_zeroed_pages(size_t page_count) {
     }
     void* virt = paging_phys_to_virt(phys);
     if (virt == nullptr) {
+        memory::free_kernel_block(phys);
         return 0;
     }
     memset(virt, 0, page_count * kPageSize);
     return phys;
+}
+
+size_t ring_page_count() {
+    return (sizeof(RxDescriptor) * kRingCount + kPageSize - 1) / kPageSize;
+}
+
+void release_dma_allocations() {
+    for (size_t i = 0; i < kRingCount; ++i) {
+        if (g_state.rx_buffer_phys[i] != 0) {
+            memory::free_kernel_page(g_state.rx_buffer_phys[i]);
+            g_state.rx_buffer_phys[i] = 0;
+            g_state.rx_buffer_virt[i] = nullptr;
+        }
+        if (g_state.tx_buffer_phys[i] != 0) {
+            memory::free_kernel_page(g_state.tx_buffer_phys[i]);
+            g_state.tx_buffer_phys[i] = 0;
+            g_state.tx_buffer_virt[i] = nullptr;
+        }
+    }
+    if (g_state.rx_ring_phys != 0) {
+        memory::free_kernel_block(g_state.rx_ring_phys);
+        g_state.rx_ring_phys = 0;
+        g_state.rx_ring = nullptr;
+    }
+    if (g_state.tx_ring_phys != 0) {
+        memory::free_kernel_block(g_state.tx_ring_phys);
+        g_state.tx_ring_phys = 0;
+        g_state.tx_ring = nullptr;
+    }
 }
 
 bool load_mac_address(uint8_t mac[6]) {
@@ -606,25 +641,34 @@ void program_mac_address(const uint8_t mac[6]) {
 }
 
 bool setup_rx_ring() {
-    g_state.rx_ring_phys =
-        alloc_zeroed_pages((sizeof(RxDescriptor) * kRingCount + kPageSize - 1) / kPageSize);
+    g_state.rx_ring_phys = alloc_zeroed_pages(ring_page_count());
     if (g_state.rx_ring_phys == 0) {
+        log_message(LogLevel::Warn, "e1000e: failed to allocate RX descriptor ring");
         return false;
     }
 
     g_state.rx_ring = static_cast<RxDescriptor*>(paging_phys_to_virt(g_state.rx_ring_phys));
     if (g_state.rx_ring == nullptr) {
+        log_message(LogLevel::Warn, "e1000e: failed to map RX descriptor ring");
         return false;
     }
 
     for (size_t i = 0; i < kRingCount; ++i) {
         g_state.rx_buffer_phys[i] = memory::alloc_kernel_page();
         if (g_state.rx_buffer_phys[i] == 0) {
+            log_message(LogLevel::Warn,
+                        "e1000e: failed to allocate RX buffer %zu/%zu",
+                        i,
+                        kRingCount);
             return false;
         }
         g_state.rx_buffer_virt[i] =
             static_cast<uint8_t*>(paging_phys_to_virt(g_state.rx_buffer_phys[i]));
         if (g_state.rx_buffer_virt[i] == nullptr) {
+            log_message(LogLevel::Warn,
+                        "e1000e: failed to map RX buffer %zu/%zu",
+                        i,
+                        kRingCount);
             return false;
         }
         memset(g_state.rx_buffer_virt[i], 0, kPacketBufferSize);
@@ -671,25 +715,34 @@ bool setup_rx_ring() {
 }
 
 bool setup_tx_ring() {
-    g_state.tx_ring_phys =
-        alloc_zeroed_pages((sizeof(TxDescriptor) * kRingCount + kPageSize - 1) / kPageSize);
+    g_state.tx_ring_phys = alloc_zeroed_pages(ring_page_count());
     if (g_state.tx_ring_phys == 0) {
+        log_message(LogLevel::Warn, "e1000e: failed to allocate TX descriptor ring");
         return false;
     }
 
     g_state.tx_ring = static_cast<TxDescriptor*>(paging_phys_to_virt(g_state.tx_ring_phys));
     if (g_state.tx_ring == nullptr) {
+        log_message(LogLevel::Warn, "e1000e: failed to map TX descriptor ring");
         return false;
     }
 
     for (size_t i = 0; i < kRingCount; ++i) {
         g_state.tx_buffer_phys[i] = memory::alloc_kernel_page();
         if (g_state.tx_buffer_phys[i] == 0) {
+            log_message(LogLevel::Warn,
+                        "e1000e: failed to allocate TX buffer %zu/%zu",
+                        i,
+                        kRingCount);
             return false;
         }
         g_state.tx_buffer_virt[i] =
             static_cast<uint8_t*>(paging_phys_to_virt(g_state.tx_buffer_phys[i]));
         if (g_state.tx_buffer_virt[i] == nullptr) {
+            log_message(LogLevel::Warn,
+                        "e1000e: failed to map TX buffer %zu/%zu",
+                        i,
+                        kRingCount);
             return false;
         }
         memset(g_state.tx_buffer_virt[i], 0, kPacketBufferSize);
@@ -879,6 +932,7 @@ bool init_device(const pci::PciDevice& device) {
     log_init_stage(device, "setup-rings");
     if (!setup_rx_ring() || !setup_tx_ring()) {
         log_message(LogLevel::Warn, "e1000e: failed to allocate descriptor rings");
+        release_dma_allocations();
         return false;
     }
 
@@ -1007,12 +1061,47 @@ void handle_interrupt() {
 }  // namespace
 
 void register_driver() {
+#ifdef NEUTRINO_DYNAMIC_MODULE_E1000E
+    if (g_module_api == nullptr || g_module_api->register_pci_driver == nullptr) {
+        return;
+    }
+    (void)g_module_api->register_pci_driver(
+        "e1000e",
+        kPciMatches,
+        sizeof(kPciMatches) / sizeof(kPciMatches[0]),
+        init);
+#else
     (void)driver_registry::register_pci_driver(
         "e1000e",
         kPciMatches,
         sizeof(kPciMatches) / sizeof(kPciMatches[0]),
         init);
+#endif
 }
+
+bool register_module() {
+    register_driver();
+    return true;
+}
+
+#ifndef NEUTRINO_DYNAMIC_MODULE_E1000E
+KERNEL_BUILTIN_MODULE(e1000e_module,
+                      "e1000e",
+                      kernel_module::Phase::Driver,
+                      register_module,
+                      kPciMatches,
+                      sizeof(kPciMatches) / sizeof(kPciMatches[0]));
+#else
+extern "C" bool neutrino_module_init(const kernel_module::Api* api) {
+    if (api == nullptr ||
+        api->abi_version != kernel_module::kDescriptorAbiVersion) {
+        return false;
+    }
+    g_module_api = api;
+    register_driver();
+    return true;
+}
+#endif
 
 void init() {
     if (g_state.initialized) {
@@ -1046,7 +1135,8 @@ void init() {
         }
     }
 
-    log_message(LogLevel::Info, "e1000e: no supported device found");
+    g_state.initialized = false;
+    log_message(LogLevel::Info, "e1000e: no supported device initialized");
 }
 
 void poll() {
