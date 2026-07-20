@@ -12,12 +12,17 @@ namespace {
 
 constexpr size_t kMaxCachedDevices = 32;
 constexpr size_t kCacheEntryCount = 65536;
+constexpr size_t kCacheHashBucketCount = 65536;
 constexpr size_t kCacheSectorSize = 512;
 constexpr size_t kIdleFlushBudget = 16;
+constexpr uint16_t kSequentialWriteThroughSectors = 4;
 
 struct CachedDevice {
     BlockDevice backing;
     bool in_use;
+    bool have_last_write;
+    uint16_t sequential_write_sectors;
+    uint32_t last_write_end_lba;
 };
 
 struct CacheEntry {
@@ -29,13 +34,16 @@ struct CacheEntry {
     bool valid;
     bool dirty;
     bool flushing;
+    int32_t hash_next;
     alignas(512) uint8_t data[kCacheSectorSize];
 };
 
 CachedDevice g_devices[kMaxCachedDevices]{};
 CacheEntry g_entries[kCacheEntryCount]{};
+int32_t g_hash_heads[kCacheHashBucketCount]{};
 volatile int g_cache_lock = 0;
 uint64_t g_clock = 0;
+size_t g_victim_cursor = 0;
 bool g_enabled = true;
 
 void lock() {
@@ -72,22 +80,63 @@ BlockIoStatus write_uncached(CachedDevice& cached,
     return block_write(cached.backing, lba, sector_count, buffer);
 }
 
+size_t cache_hash(const CachedDevice& cached, uint32_t lba) {
+    uintptr_t owner = reinterpret_cast<uintptr_t>(&cached);
+    uint64_t mixed = static_cast<uint64_t>(lba) * 11400714819323198485ull;
+    mixed ^= static_cast<uint64_t>(owner >> 4);
+    return static_cast<size_t>(mixed) & (kCacheHashBucketCount - 1);
+}
+
 CacheEntry* find_entry(CachedDevice& cached, uint32_t lba, size_t sector_size) {
-    for (auto& entry : g_entries) {
+    int32_t index = g_hash_heads[cache_hash(cached, lba)];
+    while (index >= 0) {
+        CacheEntry& entry = g_entries[static_cast<size_t>(index)];
         if (entry.valid && entry.owner == &cached && entry.lba == lba &&
             entry.sector_size == sector_size) {
             return &entry;
         }
+        index = entry.hash_next;
     }
     return nullptr;
 }
 
+void unlink_entry_locked(CacheEntry& target) {
+    if (!target.valid || target.owner == nullptr) {
+        target.hash_next = -1;
+        return;
+    }
+    size_t bucket = cache_hash(*target.owner, target.lba);
+    int32_t* link = &g_hash_heads[bucket];
+    while (*link >= 0) {
+        CacheEntry& entry = g_entries[static_cast<size_t>(*link)];
+        if (&entry == &target) {
+            *link = entry.hash_next;
+            entry.hash_next = -1;
+            return;
+        }
+        link = &entry.hash_next;
+    }
+    target.hash_next = -1;
+}
+
+void link_entry_locked(CacheEntry& entry) {
+    size_t index = static_cast<size_t>(&entry - g_entries);
+    size_t bucket = cache_hash(*entry.owner, entry.lba);
+    entry.hash_next = g_hash_heads[bucket];
+    g_hash_heads[bucket] = static_cast<int32_t>(index);
+}
+
 CacheEntry* choose_clean_victim() {
     CacheEntry* oldest = nullptr;
-    for (auto& entry : g_entries) {
+    for (size_t scanned = 0; scanned < kCacheEntryCount; ++scanned) {
+        size_t index = (g_victim_cursor + scanned) % kCacheEntryCount;
+        CacheEntry& entry = g_entries[index];
         if (!entry.valid) {
+            g_victim_cursor = (index + 1) % kCacheEntryCount;
             return &entry;
         }
+    }
+    for (auto& entry : g_entries) {
         if (entry.dirty || entry.flushing) {
             continue;
         }
@@ -168,13 +217,54 @@ CacheEntry* find_or_prepare_entry_locked(CachedDevice& cached,
     if (entry == nullptr) {
         return nullptr;
     }
+    if (entry->valid) {
+        unlink_entry_locked(*entry);
+    }
     entry->owner = &cached;
     entry->lba = lba;
     entry->sector_size = sector_size;
     entry->valid = true;
     entry->dirty = false;
     entry->flushing = false;
+    link_entry_locked(*entry);
     return entry;
+}
+
+void invalidate_write_range(CachedDevice& cached,
+                            uint32_t lba,
+                            uint8_t sector_count) {
+    LockGuard guard;
+    for (uint16_t i = 0; i < sector_count; ++i) {
+        CacheEntry* entry = find_entry(cached,
+                                       lba + static_cast<uint32_t>(i),
+                                       cached.backing.sector_size);
+        if (entry == nullptr) {
+            continue;
+        }
+        unlink_entry_locked(*entry);
+        entry->owner = nullptr;
+        entry->valid = false;
+        entry->dirty = false;
+        entry->flushing = false;
+    }
+}
+
+bool should_write_through(CachedDevice& cached,
+                          uint32_t lba,
+                          uint8_t sector_count) {
+    LockGuard guard;
+    if (cached.have_last_write && lba == cached.last_write_end_lba) {
+        uint32_t total = static_cast<uint32_t>(cached.sequential_write_sectors) +
+                         static_cast<uint32_t>(sector_count);
+        cached.sequential_write_sectors =
+            static_cast<uint16_t>(total > UINT16_MAX ? UINT16_MAX : total);
+    } else {
+        cached.sequential_write_sectors = sector_count;
+    }
+    cached.have_last_write = true;
+    cached.last_write_end_lba = lba + static_cast<uint32_t>(sector_count);
+    return sector_count > 1 ||
+           cached.sequential_write_sectors >= kSequentialWriteThroughSectors;
 }
 
 BlockIoStatus cached_read(void* context,
@@ -258,6 +348,15 @@ BlockIoStatus cached_write(void* context,
         return write_uncached(*cached, lba, sector_count, buffer);
     }
 
+    // Full-cluster and sustained sequential writes are streaming I/O, even on
+    // FAT volumes that use one sector per cluster. Caching them only turns the
+    // transfer into a 32 MiB burst followed by one-sector writeback once the
+    // cache is full.
+    if (should_write_through(*cached, lba, sector_count)) {
+        invalidate_write_range(*cached, lba, sector_count);
+        return write_uncached(*cached, lba, sector_count, buffer);
+    }
+
     const size_t sector_size = cached->backing.sector_size;
     uint8_t cached_count = 0;
     while (cached_count < sector_count) {
@@ -309,8 +408,13 @@ void init() {
     }
     for (auto& entry : g_entries) {
         entry = {};
+        entry.hash_next = -1;
+    }
+    for (auto& head : g_hash_heads) {
+        head = -1;
     }
     g_clock = 0;
+    g_victim_cursor = 0;
     g_enabled = true;
 }
 
@@ -417,6 +521,8 @@ void invalidate_device(const BlockDevice& device) {
     LockGuard guard;
     for (auto& entry : g_entries) {
         if (entry.owner == cached) {
+            unlink_entry_locked(entry);
+            entry.owner = nullptr;
             entry.valid = false;
             entry.dirty = false;
             entry.flushing = false;

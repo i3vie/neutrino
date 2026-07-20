@@ -12,8 +12,8 @@ namespace hda {
 namespace {
 
 constexpr size_t kPageSize = 4096;
-// A reasonably deep cyclic buffer gives userspace/storage over a second to
-// provide more samples without starving the controller.
+// reasonably deep cyclic buffer gives userspace/storage over a second to
+// provide more samples without starving the controller
 constexpr size_t kDmaPages = 64;
 constexpr size_t kDmaBytes = kDmaPages * kPageSize;
 constexpr uint64_t kMmioVirtBase = 0xFFFFE50000000000ull;
@@ -517,8 +517,22 @@ void update_playback_position() {
     size_t consumed =
         (static_cast<size_t>(position) + kDmaBytes - g_state.last_position) %
         kDmaBytes;
+    bool underrun = consumed >= g_state.queued_bytes;
     if (consumed > g_state.queued_bytes) consumed = g_state.queued_bytes;
     g_state.queued_bytes -= consumed;
+    g_state.last_position = position;
+
+    if (!underrun) return;
+
+    // CBL is cyclic, so leaving an empty stream running makes the controller
+    // replay stale samples.  It also leaves write_position behind LPIB; the
+    // next write can then appear almost a full ring later.  Stop at the live
+    // DMA position and rebase the empty queue before accepting more audio.
+    (void)stop_stream();
+    position = read32(sd + 0x04);
+    if (position >= kDmaBytes) position = 0;
+    g_state.stream_running = false;
+    g_state.write_position = static_cast<size_t>(position) & ~size_t{3};
     g_state.last_position = position;
 }
 

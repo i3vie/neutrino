@@ -247,6 +247,7 @@ struct DriverState {
     bool active;
     bool link_registered;
     bool msi_enabled;
+    bool poll_registered;
     uint8_t interrupt_vector;
     pci::PciDevice device;
     volatile uint8_t* regs;
@@ -791,9 +792,12 @@ void update_link_state() {
 }
 
 bool init_device(const pci::PciDevice& device) {
-    DriverState state{};
-    state.initialized = true;
-    state.device = device;
+    // DriverState contains the network link queues and is much larger than a
+    // kernel stack.  Initialize the module's persistent instance directly;
+    // placing a temporary DriverState here overflows the bootstrap stack.
+    memset(&g_state, 0, sizeof(g_state));
+    g_state.initialized = true;
+    g_state.device = device;
     bool pch_lan = is_pch_lan_device(device.device);
 
     log_init_stage(device, "pci-enable");
@@ -804,8 +808,8 @@ bool init_device(const pci::PciDevice& device) {
     pci::write_config16(device, 0x04, command);
 
     log_init_stage(device, "map-bar0");
-    state.regs = map_bar_region(device, 0);
-    if (state.regs == nullptr) {
+    g_state.regs = map_bar_region(device, 0);
+    if (g_state.regs == nullptr) {
         log_message(LogLevel::Warn,
                     "e1000e: failed to map BAR0 for %02u:%02u.%u",
                     static_cast<unsigned int>(device.bus),
@@ -814,7 +818,6 @@ bool init_device(const pci::PciDevice& device) {
         return false;
     }
 
-    g_state = state;
     log_register_snapshot(device, "mapped");
 
     log_init_stage(device, "mask-interrupts");
@@ -966,10 +969,12 @@ bool init_device(const pci::PciDevice& device) {
         if (vector != 0) {
             interrupts::unregister_vector(vector);
         }
-        if (!scheduler::register_poll(poll)) {
+    }
+
+    g_state.poll_registered = scheduler::register_poll(poll);
+    if (!g_state.poll_registered && !g_state.msi_enabled) {
         log_message(LogLevel::Warn,
                     "e1000e: failed to register MSI or deferred poll");
-        }
     }
 
     char mac_string[18];
@@ -1055,7 +1060,9 @@ void handle_interrupt() {
     if (mmio_read32(REG_ICR) == 0) {
         return;
     }
-    service_device();
+    if (!g_state.poll_registered) {
+        service_device();
+    }
 }
 
 }  // namespace
@@ -1144,9 +1151,6 @@ void poll() {
         return;
     }
 
-    if (g_state.msi_enabled) {
-        return;
-    }
     service_device();
     (void)mmio_read32(REG_ICR);
 }
