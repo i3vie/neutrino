@@ -54,6 +54,7 @@ struct Repo {
 
 struct Package {
     char name[kMaxName];
+    char package[kMaxName];
     char package_url[kMaxUrl];
     char version[kMaxVersion];
     char sha256[65];
@@ -777,6 +778,11 @@ bool validate_package(const Package& pkg, bool require_hash) {
         print_line(pkg.version);
         return false;
     }
+    if (require_hash && !valid_name(pkg.package)) {
+        print("neupak: invalid package filename for ");
+        print_line(pkg.name);
+        return false;
+    }
     if (strcmp(pkg.strategy, "over_root") != 0) {
         print("neupak: unsupported strategy for ");
         print(pkg.name);
@@ -887,6 +893,14 @@ bool parse_package_toml(const char* path, PackageSet& set, bool require_hash) {
             if (strcmp(key, "version") == 0) {
                 if (!parse_quoted(value, current->version, sizeof(current->version))) {
                     print("neupak: bad version string at line ");
+                    print_u64(line_number);
+                    print("\n");
+                    unmap(text, kMaxText + 1);
+                    return false;
+                }
+            } else if (strcmp(key, "package") == 0) {
+                if (!parse_quoted(value, current->package, sizeof(current->package))) {
+                    print("neupak: bad package string at line ");
                     print_u64(line_number);
                     print("\n");
                     unmap(text, kMaxText + 1);
@@ -1011,8 +1025,7 @@ bool derive_package_url(const char* indexurl,
         }
     }
     return userspace::text::append_text(out, out_size, len, "/package/") &&
-           userspace::text::append_text(out, out_size, len, package) &&
-           userspace::text::append_text(out, out_size, len, ".zip");
+           userspace::text::append_text(out, out_size, len, package);
 }
 
 bool run_download(const char* url, const char* output, bool quiet) {
@@ -1023,7 +1036,11 @@ bool run_download(const char* url, const char* output, bool quiet) {
     char args[900];
     size_t len = 0;
     args[0] = '\0';
-    if ((quiet &&
+    if (!userspace::text::append_text(args,
+                                      sizeof(args),
+                                      len,
+                                      "--require-valid-cert --compact ") ||
+        (quiet &&
          !userspace::text::append_text(args, sizeof(args), len, "--quiet ")) ||
         !userspace::text::append_text(args, sizeof(args), len, url) ||
         !userspace::text::append_char(args, sizeof(args), len, ' ') ||
@@ -1059,7 +1076,7 @@ bool load_indexes(PackageSet& set) {
                 }
                 set.packages[set.count++] = g_repo_set.packages[j];
                 if (!derive_package_url(g_repos[i].indexurl,
-                                        set.packages[set.count - 1].name,
+                                        set.packages[set.count - 1].package,
                                         set.packages[set.count - 1].package_url,
                                         sizeof(set.packages[set.count - 1].package_url))) {
                     print("neupak: unable to derive package URL for ");
@@ -1774,6 +1791,45 @@ bool owned_by_other(const FilesDb& db, const char* package, const char* path, co
     return false;
 }
 
+bool temp_payload_path(const char* package, const char* final_path, char* out, size_t out_size);
+
+bool files_equal(const char* first_path, const char* second_path) {
+    long first = file_open(first_path);
+    if (first < 0) {
+        return false;
+    }
+    long second = file_open(second_path);
+    if (second < 0) {
+        file_close(static_cast<uint32_t>(first));
+        return false;
+    }
+
+    bool equal = true;
+    uint8_t second_buffer[kCopyBufferSize];
+    while (true) {
+        long first_got = file_read(static_cast<uint32_t>(first),
+                                   g_copy_buffer,
+                                   sizeof(g_copy_buffer));
+        long second_got = file_read(static_cast<uint32_t>(second),
+                                    second_buffer,
+                                    sizeof(second_buffer));
+        if (first_got < 0 || second_got < 0 || first_got != second_got) {
+            equal = false;
+            break;
+        }
+        if (first_got == 0) {
+            break;
+        }
+        if (memcmp(g_copy_buffer, second_buffer, static_cast<size_t>(first_got)) != 0) {
+            equal = false;
+            break;
+        }
+    }
+    file_close(static_cast<uint32_t>(first));
+    file_close(static_cast<uint32_t>(second));
+    return equal;
+}
+
 bool check_conflicts(const ZipPlan& plan, const FilesDb& files, const char* package, bool force) {
     for (size_t i = 0; i < plan.count; ++i) {
         const char* owner = nullptr;
@@ -1797,7 +1853,17 @@ bool check_conflicts(const ZipPlan& plan, const FilesDb& files, const char* pack
             long existing = file_open(physical_path);
             if (existing >= 0) {
                 file_close(static_cast<uint32_t>(existing));
-                if (!force) {
+                char package_path[kMaxPath];
+                if (!temp_payload_path(package,
+                                       plan.entries[i].final_path,
+                                       package_path,
+                                       sizeof(package_path))) {
+                    return false;
+                }
+                bool preinstalled_library =
+                    userspace::text::starts_with(plan.entries[i].final_path, "/library/");
+                if (!force && !preinstalled_library &&
+                    !files_equal(physical_path, package_path)) {
                     print("neupak: refusing to overwrite unowned file ");
                     print_line(plan.entries[i].final_path);
                     return false;
@@ -2228,10 +2294,6 @@ bool install_zip_package(const char* zip_path, const Package& pkg, bool force) {
     if (!check_installed_dependencies(pkg, g_installed)) {
         return false;
     }
-    if (!check_conflicts(g_plan, g_files, pkg.name, force)) {
-        return false;
-    }
-
     if (!acquire_lock()) {
         return false;
     }
@@ -2244,10 +2306,10 @@ bool install_zip_package(const char* zip_path, const Package& pkg, bool force) {
         ok = false;
     } else if (!check_installed_dependencies(pkg, g_installed)) {
         ok = false;
-    } else if (!check_conflicts(g_plan, g_files, pkg.name, force)) {
-        ok = false;
     } else if (!extract_zip_to_temp(zip_path, pkg.name)) {
         print_line("neupak: failed to extract package to temp");
+        ok = false;
+    } else if (!check_conflicts(g_plan, g_files, pkg.name, force)) {
         ok = false;
     } else if (!copy_temp_into_place(pkg.name, g_plan)) {
         print_line("neupak: failed to copy package files into place");

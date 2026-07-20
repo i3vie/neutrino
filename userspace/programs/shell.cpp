@@ -425,37 +425,23 @@ const char* skip_spaces(const char* str) {
 }
 
 size_t render_line(long console,
-                   const char* prompt,
-                   size_t prompt_len,
                    const char* buffer,
                    size_t buffer_len,
                    size_t previous_len) {
-    descriptor_write(static_cast<uint32_t>(console), "\r", 1);
-    write_prompt(console, prompt, prompt_len);
+    // Editing is always at the end of the input.  Walk back over the old
+    // input instead of using carriage return: '\r' only reaches the start of
+    // the current physical row, so rewriting the prompt after a line wraps
+    // repeatedly appends/scrolls rows on every key press.
+    for (size_t i = 0; i < previous_len; ++i) {
+        descriptor_write(static_cast<uint32_t>(console), "\b", 1);
+    }
     if (buffer_len > 0) {
         set_console_color(console, kPromptPathColor, kPromptBgColor);
         descriptor_write(static_cast<uint32_t>(console),
                          buffer,
                          buffer_len);
     }
-
-    size_t current_len = prompt_len + buffer_len;
-    if (previous_len > current_len) {
-        size_t diff = previous_len - current_len;
-        for (size_t i = 0; i < diff; ++i) {
-            descriptor_write(static_cast<uint32_t>(console), " ", 1);
-        }
-        descriptor_write(static_cast<uint32_t>(console), "\r", 1);
-        write_prompt(console, prompt, prompt_len);
-        if (buffer_len > 0) {
-            set_console_color(console, kPromptPathColor, kPromptBgColor);
-            descriptor_write(static_cast<uint32_t>(console),
-                             buffer,
-                             buffer_len);
-        }
-        current_len = prompt_len + buffer_len;
-    }
-    return current_len;
+    return buffer_len;
 }
 
 bool starts_with(const char* text, const char* prefix) {
@@ -784,7 +770,7 @@ int main(uint64_t arg, uint64_t) {
     char input_buffer[kMaxInputLength];
     size_t input_length = 0;
     input_buffer[0] = '\0';
-    size_t rendered_length = prompt_len;
+    size_t rendered_length = 0;
     char history[kHistoryCapacity][kMaxInputLength]{};
     size_t history_count = 0;
     size_t history_position = 0;
@@ -798,8 +784,6 @@ int main(uint64_t arg, uint64_t) {
         auto show_input = [&]() {
             prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
             rendered_length = render_line(console,
-                                          prompt_buffer,
-                                          prompt_len,
                                           input_buffer,
                                           input_length,
                                           rendered_length);
@@ -879,42 +863,35 @@ int main(uint64_t arg, uint64_t) {
                 history_draft[0] = '\0';
                 prompt_len = build_prompt(prompt_buffer, sizeof(prompt_buffer));
                 write_prompt(console, prompt_buffer, prompt_len);
-                rendered_length = prompt_len;
+                rendered_length = 0;
             } else if (key == '\b' || key == 0x7F) {
                 if (input_length > 0) {
                     --input_length;
                     input_buffer[input_length] = '\0';
-                    prompt_len = build_prompt(prompt_buffer,
-                                              sizeof(prompt_buffer));
                     if (echo_input) {
-                        rendered_length = render_line(console,
-                                                      prompt_buffer,
-                                                      prompt_len,
-                                                      input_buffer,
-                                                      input_length,
-                                                      rendered_length);
-                    } else
-                        rendered_length = prompt_len + input_length;
+                        descriptor_write(static_cast<uint32_t>(console),
+                                         "\b",
+                                         1);
+                    }
+                    rendered_length = input_length;
                 }
             } else if (key == '\t') {
                 bool listed = complete_path(console, input_buffer, input_length);
-                if (listed) rendered_length = 0;
+                if (listed) {
+                    write_prompt(console, prompt_buffer, prompt_len);
+                    rendered_length = 0;
+                }
                 show_input();
             } else if (key >= 0x20 && key <= 0x7E) {
                 if (input_length + 1 < sizeof(input_buffer)) {
                     input_buffer[input_length++] = static_cast<char>(key);
                     input_buffer[input_length] = '\0';
-                    prompt_len = build_prompt(prompt_buffer,
-                                              sizeof(prompt_buffer));
                     if (echo_input) {
-                        rendered_length = render_line(console,
-                                                      prompt_buffer,
-                                                      prompt_len,
-                                                      input_buffer,
-                                                      input_length,
-                                                      rendered_length);
-                    } else
-                        rendered_length = prompt_len + input_length;
+                        descriptor_write(static_cast<uint32_t>(console),
+                                         &input_buffer[input_length - 1],
+                                         1);
+                    }
+                    rendered_length = input_length;
                 }
             }
         };

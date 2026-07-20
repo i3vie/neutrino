@@ -20,6 +20,8 @@ constexpr uint32_t kDefaultFg = 0xFFFFFFFF;
 constexpr uint32_t kDefaultBg = 0x00000000;
 constexpr long kWouldBlock = -2;
 constexpr const char* kInstallerPath = "binary/installer.elf";
+constexpr const char* kUserDirectory = "user";
+constexpr const char* kRootHomeDirectory = "user/root";
 constexpr uint8_t kNeufsMagic[8] = {
     0x4E, 0x45, 0x55, 0x46, 0x53, 0x00, 0x77, 0x42};
 constexpr int32_t kNeufsVersion = 1;
@@ -1424,6 +1426,34 @@ bool write_installed_module_loads(const char* target_root, long console) {
     return ok;
 }
 
+bool ensure_installed_directory(const char* target_root,
+                                const char* relative_path,
+                                long console) {
+    char path[160];
+    if (!append_path(target_root, relative_path, path, sizeof(path))) {
+        userspace::write_line(console, "installed directory path too long");
+        return false;
+    }
+
+    long directory = directory_open(path);
+    if (directory >= 0) {
+        directory_close(static_cast<uint32_t>(directory));
+        return true;
+    }
+    if (directory_create(path) >= 0) {
+        return true;
+    }
+
+    userspace::write(console, "failed to create installed directory: ");
+    userspace::write_line(console, path);
+    return false;
+}
+
+bool ensure_installed_root_home(const char* target_root, long console) {
+    return ensure_installed_directory(target_root, kUserDirectory, console) &&
+           ensure_installed_directory(target_root, kRootHomeDirectory, console);
+}
+
 bool write_config_chunk(uint32_t file,
                         const char* text,
                         const char* label,
@@ -1717,7 +1747,8 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     strlcpy(progress.current, source_root, sizeof(progress.current));
     render_copy_progress(progress, true);
 
-    ok = copy_tree(source_root, target_root, console, &progress);
+    ok = copy_tree(source_root, target_root, console, &progress) &&
+         ensure_installed_root_home(target_root, console);
     if (ok) {
         (void)write_installed_module_loads(target_root, console);
         progress.copied_files = progress.total_files;
