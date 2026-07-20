@@ -2,6 +2,7 @@
 ARCH       := x86_64
 CROSS      := x86_64-elf-
 CC         := $(CROSS)g++
+C_CC       := $(CROSS)gcc
 LD         := $(CROSS)ld
 AS         := nasm -f elf64
 OBJCOPY    := $(CROSS)objcopy
@@ -15,7 +16,8 @@ TARGET_ISO := $(OUT_DIR)/neutrino.iso
 TARGET_DISK_IMG ?= hdd.img
 TARGET_DISK_SIZE ?= 4G
 
-CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH)
+CFLAGS     := -std=c++20 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -fno-exceptions -fno-rtti -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH) -I$(SRC_DIR)/third_party/uacpi/include
+UACPI_CFLAGS := -std=c11 -g -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-sse -mno-mmx -mno-avx -mno-avx512f -mno-sse2 -mcmodel=kernel $(EXTRA_CFLAGS) -Ishared/include -I$(SRC_DIR) -I$(SRC_DIR)/arch/$(ARCH) -I$(SRC_DIR)/third_party/uacpi/include
 LDFLAGS    := -T $(SRC_DIR)/linker.ld -nostdlib
 
 # === QEMU configuration ===
@@ -23,7 +25,7 @@ QEMU ?= qemu-system-x86_64
 QEMU_BIOS ?= /usr/share/edk2/x64/OVMF.4m.fd
 QEMU_NET_MAC ?= 52:54:00:12:34:56
 QEMU_NET_BACKEND ?= user
-QEMU_NET_DEVICE ?= e1000e
+QEMU_NET_DEVICE ?= virtio-net-pci
 QEMU_STORAGE ?= ahci
 QEMU_PRIMARY_IMG ?= $(TARGET_DISK_IMG)
 QEMU_PRIMARY_IMG := $(if $(strip $(QEMU_PRIMARY_IMG)),$(QEMU_PRIMARY_IMG),$(TARGET_DISK_IMG))
@@ -32,7 +34,8 @@ QEMU_EXTRA_AHCI_IMG ?=
 QEMU_XHCI ?= 0
 QEMU_USB_STORAGE_IMG ?=
 QEMU_HDA ?= 1
-QEMU_AUDIO_DRIVER ?= sdl
+QEMU_AUDIO_DRIVER ?= pipewire
+QEMU_AUDIO_OPTIONS ?= timer-period=5000,out.buffer-length=100000,out.latency=100000
 QEMU_HOSTFWD ?= tcp::2222-:2222
 QEMU_LIVE_BOOT_ARGS ?= -boot order=d
 QEMU_INSTALLED_BOOT_ARGS ?= -boot order=c
@@ -80,14 +83,14 @@ QEMU_USB_ARGS += -drive file=$(QEMU_USB_STORAGE_IMG),format=raw,if=none,id=usb_d
 endif
 endif
 ifeq ($(QEMU_HDA),1)
-QEMU_AUDIO_ARGS := -audiodev $(QEMU_AUDIO_DRIVER),id=audio0 \
+QEMU_AUDIO_ARGS := -audiodev $(QEMU_AUDIO_DRIVER),id=audio0,$(QEMU_AUDIO_OPTIONS) \
 		-device ich9-intel-hda -device hda-output,audiodev=audio0
 endif
 QEMU_BASE_ARGS := -m 1G -serial stdio \
 		-smp 4 -bios $(QEMU_BIOS) \
 		$(QEMU_STORAGE_ARGS) \
 		-enable-kvm -display sdl \
-		-machine pc -cpu qemu64,+apic \
+		-machine pc -cpu qemu64,+apic,+rdrand \
 		$(QEMU_USB_ARGS) \
 		$(QEMU_AUDIO_ARGS) \
 		$(QEMU_NET_ARGS)
@@ -112,8 +115,10 @@ KERNEL_MODULES := $(OUT_DIR)/modules/e1000e.ko
 KERNEL_MODULE_LOADS := $(OUT_DIR)/modules/loads.txt
 SRC_CPP_ALL := $(shell find $(SRC_DIR) -type f -name '*.cpp')
 SRC_CPP := $(filter-out $(KERNEL_MODULE_CPP),$(SRC_CPP_ALL))
+UACPI_C := $(shell find $(SRC_DIR)/third_party/uacpi/source -maxdepth 1 -type f -name '*.c')
 SRC_ASM := $(shell find $(SRC_DIR) -type f -name '*.S')
 OBJ     := $(SRC_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o) \
+           $(UACPI_C:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o) \
            $(SRC_ASM:$(SRC_DIR)/%.S=$(BUILD_DIR)/%.o)
 KERNEL_SIMD_CPP ?=
 KERNEL_SIMD_OBJ := $(KERNEL_SIMD_CPP:$(SRC_DIR)/%.cpp=$(BUILD_DIR)/%.o)
@@ -129,6 +134,11 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "[C++] $<"
 	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/third_party/uacpi/source/%.o: $(SRC_DIR)/third_party/uacpi/source/%.c
+	@mkdir -p $(dir $@)
+	@echo "[CC]   $<"
+	$(C_CC) $(UACPI_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 	@mkdir -p $(dir $@)
@@ -284,6 +294,15 @@ $(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(KERNEL_MODU
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
 	mkfs.fat -F 32 --mbr=y $@
 	$(MAKE) -C userspace install-mtools HDD_IMAGE=$(abspath $@) PROGRAMS="$(LIVE_ROOTFS_PROGRAMS)" CONFIG_DIR="$(LIVE_ROOTFS_CONFIG_DIR)"
+	# The live medium is read-only at runtime.  Seed it with an explicit valid,
+	# empty v3 credential store so init can distinguish intentional bootstrap
+	# mode from a missing, truncated, or corrupt database.
+	mmd -i $@ ::/system
+	printf '\125\104\124\116\003\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(OUT_DIR)/live-users.ntd
+	mcopy -i $@ $(OUT_DIR)/live-users.ntd ::/system/users.ntd
+	rm -f $(OUT_DIR)/live-users.ntd
+	mmd -i $@ ::/config/ssl
+	mcopy -i $@ userspace/config/ssl/cacert.pem ::/config/ssl/cacert.pem
 	mmd -i $@ ::/modules
 	mcopy -i $@ $(KERNEL_MODULES) ::/modules/
 	mcopy -i $@ $(KERNEL_MODULE_LOADS) ::/modules/loads.txt

@@ -10,6 +10,7 @@
 #include "../../kernel/loader.hpp"
 #include "../../kernel/module.hpp"
 #include "../../kernel/process.hpp"
+#include "../../kernel/random.hpp"
 #include "../../kernel/path_util.hpp"
 #include "../../kernel/scheduler.hpp"
 #include "../../kernel/time.hpp"
@@ -17,6 +18,7 @@
 #include "../../fs/vfs.hpp"
 #include "../../lib/mem.hpp"
 #include "../../kernel/string_util.hpp"
+#include "../../kernel/sync.hpp"
 #include "../../kernel/users.hpp"
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/io.hpp"
@@ -26,10 +28,19 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 1;
-constexpr uint64_t kAbiMinor = 0;
+constexpr uint64_t kAbiMinor = 1;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
+sync::SpinLock g_exec_lock;
+
+class ExecImageGuard {
+public:
+    ExecImageGuard() { g_exec_lock.lock(); }
+    ~ExecImageGuard() { g_exec_lock.unlock(); }
+    ExecImageGuard(const ExecImageGuard&) = delete;
+    ExecImageGuard& operator=(const ExecImageGuard&) = delete;
+};
 
 struct ProcessStdioConfig {
     uint32_t stdin_handle;
@@ -92,7 +103,12 @@ uint64_t place_args_on_stack(process::Process& child, const char* args) {
 
     constexpr size_t kMaxArgBytes = 512;
     char arg_copy[kMaxArgBytes];
-    if (!vm::copy_user_string(args, arg_copy, sizeof(arg_copy))) {
+    process::Process* parent = process::current();
+    if (parent == nullptr ||
+        !vm::copy_user_string(parent->cr3,
+                              args,
+                              arg_copy,
+                              sizeof(arg_copy))) {
         log_message(LogLevel::Error,
                     "ExecArgs: copy_user_string failed ptr=%llx",
                     static_cast<unsigned long long>(
@@ -249,6 +265,12 @@ bool descriptor_type_requires_hardware_access(uint32_t type) {
 bool descriptor_type_requires_monitor_access(uint32_t type) {
     return type == descriptor::kTypeCpuStats ||
            type == descriptor::kTypeTaskStats;
+}
+
+bool descriptor_type_requires_stream_access(uint32_t type) {
+    return type == descriptor::kTypePipe ||
+           type == descriptor::kTypeSharedMemory ||
+           type == descriptor::kTypeNetEndpoint;
 }
 
 uint32_t duplicate_stream_descriptor(process::Process& from,
@@ -435,6 +457,13 @@ Result handle_syscall(SyscallFrame& frame) {
             if (descriptor_type_requires_monitor_access(type) &&
                 !require_capability(*proc,
                                     capabilities::CapabilityKind::Monitor,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (descriptor_type_requires_stream_access(type) &&
+                !require_capability(*proc,
+                                    capabilities::CapabilityKind::Stream,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -639,6 +668,7 @@ Result handle_syscall(SyscallFrame& frame) {
             const char* mount_name_ptr = nullptr;
             if (frame.rsi != 0) {
                 if (!vm::copy_user_string(
+                        proc->cr3,
                         reinterpret_cast<const char*>(frame.rsi),
                         mount_name,
                         sizeof(mount_name))) {
@@ -699,12 +729,26 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             bool ok =
                 file_io::sync_file(*proc, static_cast<uint32_t>(frame.rdi));
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
         case SystemCall::Sync: {
+            process::Process* proc = process::current();
+            if (proc != nullptr &&
+                !require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             bool ok = fs::block_cache::flush_all();
             frame.rax = ok ? 0 : static_cast<uint64_t>(-1);
             return Result::Continue;
@@ -735,7 +779,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
             if (!require_capability(*proc,
-                                    capabilities::CapabilityKind::HardwareAccess,
+                                    capabilities::CapabilityKind::ModuleLoad,
                                     frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -746,15 +790,17 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            size_t path_len = string_util::length(path_user);
-            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+            char path_input[path_util::kMaxPathLength];
+            if (!vm::copy_user_string(proc->cr3,
+                                      path_user,
+                                      path_input,
+                                      sizeof(path_input)) ||
+                path_input[0] == '\0') {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
-            char path_input[path_util::kMaxPathLength];
             char resolved[path_util::kMaxPathLength];
-            string_util::copy(path_input, sizeof(path_input), path_user);
             if (!path_util::build_absolute_path(proc->cwd,
                                                 path_input,
                                                 resolved)) {
@@ -816,6 +862,12 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             int64_t result =
                 file_io::write_file(*proc,
                                     static_cast<uint32_t>(frame.rdi),
@@ -827,6 +879,12 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::FileCreate: {
             process::Process* proc = process::current();
             if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -855,15 +913,17 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            size_t path_len = string_util::length(path_user);
-            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+            char path_input[path_util::kMaxPathLength];
+            if (!vm::copy_user_string(proc->cr3,
+                                      path_user,
+                                      path_input,
+                                      sizeof(path_input)) ||
+                path_input[0] == '\0') {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
-            char path_input[path_util::kMaxPathLength];
             char resolved_exec[path_util::kMaxPathLength];
-            string_util::copy(path_input, sizeof(path_input), path_user);
             if (!path_util::build_absolute_path(proc->cwd,
                                                 path_input,
                                                 resolved_exec)) {
@@ -871,6 +931,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
+            ExecImageGuard exec_guard;
             loader::ProgramImage image{};
             if (!load_program_image(resolved_exec, image)) {
                 frame.rax = static_cast<uint64_t>(-1);
@@ -895,10 +956,12 @@ Result handle_syscall(SyscallFrame& frame) {
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
-                size_t cwd_len = string_util::length(cwd_user);
-                if (cwd_len > 0 && cwd_len < path_util::kMaxPathLength) {
-                    char cwd_input[path_util::kMaxPathLength];
-                    string_util::copy(cwd_input, sizeof(cwd_input), cwd_user);
+                char cwd_input[path_util::kMaxPathLength];
+                if (vm::copy_user_string(proc->cr3,
+                                         cwd_user,
+                                         cwd_input,
+                                         sizeof(cwd_input)) &&
+                    cwd_input[0] != '\0') {
                     child_cwd_valid = path_util::build_absolute_path(proc->cwd,
                                                                      cwd_input,
                                                                      child_cwd_buffer);
@@ -991,15 +1054,17 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            size_t path_len = string_util::length(path_user);
-            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+            char path_input[path_util::kMaxPathLength];
+            if (!vm::copy_user_string(proc->cr3,
+                                      path_user,
+                                      path_input,
+                                      sizeof(path_input)) ||
+                path_input[0] == '\0') {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
-            char path_input[path_util::kMaxPathLength];
             char resolved_exec[path_util::kMaxPathLength];
-            string_util::copy(path_input, sizeof(path_input), path_user);
             if (!path_util::build_absolute_path(proc->cwd,
                                                 path_input,
                                                 resolved_exec)) {
@@ -1007,6 +1072,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
+            ExecImageGuard exec_guard;
             loader::ProgramImage image{};
             if (!load_program_image(resolved_exec, image)) {
                 frame.rax = static_cast<uint64_t>(-1);
@@ -1031,10 +1097,12 @@ Result handle_syscall(SyscallFrame& frame) {
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
-                size_t cwd_len = string_util::length(cwd_user);
-                if (cwd_len > 0 && cwd_len < path_util::kMaxPathLength) {
-                    char cwd_input[path_util::kMaxPathLength];
-                    string_util::copy(cwd_input, sizeof(cwd_input), cwd_user);
+                char cwd_input[path_util::kMaxPathLength];
+                if (vm::copy_user_string(proc->cr3,
+                                         cwd_user,
+                                         cwd_input,
+                                         sizeof(cwd_input)) &&
+                    cwd_input[0] != '\0') {
                     child_cwd_valid = path_util::build_absolute_path(proc->cwd,
                                                                      cwd_input,
                                                                      child_cwd_buffer);
@@ -1092,15 +1160,17 @@ Result handle_syscall(SyscallFrame& frame) {
                 return Result::Continue;
             }
 
-            size_t path_len = string_util::length(path_user);
-            if (path_len == 0 || path_len >= path_util::kMaxPathLength) {
+            char path_input[path_util::kMaxPathLength];
+            if (!vm::copy_user_string(proc->cr3,
+                                      path_user,
+                                      path_input,
+                                      sizeof(path_input)) ||
+                path_input[0] == '\0') {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
-            char path_input[path_util::kMaxPathLength];
             char resolved[path_util::kMaxPathLength];
-            string_util::copy(path_input, sizeof(path_input), path_user);
             if (!path_util::build_absolute_path(proc->cwd,
                                                 path_input,
                                                 resolved)) {
@@ -1135,10 +1205,21 @@ Result handle_syscall(SyscallFrame& frame) {
                 cwd_len = static_cast<size_t>(buffer_size - 1);
             }
 
-            for (size_t i = 0; i < cwd_len; ++i) {
-                buffer[i] = proc->cwd[i];
+            if (!vm::copy_to_user(proc->cr3,
+                                  reinterpret_cast<uint64_t>(buffer),
+                                  proc->cwd,
+                                  cwd_len)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
             }
-            buffer[cwd_len] = '\0';
+            const char terminator = '\0';
+            if (!vm::copy_to_user(proc->cr3,
+                                  reinterpret_cast<uint64_t>(buffer) + cwd_len,
+                                  &terminator,
+                                  sizeof(terminator))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             frame.rax = static_cast<uint64_t>(cwd_len);
             return Result::Continue;
         }
@@ -1217,6 +1298,12 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             uint32_t parent = static_cast<uint32_t>(frame.rdi);
             const char* name = reinterpret_cast<const char*>(frame.rsi);
             int32_t handle = file_io::create_file_at(*proc, parent, name);
@@ -1226,6 +1313,12 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::DirectoryCreate: {
             process::Process* proc = process::current();
             if (proc == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1241,6 +1334,12 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             const char* path = reinterpret_cast<const char*>(frame.rdi);
             frame.rax = file_io::remove_file(*proc, path)
                             ? 0
@@ -1253,6 +1352,12 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (!require_capability(*proc,
+                                    capabilities::CapabilityKind::FileSystemWrite,
+                                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             const char* path = reinterpret_cast<const char*>(frame.rdi);
             frame.rax = file_io::remove_directory(*proc, path)
                             ? 0
@@ -1262,6 +1367,8 @@ Result handle_syscall(SyscallFrame& frame) {
         case SystemCall::TimeGet: {
             process::Process* proc = process::current();
             if (proc == nullptr) {
+                log_message(LogLevel::Warn,
+                            "TimeGet: no current process");
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1270,21 +1377,78 @@ Result handle_syscall(SyscallFrame& frame) {
                 reinterpret_cast<NeutrinoWallTime*>(frame.rdi);
             uint64_t out_size = frame.rsi;
             if (out_time == nullptr || out_size < sizeof(NeutrinoWallTime)) {
+                log_message(LogLevel::Warn,
+                            "TimeGet: invalid output ptr=%llx size=%llu expected=%zu",
+                            static_cast<unsigned long long>(frame.rdi),
+                            static_cast<unsigned long long>(out_size),
+                            sizeof(NeutrinoWallTime));
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
             NeutrinoWallTime snapshot{};
-            if (!timekeeping::snapshot(snapshot) ||
-                !vm::copy_to_user(proc->cr3,
+            if (!timekeeping::snapshot(snapshot)) {
+                log_message(LogLevel::Warn,
+                            "TimeGet: wall clock snapshot unavailable");
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (!vm::copy_to_user(proc->cr3,
                                   reinterpret_cast<uint64_t>(out_time),
                                   &snapshot,
                                   sizeof(snapshot))) {
+                log_message(LogLevel::Warn,
+                            "TimeGet: copy_to_user failed pid=%u cr3=%llx ptr=%llx size=%zu",
+                            static_cast<unsigned>(proc->pid),
+                            static_cast<unsigned long long>(proc->cr3),
+                            static_cast<unsigned long long>(frame.rdi),
+                            sizeof(snapshot));
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
 
             frame.rax = 0;
+            return Result::Continue;
+        }
+        case SystemCall::RandomGet: {
+            process::Process* proc = process::current();
+            uint64_t user_address = frame.rdi;
+            size_t length = static_cast<size_t>(frame.rsi);
+            constexpr size_t kMaxRandomRequest = 1024 * 1024;
+            if (proc == nullptr || length > kMaxRandomRequest ||
+                (length != 0 && user_address == 0)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            if (length != 0 &&
+                !vm::validate_user_buffer(proc->cr3,
+                                          user_address,
+                                          length,
+                                          true)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+
+            uint8_t buffer[64];
+            size_t offset = 0;
+            while (offset < length) {
+                size_t chunk = length - offset;
+                if (chunk > sizeof(buffer)) {
+                    chunk = sizeof(buffer);
+                }
+                if (!kernel_random::secure_fill(buffer, chunk) ||
+                    !vm::copy_to_user(proc->cr3,
+                                      user_address + offset,
+                                      buffer,
+                                      chunk)) {
+                    memset(buffer, 0, sizeof(buffer));
+                    frame.rax = static_cast<uint64_t>(-1);
+                    return Result::Continue;
+                }
+                offset += chunk;
+            }
+            memset(buffer, 0, sizeof(buffer));
+            frame.rax = length;
             return Result::Continue;
         }
         case SystemCall::MapAnonymous: {
@@ -1350,11 +1514,15 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            void* backing_user = reinterpret_cast<void*>(frame.rdi);
+            users::User* backing_user = users::from_handle(frame.rdi);
+            if (frame.rdi != 0 && backing_user == nullptr) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             uint64_t allowed_mask = frame.rsi;
             capabilities::Principal* principal =
                 capabilities::create_principal(backing_user, allowed_mask);
-            frame.rax = reinterpret_cast<uint64_t>(principal);
+            frame.rax = capabilities::principal_handle(principal);
             return Result::Continue;
         }
         case SystemCall::PrincipalSet: {
@@ -1366,7 +1534,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            auto* principal = reinterpret_cast<capabilities::Principal*>(frame.rdi);
+            auto* principal = capabilities::principal_from_handle(frame.rdi);
             if (!capabilities::principal_is_valid(principal)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
@@ -1464,10 +1632,17 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            const char* name = reinterpret_cast<const char*>(frame.rdi);
+            char name[32];
+            if (!vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rdi),
+                                      name,
+                                      sizeof(name))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             uint64_t caps = frame.rsi;
             users::User* user = users::create(name, caps);
-            frame.rax = reinterpret_cast<uint64_t>(user);
+            frame.rax = users::handle_for(user);
             return Result::Continue;
         }
         case SystemCall::UserFind: {
@@ -1479,9 +1654,16 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            const char* name = reinterpret_cast<const char*>(frame.rdi);
+            char name[32];
+            if (!vm::copy_user_string(proc->cr3,
+                                      reinterpret_cast<const char*>(frame.rdi),
+                                      name,
+                                      sizeof(name))) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             users::User* user = users::find(name);
-            frame.rax = reinterpret_cast<uint64_t>(user);
+            frame.rax = users::handle_for(user);
             return Result::Continue;
         }
         case SystemCall::UserBumpGeneration: {
@@ -1493,7 +1675,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            auto* user = reinterpret_cast<users::User*>(frame.rdi);
+            auto* user = users::from_handle(frame.rdi);
             if (user != nullptr) {
                 users::bump_generation(*user);
                 frame.rax = 0;
@@ -1511,7 +1693,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            auto* user = reinterpret_cast<users::User*>(frame.rdi);
+            auto* user = users::from_handle(frame.rdi);
             const auto* user_salt = reinterpret_cast<const uint8_t*>(frame.rsi);
             const auto* user_hash = reinterpret_cast<const uint8_t*>(frame.rdx);
             uint32_t iterations = static_cast<uint32_t>(frame.r10);
@@ -1542,7 +1724,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            auto* user = reinterpret_cast<users::User*>(frame.rdi);
+            auto* user = users::from_handle(frame.rdi);
             auto* user_info = reinterpret_cast<syscall::UserInfo*>(frame.rsi);
             if (user == nullptr || user_info == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);

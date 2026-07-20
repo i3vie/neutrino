@@ -63,6 +63,7 @@ enum class SystemCall : uint64_t {
     ModuleLoad           = 53,
     ModuleCount          = 54,
     ModuleInfo           = 55,
+    RandomGet            = 56,
 };
 
 Result handle_syscall(SyscallFrame& frame);

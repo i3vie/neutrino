@@ -470,15 +470,13 @@ bool load_login_users(LoginUsers& users) {
                                        len);
     }
     if (!loaded || len < sizeof(UserStoreHeader)) {
-        ensure_login_user(users, kRootUserName);
-        return users.count != 0;
+        return false;
     }
 
     UserStoreHeader header{};
     memcpy(&header, buffer, sizeof(header));
     if (header.magic != 0x4E544455u) {
-        ensure_login_user(users, kRootUserName);
-        return users.count != 0;
+        return false;
     }
     bool current_v2 = header.version == 2 &&
                       header.entry_size == sizeof(PackedUser);
@@ -487,26 +485,21 @@ bool load_login_users(LoginUsers& users) {
     bool legacy = header.version == 1 &&
                   header.entry_size == sizeof(PackedUserV1);
     if (!current_v2 && !current_v3 && !legacy) {
-        ensure_login_user(users, kRootUserName);
-        return users.count != 0;
+        return false;
     }
 
     size_t available = 0;
     size_t count = header.count;
     if (current_v3) {
         if (len < sizeof(UserStoreHeaderV3)) {
-            ensure_login_user(users, kRootUserName);
-            return users.count != 0;
+            return false;
         }
         available = (len - sizeof(UserStoreHeaderV3)) / header.entry_size;
     } else {
         available = (len - sizeof(UserStoreHeader)) / header.entry_size;
     }
     if (count > available) {
-        count = available;
-    }
-    if (count > available) {
-        count = available;
+        return false;
     }
     if (count > kMaxLoginUsers) {
         count = kMaxLoginUsers;
@@ -561,7 +554,9 @@ bool verify_login_password(TelnetSession& session,
                            const LoginUsers& users,
                            size_t index) {
     if (index >= users.count || !users.password_set[index]) {
-        return true;
+        // Network authentication must never accept a passwordless account,
+        // including the explicit local bootstrap root account.
+        return false;
     }
     telnet_set_password_mode(session, true);
     endpoint_write(session.endpoint, "password: ");
@@ -791,7 +786,11 @@ bool login_connection(TelnetSession& session,
                       char* user_name,
                       size_t user_name_size) {
     LoginUsers users{};
-    load_login_users(users);
+    if (!load_login_users(users)) {
+        endpoint_write(session.endpoint,
+                       "Authentication database unavailable\r\n");
+        return false;
+    }
     endpoint_write(session.endpoint, "\r\nNeutrino telnet\r\nlogin: ");
     char name[kMaxUserNameLength];
     if (!endpoint_read_line(session, name, sizeof(name), false)) {

@@ -3,23 +3,11 @@
 #include "../log/logging.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 
+extern "C" {
+#include <uacpi/tables.h>
+}
+
 namespace {
-
-struct [[gnu::packed]] RsdpV1 {
-    char signature[8];
-    uint8_t checksum;
-    char oem_id[6];
-    uint8_t revision;
-    uint32_t rsdt_address;
-};
-
-struct [[gnu::packed]] RsdpV2 {
-    RsdpV1 first_part;
-    uint32_t length;
-    uint64_t xsdt_address;
-    uint8_t extended_checksum;
-    uint8_t reserved[3];
-};
 
 struct [[gnu::packed]] AcpiSdtHeader {
     char signature[4];
@@ -90,30 +78,6 @@ IsoOverride g_overrides[kMaxOverrides]{};
 bool g_available = false;
 bool g_handles_irq[16]{};
 uint32_t g_lapic_id = 0;
-
-bool match_signature(const char* lhs, const char* rhs, size_t length) {
-    if (lhs == nullptr || rhs == nullptr) {
-        return false;
-    }
-    for (size_t i = 0; i < length; ++i) {
-        if (lhs[i] != rhs[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool checksum_ok(const void* data, size_t length) {
-    if (data == nullptr || length == 0) {
-        return false;
-    }
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    uint8_t sum = 0;
-    for (size_t i = 0; i < length; ++i) {
-        sum = static_cast<uint8_t>(sum + bytes[i]);
-    }
-    return sum == 0;
-}
 
 volatile uint32_t* map_mmio(uint32_t phys_addr, uint64_t hhdm_offset) {
     uint64_t virt_addr = static_cast<uint64_t>(phys_addr) + hhdm_offset;
@@ -192,79 +156,11 @@ IoApicInfo* find_ioapic_for_gsi(uint32_t gsi) {
     return nullptr;
 }
 
-const AcpiSdtHeader* find_madt_from_sdt(const AcpiSdtHeader* sdt, bool xsdt) {
-    if (sdt == nullptr || sdt->length < sizeof(AcpiSdtHeader)) {
-        return nullptr;
-    }
-    if (!checksum_ok(sdt, sdt->length)) {
-        return nullptr;
-    }
-    size_t entry_size = xsdt ? sizeof(uint64_t) : sizeof(uint32_t);
-    size_t payload_length = sdt->length - sizeof(AcpiSdtHeader);
-    size_t entry_count = payload_length / entry_size;
-    const uint8_t* entry_base =
-        reinterpret_cast<const uint8_t*>(sdt) + sizeof(AcpiSdtHeader);
-    for (size_t i = 0; i < entry_count; ++i) {
-        const AcpiSdtHeader* child = nullptr;
-        if (xsdt) {
-            auto address =
-                reinterpret_cast<const uint64_t*>(entry_base)[i];
-            child = reinterpret_cast<const AcpiSdtHeader*>(
-                static_cast<uintptr_t>(address));
-        } else {
-            auto address =
-                reinterpret_cast<const uint32_t*>(entry_base)[i];
-            child = reinterpret_cast<const AcpiSdtHeader*>(
-                static_cast<uintptr_t>(address));
-        }
-        if (child != nullptr && match_signature(child->signature, "APIC", 4)) {
-            return child;
-        }
-    }
-    return nullptr;
-}
-
-const Madt* find_madt(uint64_t rsdp_address) {
-    if (rsdp_address == 0) {
-        return nullptr;
-    }
-    const auto* rsdp = reinterpret_cast<const RsdpV1*>(
-        static_cast<uintptr_t>(rsdp_address));
-    if (!match_signature(rsdp->signature, "RSD PTR ", 8) ||
-        !checksum_ok(rsdp, sizeof(RsdpV1))) {
-        return nullptr;
-    }
-
-    if (rsdp->revision >= 2) {
-        const auto* rsdp2 = reinterpret_cast<const RsdpV2*>(rsdp);
-        if (rsdp2->length < sizeof(RsdpV2) ||
-            !checksum_ok(rsdp2, rsdp2->length)) {
-            return nullptr;
-        }
-        if (rsdp2->xsdt_address != 0) {
-            const auto* xsdt = reinterpret_cast<const AcpiSdtHeader*>(
-                static_cast<uintptr_t>(rsdp2->xsdt_address));
-            if (const auto* madt = find_madt_from_sdt(xsdt, true)) {
-                return reinterpret_cast<const Madt*>(madt);
-            }
-        }
-    }
-
-    if (rsdp->rsdt_address != 0) {
-        const auto* rsdt = reinterpret_cast<const AcpiSdtHeader*>(
-            static_cast<uintptr_t>(rsdp->rsdt_address));
-        if (const auto* madt = find_madt_from_sdt(rsdt, false)) {
-            return reinterpret_cast<const Madt*>(madt);
-        }
-    }
-    return nullptr;
-}
-
 }  // namespace
 
 namespace ioapic {
 
-void init(uint64_t rsdp_address, uint64_t hhdm_offset, uint32_t lapic_id) {
+void init(uint64_t hhdm_offset, uint32_t lapic_id) {
     g_available = false;
     g_lapic_id = lapic_id;
     for (size_t i = 0; i < kMaxIoApics; ++i) {
@@ -277,8 +173,15 @@ void init(uint64_t rsdp_address, uint64_t hhdm_offset, uint32_t lapic_id) {
         g_handles_irq[i] = false;
     }
 
-    const Madt* madt = find_madt(rsdp_address);
+    uacpi_table table{};
+    const uacpi_status table_status =
+        uacpi_table_find_by_signature("APIC", &table);
+    const Madt* madt = table_status == UACPI_STATUS_OK
+        ? reinterpret_cast<const Madt*>(table.ptr) : nullptr;
     if (madt == nullptr || madt->header.length < sizeof(Madt)) {
+        if (table_status == UACPI_STATUS_OK) {
+            (void)uacpi_table_unref(&table);
+        }
         log_message(LogLevel::Info, "IOAPIC: MADT not available");
         return;
     }
@@ -304,6 +207,8 @@ void init(uint64_t rsdp_address, uint64_t hhdm_offset, uint32_t lapic_id) {
         }
         cursor += header->length;
     }
+
+    (void)uacpi_table_unref(&table);
 
     for (size_t i = 0; i < kMaxIoApics; ++i) {
         if (g_ioapics[i].present) {

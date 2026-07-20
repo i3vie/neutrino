@@ -6,7 +6,7 @@
 
 namespace ioapic {
 
-void init(uint64_t rsdp_address, uint64_t hhdm_offset, uint32_t lapic_id);
+void init(uint64_t hhdm_offset, uint32_t lapic_id);
 bool available();
 bool route_isa_irq(uint8_t irq, uint8_t vector);
 bool handles_irq(uint8_t irq);

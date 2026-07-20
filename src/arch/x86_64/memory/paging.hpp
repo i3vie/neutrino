@@ -5,7 +5,9 @@ constexpr uint64_t PAGE_FLAG_WRITE  = 1ull << 1;
 constexpr uint64_t PAGE_FLAG_USER   = 1ull << 2;
 constexpr uint64_t PAGE_FLAG_WRITE_THROUGH = 1ull << 3;
 constexpr uint64_t PAGE_FLAG_CACHE_DISABLE = 1ull << 4;
+constexpr uint64_t PAGE_FLAG_WRITE_COMBINING = 1ull << 7;
 constexpr uint64_t PAGE_FLAG_GLOBAL = 1ull << 8;
+constexpr uint64_t PAGE_FLAG_NO_EXECUTE = 1ull << 63;
 
 void paging_init();
 bool paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
@@ -25,6 +27,8 @@ bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out);
 bool paging_resolve_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out);
 bool paging_flags_cr3(uint64_t cr3, uint64_t virt, uint64_t& flags_out);
 bool paging_set_writable_cr3(uint64_t cr3, uint64_t virt, bool writable);
+bool paging_set_executable_cr3(uint64_t cr3, uint64_t virt, bool executable);
+bool paging_flush_tlb_all_cpus();
 void* paging_phys_to_virt(uint64_t phys);
 bool paging_unmap_page(uint64_t virt, uint64_t& phys_out);
 void paging_free_physical(uint64_t phys);

@@ -10,6 +10,7 @@
 #include "../drivers/interrupts/ioapic.hpp"
 #include "../drivers/interrupts/pic.hpp"
 #include "../drivers/limine/limine_requests.hpp"
+#include "drivers/acpi/acpi.hpp"
 #include "../drivers/log/logging.hpp"
 #include "../drivers/pci/pci.hpp"
 #include "../drivers/timer/pit.hpp"
@@ -37,6 +38,7 @@
 #include "module.hpp"
 #include "path_util.hpp"
 #include "process.hpp"
+#include "random.hpp"
 #include "scheduler.hpp"
 #include "settings.hpp"
 #include "string_util.hpp"
@@ -515,11 +517,8 @@ static void kernel_main_stage2() {
     lapic::init(hhdm_request.response->offset);
     log_message(LogLevel::Info, "Local APIC initialized");
 
-    uint64_t rsdp_address = 0;
-    if (rsdp_request.response != nullptr) {
-        rsdp_address = reinterpret_cast<uint64_t>(rsdp_request.response->address);
-    }
-    ioapic::init(rsdp_address, hhdm_request.response->offset, bsp_lapic);
+    (void)acpi::initialize_tables();
+    ioapic::init(hhdm_request.response->offset, bsp_lapic);
     (void)ioapic::route_isa_irq(1, 32 + 1);
     (void)ioapic::route_isa_irq(12, 32 + 12);
 
@@ -538,11 +537,6 @@ static void kernel_main_stage2() {
     log_message(LogLevel::Info, "Configuring PIT");
     pit::init(1000);
     log_message(LogLevel::Info, "PIT configured");
-
-    log_message(LogLevel::Info, "Initializing wall clock");
-    if (!timekeeping::init_from_rtc(1000)) {
-        log_message(LogLevel::Warn, "Wall clock unavailable");
-    }
 
     log_message(
         LogLevel::Debug, "Kernel phys base addr: %016x",
@@ -564,10 +558,31 @@ static void kernel_main_stage2() {
 
     log_message(LogLevel::Info, "Initializing physical memory pools");
     memory::init();
-    if (kconsole != nullptr) {
-        kconsole->enable_back_buffer();
+
+    uint64_t entropy_probe = 0;
+    bool secure_random_available =
+        kernel_random::secure_fill(&entropy_probe, sizeof(entropy_probe));
+    entropy_probe = 0;
+    log_message(secure_random_available ? LogLevel::Info : LogLevel::Warn,
+                secure_random_available
+                    ? "Random: hardware entropy source available"
+                    : "Random: no secure hardware entropy source");
+
+    // Keep timer interrupts gated out of timekeeping until the complete RTC
+    // snapshot has been committed by init_from_rtc().
+    log_message(LogLevel::Info, "Initializing wall clock");
+    if (!timekeeping::init_from_rtc(1000)) {
+        log_message(LogLevel::Warn, "Wall clock unavailable");
     }
+
+    if (kconsole != nullptr) {
+        log_message(LogLevel::Info, "Enabling console back buffer");
+        kconsole->enable_back_buffer();
+        log_message(LogLevel::Info, "Console back buffer enabled");
+    }
+    log_message(LogLevel::Info, "Starting SMP bring-up");
     smp::init();
+    log_message(LogLevel::Info, "SMP bring-up complete");
 
     bool pat_ok = cpu::configure_pat_write_combining();
     bool wc_pages = false;
@@ -793,6 +808,12 @@ static void kernel_main_stage2() {
 
     process::init();
     scheduler::init();
+    // Namespace initialization may install SCI handlers and queue deferred AML
+    // work, so it must follow process and scheduler initialization.
+    if (!acpi::initialize()) {
+        log_message(LogLevel::Warn, "ACPI runtime unavailable");
+    }
+
     log_message(LogLevel::Info, "DriverRegistry: probing PCI drivers");
     driver_registry::probe_pci_drivers();
     log_message(LogLevel::Info, "DriverRegistry: PCI probe complete");

@@ -13,6 +13,10 @@ uint64_t alloc_kernel_page();
 void free_kernel_block(uint64_t phys);
 void free_kernel_page(uint64_t phys);
 
+// General-purpose, aligned kernel heap backed by the kernel buddy allocator.
+void* alloc_kernel(size_t bytes, size_t alignment = alignof(uint64_t));
+void free_kernel(void* ptr);
+
 uint64_t alloc_user_page();
 void free_user_page(uint64_t phys);
 

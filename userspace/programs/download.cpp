@@ -6,6 +6,7 @@
 #include <neutrino.h>
 
 #include "../crt/syscall.hpp"
+#include "../auth/secure_random.hpp"
 #include "../helpers/http.hpp"
 #include "../net/dns.hpp"
 #include "../net/tcpd_protocol.hpp"
@@ -33,15 +34,6 @@ struct TcpConnection {
     size_t pending_length = 0;
 };
 
-struct InsecureX509Context {
-    const br_x509_class* vtable;
-    br_x509_decoder_context decoder;
-    unsigned cert_count;
-    unsigned end_error;
-    unsigned usages;
-    bool have_pkey;
-};
-
 struct Buffer {
     uint8_t* data = nullptr;
     size_t size = 0;
@@ -63,7 +55,6 @@ struct Stream {
     br_sslio_context ssl_io;
     uint8_t ssl_iobuf[BR_SSL_BUFSIZE_BIDI];
     br_x509_minimal_context x509_minimal;
-    InsecureX509Context insecure_x509;
 };
 
 struct ProgressState {
@@ -80,7 +71,9 @@ struct DownloadOptions {
     size_t limit = 0;
     bool net_debug = false;
     bool quiet = false;
+    bool compact = false;
     bool discard = false;
+    bool require_valid_cert = false;
 };
 
 enum class BodyResult : uint8_t {
@@ -140,11 +133,14 @@ bool timed_out(uint64_t start_ns,
                uint64_t timeout_ns,
                uint32_t waits,
                uint32_t wait_limit) {
+    if (waits >= wait_limit) {
+        return true;
+    }
     uint64_t now = wall_time_ns();
     if (start_ns != 0 && now != 0 && now >= start_ns) {
         return now - start_ns >= timeout_ns;
     }
-    return waits >= wait_limit;
+    return false;
 }
 
 void print_net_debug(ProgressState& progress) {
@@ -395,8 +391,16 @@ bool parse_args(const char* raw,
             options.quiet = true;
             continue;
         }
+        if (equals(token, "--compact")) {
+            options.compact = true;
+            continue;
+        }
         if (equals(token, "--discard")) {
             options.discard = true;
+            continue;
+        }
+        if (equals(token, "--require-valid-cert")) {
+            options.require_valid_cert = true;
             continue;
         }
         if (equals(token, "--net-debug") || equals(token, "--debug-net")) {
@@ -754,28 +758,6 @@ int tcp_read_some(TcpConnection& conn, uint8_t* out, size_t capacity) {
     return static_cast<int>(available);
 }
 
-uint64_t read_tsc() {
-    uint32_t lo = 0;
-    uint32_t hi = 0;
-    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-
-void seed_entropy(uint8_t out[32], const char* host, uint16_t port) {
-    uint64_t mix = read_tsc();
-    mix ^= reinterpret_cast<uintptr_t>(out);
-    mix ^= reinterpret_cast<uintptr_t>(host);
-    mix ^= static_cast<uint64_t>(port) << 16;
-    for (size_t i = 0; i < 32; ++i) {
-        yield();
-        mix ^= read_tsc();
-        mix ^= (mix << 13);
-        mix ^= (mix >> 7);
-        mix ^= (mix << 17);
-        out[i] = static_cast<uint8_t>((mix >> ((i % 8) * 8)) & 0xFFu);
-    }
-}
-
 void* alloc_persistent_bytes(size_t size) {
     if (size == 0) {
         size = 1;
@@ -982,150 +964,46 @@ bool ensure_trust_store_loaded() {
     return g_trust_store->loaded;
 }
 
-int ignore_certificate_time(void*, uint32_t, uint32_t, uint32_t, uint32_t) {
-    return 0;
-}
-
-void insecure_start_chain(const br_x509_class** ctx, const char*) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    xc->vtable = &xc->vtable[0];
-    xc->cert_count = 0;
-    xc->end_error = 0;
-    xc->usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
-    xc->have_pkey = false;
-}
-
-void insecure_start_cert(const br_x509_class** ctx, uint32_t) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (xc->cert_count == 0) {
-        br_x509_decoder_init(&xc->decoder, nullptr, nullptr);
+bool init_tls_client(Stream& stream,
+                     const char* host,
+                     uint16_t port,
+                     bool require_valid_cert) {
+    (void)port;
+    (void)require_valid_cert;
+    NeutrinoWallTime now{};
+    bool have_time = neutrino_get_time(&now);
+    if (!have_time) {
+        print_line("download: HTTPS requires a valid system clock");
+        return false;
     }
-}
 
-void insecure_append(const br_x509_class** ctx, const unsigned char* buf, size_t len) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (xc->cert_count == 0) {
-        br_x509_decoder_push(&xc->decoder, buf, len);
-    }
-}
-
-void insecure_end_cert(const br_x509_class** ctx) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (xc->cert_count == 0) {
-        int err = br_x509_decoder_last_error(&xc->decoder);
-        if (err == 0 && br_x509_decoder_get_pkey(&xc->decoder) != nullptr) {
-            xc->have_pkey = true;
-        } else if (xc->end_error == 0) {
-            xc->end_error = static_cast<unsigned>(err);
-        }
-    }
-    ++xc->cert_count;
-}
-
-unsigned insecure_end_chain(const br_x509_class** ctx) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (!xc->have_pkey) {
-        return xc->end_error != 0 ? xc->end_error : static_cast<unsigned>(BR_ERR_X509_EMPTY_CHAIN);
-    }
-    return 0;
-}
-
-const br_x509_pkey* insecure_get_pkey(const br_x509_class* const* ctx, unsigned* usages) {
-    auto* xc = reinterpret_cast<const InsecureX509Context*>(ctx);
-    if (usages != nullptr) {
-        *usages = xc->usages;
-    }
-    return br_x509_decoder_get_pkey(const_cast<br_x509_decoder_context*>(&xc->decoder));
-}
-
-const br_x509_class kInsecureX509Vtable = {
-    sizeof(InsecureX509Context),
-    insecure_start_chain,
-    insecure_start_cert,
-    insecure_append,
-    insecure_end_cert,
-    insecure_end_chain,
-    insecure_get_pkey,
-};
-
-void init_tls_client(Stream& stream, const char* host, uint16_t port) {
     if (ensure_trust_store_loaded() && g_trust_store->anchor_count != 0) {
         br_ssl_client_init_full(&stream.ssl_client,
                                 &stream.x509_minimal,
                                 g_trust_store->anchors,
                                 g_trust_store->anchor_count);
-        NeutrinoWallTime now{};
-        if (neutrino_get_time(&now)) {
-            constexpr uint32_t kUnixEpochDays = 719528u;
-            uint32_t days = kUnixEpochDays +
-                            static_cast<uint32_t>(now.unix_seconds / 86400ull);
-            uint32_t seconds = static_cast<uint32_t>(now.unix_seconds % 86400ull);
-            br_x509_minimal_set_time(&stream.x509_minimal, days, seconds);
-        } else {
-            br_x509_minimal_set_time_callback(&stream.x509_minimal,
-                                              nullptr,
-                                              ignore_certificate_time);
-        }
+        constexpr uint32_t kUnixEpochDays = 719528u;
+        uint32_t days = kUnixEpochDays +
+                        static_cast<uint32_t>(now.unix_seconds / 86400ull);
+        uint32_t seconds = static_cast<uint32_t>(now.unix_seconds % 86400ull);
+        br_x509_minimal_set_time(&stream.x509_minimal, days, seconds);
+        br_ssl_engine_set_versions(&stream.ssl_client.eng, BR_TLS12, BR_TLS12);
     } else {
-        print_line("download: warning: TLS trust store unavailable; certificate not verified");
-        stream.insecure_x509.vtable = &kInsecureX509Vtable;
-        stream.insecure_x509.cert_count = 0;
-        stream.insecure_x509.end_error = 0;
-        stream.insecure_x509.usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
-        stream.insecure_x509.have_pkey = false;
-
-        br_ssl_client_zero(&stream.ssl_client);
-        br_ssl_engine_set_versions(&stream.ssl_client.eng, BR_TLS10, BR_TLS12);
-        br_ssl_client_set_default_rsapub(&stream.ssl_client);
-        br_ssl_engine_set_default_rsavrfy(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_ecdsa(&stream.ssl_client.eng);
-
-        static const uint16_t suites[] = {
-            BR_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            BR_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            BR_TLS_RSA_WITH_AES_128_GCM_SHA256,
-            BR_TLS_RSA_WITH_AES_256_GCM_SHA384,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-            BR_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-            BR_TLS_RSA_WITH_AES_128_CBC_SHA,
-        };
-        br_ssl_engine_set_suites(&stream.ssl_client.eng,
-                                 suites,
-                                 sizeof(suites) / sizeof(suites[0]));
-
-        static const br_hash_class* hashes[] = {
-            &br_md5_vtable,
-            &br_sha1_vtable,
-            &br_sha224_vtable,
-            &br_sha256_vtable,
-            &br_sha384_vtable,
-            &br_sha512_vtable,
-        };
-        for (int id = br_md5_ID; id <= br_sha512_ID; ++id) {
-            br_ssl_engine_set_hash(&stream.ssl_client.eng, id, hashes[id - 1]);
-        }
-
-        br_ssl_engine_set_x509(&stream.ssl_client.eng,
-                               reinterpret_cast<const br_x509_class**>(&stream.insecure_x509.vtable));
-        br_ssl_engine_set_prf10(&stream.ssl_client.eng, &br_tls10_prf);
-        br_ssl_engine_set_prf_sha256(&stream.ssl_client.eng, &br_tls12_sha256_prf);
-        br_ssl_engine_set_prf_sha384(&stream.ssl_client.eng, &br_tls12_sha384_prf);
-        br_ssl_engine_set_default_aes_cbc(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_aes_ccm(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_aes_gcm(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_des_cbc(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_chapol(&stream.ssl_client.eng);
+        print_line("download: TLS trust store unavailable; refusing HTTPS");
+        return false;
     }
     br_ssl_engine_set_buffer(&stream.ssl_client.eng,
                              stream.ssl_iobuf,
                              sizeof(stream.ssl_iobuf),
                              1);
     uint8_t entropy[32];
-    seed_entropy(entropy, host, port);
+    if (!auth::secure_random(entropy, sizeof(entropy))) {
+        print_line("download: secure random source unavailable; refusing HTTPS");
+        return false;
+    }
     br_ssl_engine_inject_entropy(&stream.ssl_client.eng, entropy, sizeof(entropy));
     br_ssl_client_reset(&stream.ssl_client, host, 0);
+    return true;
 }
 
 int tcp_low_read(void* context, unsigned char* data, size_t len) {
@@ -1138,7 +1016,7 @@ int tcp_low_write(void* context, const unsigned char* data, size_t len) {
     return tcp_send_all(*tcp, data, len) ? static_cast<int>(len) : -1;
 }
 
-bool stream_connect(Stream& stream, const Url& url) {
+bool stream_connect(Stream& stream, const Url& url, bool require_valid_cert) {
     uint8_t ip[4];
     if (!userspace::http::parse_ipv4_literal(url.host, ip) &&
         !usernet::dns::resolve_a(url.host, ip)) {
@@ -1153,7 +1031,10 @@ bool stream_connect(Stream& stream, const Url& url) {
     if (!stream.tls) {
         return true;
     }
-    init_tls_client(stream, url.host, url.port);
+    if (!init_tls_client(stream, url.host, url.port, require_valid_cert)) {
+        tcp_close(stream.tcp);
+        return false;
+    }
     br_sslio_init(&stream.ssl_io,
                   &stream.ssl_client.eng,
                   tcp_low_read,
@@ -1547,7 +1428,15 @@ bool fetch_to_file(const char* url_text,
             reinterpret_cast<uint8_t*>(stream)[i] = 0;
         }
 
-        if (!stream_connect(*stream, url)) {
+        // A TLS handshake can take long enough to look like a stalled package
+        // download. Show the initial progress state before networking starts;
+        // write_response_body() replaces it with byte progress after headers.
+        if (!options.quiet && !options.compact) {
+            print("download: [                    ] 0% connecting to ");
+            print(url.host);
+            print("...\n");
+        }
+        if (!stream_connect(*stream, url, options.require_valid_cert)) {
             unmap(stream, sizeof(*stream));
             return false;
         }
@@ -1631,7 +1520,7 @@ int main(uint64_t arg_ptr, uint64_t) {
     DownloadOptions options{};
     const char* args = reinterpret_cast<const char*>(arg_ptr);
     if (!parse_args(args, options, url, sizeof(url), output, sizeof(output))) {
-        print_line("usage: download [--limit bytes|1K|1M] [--net-debug] [--quiet] [--discard] <url> [output-file]");
+        print_line("usage: download [--limit bytes|1K|1M] [--net-debug] [--quiet|--compact] [--discard] [--require-valid-cert] <url> [output-file]");
         return 1;
     }
 
@@ -1644,7 +1533,10 @@ int main(uint64_t arg_ptr, uint64_t) {
     uint64_t end_ns = wall_time_ns();
     uint64_t elapsed_ns = (end_ns >= start_ns) ? end_ns - start_ns : 0;
 
-    if (options.quiet) {
+    if (options.quiet || options.compact) {
+        if (options.compact && stopped_by_limit) {
+            print_line("download: stopped at limit");
+        }
         return 0;
     }
     print("download: ");

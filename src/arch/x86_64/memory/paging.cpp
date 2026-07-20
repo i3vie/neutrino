@@ -4,13 +4,21 @@
 #include <stdint.h>
 
 #include "../../drivers/console/console.hpp"
+#include "arch/x86_64/lapic.hpp"
+#include "arch/x86_64/smp.hpp"
 #include "drivers/limine/limine_requests.hpp"
+#include "kernel/interrupts.hpp"
 #include "kernel/memory/physical_allocator.hpp"
+#include "kernel/sync.hpp"
 #include "lib/mem.hpp"
 #include "kernel/error.hpp"
 
 extern "C" char kernel_start[];
 extern "C" char kernel_end[];
+extern "C" char kernel_text_start[];
+extern "C" char kernel_text_end[];
+extern "C" char kernel_rodata_start[];
+extern "C" char kernel_rodata_end[];
 
 namespace {
 
@@ -20,6 +28,10 @@ constexpr uint64_t PAGE_LARGE_SIZE = 0x200000;
 constexpr uint64_t PAGE_LARGE_MASK = PAGE_LARGE_SIZE - 1;
 constexpr uint64_t PAGE_HUGE_SIZE = 0x40000000;
 constexpr uint64_t PAGE_HUGE_MASK = PAGE_HUGE_SIZE - 1;
+// Long-mode page-table entries carry flags above the physical frame number
+// (notably NX in bit 63).  Never derive a physical address by merely clearing
+// the page offset, because that would retain those flags.
+constexpr uint64_t PHYSICAL_ADDRESS_MASK = 0x000FFFFFFFFFF000ull;
 
 constexpr uint64_t PTE_PRESENT = 1ull << 0;
 constexpr uint64_t PTE_WRITE = 1ull << 1;
@@ -31,6 +43,8 @@ constexpr uint64_t PTE_LARGE = 1ull << 7;
 constexpr uint64_t PTE_GLOBAL = 1ull << 8;
 constexpr uint64_t PTE_NX = 1ull << 63;
 constexpr uint64_t CR0_WRITE_PROTECT = 1ull << 16;
+constexpr uint32_t MSR_EFER = 0xC0000080;
+constexpr uint64_t EFER_NXE = 1ull << 11;
 
 constexpr size_t PAGE_TABLE_ENTRIES = 512;
 constexpr size_t MAX_ADDRESS_SPACES = 256;
@@ -56,12 +70,40 @@ uint64_t* pml4_table = nullptr;
 uint64_t* g_address_space_roots[MAX_ADDRESS_SPACES];
 size_t g_address_space_count = 0;
 
+sync::SpinLock g_tlb_shootdown_lock;
+uint8_t g_tlb_shootdown_vector = 0;
+volatile size_t g_tlb_shootdown_acks = 0;
+
+void tlb_shootdown_handler() {
+    uint64_t cr3 = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    __atomic_fetch_add(&g_tlb_shootdown_acks,
+                       static_cast<size_t>(1),
+                       __ATOMIC_RELEASE);
+}
+
 constexpr uint64_t align_down(uint64_t value, uint64_t alignment) {
     return value & ~(alignment - 1);
 }
 
 constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+uint64_t read_msr(uint32_t msr) {
+    uint32_t low = 0;
+    uint32_t high = 0;
+    asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+    return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+void write_msr(uint32_t msr, uint64_t value) {
+    asm volatile("wrmsr"
+                 :
+                 : "c"(msr),
+                   "a"(static_cast<uint32_t>(value)),
+                   "d"(static_cast<uint32_t>(value >> 32)));
 }
 
 [[noreturn]] void halt_system() {
@@ -142,7 +184,7 @@ PagingStructurePage alloc_paging_structure_page() {
 }
 
 uint64_t* table_from_entry(uint64_t entry) {
-    uint64_t phys = entry & ~PAGE_MASK;
+    uint64_t phys = entry & PHYSICAL_ADDRESS_MASK;
     return reinterpret_cast<uint64_t*>(table_phys_to_virt(phys));
 }
 
@@ -163,7 +205,8 @@ uint64_t* ensure_table(uint64_t* table, size_t index, uint64_t flags) {
     if (entry & PTE_LARGE) {
         PagingStructurePage child_page = alloc_paging_structure_page();
         auto* child = static_cast<uint64_t*>(child_page.virt);
-        uint64_t phys_base = entry & ~PAGE_LARGE_MASK;
+        uint64_t phys_base =
+            entry & (PHYSICAL_ADDRESS_MASK & ~PAGE_LARGE_MASK);
         uint64_t base_flags = entry & ((1ull << 12) - 1);
         base_flags &= ~PTE_LARGE;
         base_flags |= PTE_PRESENT;
@@ -189,7 +232,7 @@ uint64_t* ensure_table(uint64_t* table, size_t index, uint64_t flags) {
         entry = table[index];
     }
 
-    uint64_t phys = entry & ~PAGE_MASK;
+    uint64_t phys = entry & PHYSICAL_ADDRESS_MASK;
     return reinterpret_cast<uint64_t*>(table_phys_to_virt(phys));
 }
 
@@ -245,7 +288,7 @@ void destroy_table_level(uint64_t table_phys, int level) {
             continue;
         }
 
-        uint64_t child_phys = entry & ~PAGE_MASK;
+        uint64_t child_phys = entry & PHYSICAL_ADDRESS_MASK;
         destroy_table_level(child_phys, level - 1);
         memory::free_kernel_page(child_phys);
         table[i] = 0;
@@ -364,6 +407,11 @@ void paging_init() {
         g_hhdm_offset = 0;
     }
 
+    uint64_t efer = read_msr(MSR_EFER);
+    if ((efer & EFER_NXE) == 0) {
+        write_msr(MSR_EFER, efer | EFER_NXE);
+    }
+
     g_kernel_phys_base = kernel_addr_request.response->physical_base;
     g_kernel_virt_base = reinterpret_cast<uint64_t>(&kernel_start);
     uint64_t kernel_virtual_end = reinterpret_cast<uint64_t>(&kernel_end);
@@ -376,7 +424,7 @@ void paging_init() {
     boot_pool_off = 0;
     pml4_table = static_cast<uint64_t*>(alloc_boot_page());
 
-    const uint64_t map_flags = PTE_WRITE | PTE_GLOBAL;
+    const uint64_t map_flags = PTE_WRITE | PTE_GLOBAL | PTE_NX;
 
     auto memmap = memmap_request.response;
     for (uint64_t i = 0; i < memmap->entry_count; ++i) {
@@ -405,10 +453,60 @@ void paging_init() {
                             g_kernel_phys_base,
                             g_kernel_size,
                             map_flags);
+
+        uint64_t text_start = reinterpret_cast<uint64_t>(kernel_text_start);
+        uint64_t text_end = reinterpret_cast<uint64_t>(kernel_text_end);
+        if (text_end > text_start) {
+            uint64_t text_phys = virt_to_phys(text_start);
+            map_range_with_root(pml4_table,
+                                text_start,
+                                text_phys,
+                                text_end - text_start,
+                                PTE_GLOBAL);
+            // The identity and HHDM aliases must not provide a writable route
+            // to executable kernel text.
+            map_range_with_root(pml4_table,
+                                text_phys,
+                                text_phys,
+                                text_end - text_start,
+                                PTE_GLOBAL | PTE_NX);
+            if (g_hhdm_offset != 0) {
+                map_range_with_root(pml4_table,
+                                    text_phys + g_hhdm_offset,
+                                    text_phys,
+                                    text_end - text_start,
+                                    PTE_GLOBAL | PTE_NX);
+            }
+        }
+
+        uint64_t rodata_start =
+            reinterpret_cast<uint64_t>(kernel_rodata_start);
+        uint64_t rodata_end = reinterpret_cast<uint64_t>(kernel_rodata_end);
+        if (rodata_end > rodata_start) {
+            uint64_t rodata_phys = virt_to_phys(rodata_start);
+            map_range_with_root(pml4_table,
+                                rodata_start,
+                                rodata_phys,
+                                rodata_end - rodata_start,
+                                PTE_GLOBAL | PTE_NX);
+            map_range_with_root(pml4_table,
+                                rodata_phys,
+                                rodata_phys,
+                                rodata_end - rodata_start,
+                                PTE_GLOBAL | PTE_NX);
+            if (g_hhdm_offset != 0) {
+                map_range_with_root(pml4_table,
+                                    rodata_phys + g_hhdm_offset,
+                                    rodata_phys,
+                                    rodata_end - rodata_start,
+                                    PTE_GLOBAL | PTE_NX);
+            }
+        }
     }
 
     // Map Local APIC MMIO (identity + HHDM) with cache disabled.
-    const uint64_t lapic_flags = PTE_PRESENT | PTE_WRITE | PTE_PCD | PTE_PWT;
+    const uint64_t lapic_flags =
+        PTE_PRESENT | PTE_WRITE | PTE_PCD | PTE_PWT | PTE_NX;
     map_page_with_root(pml4_table, LAPIC_BASE, LAPIC_BASE, lapic_flags);
     if (g_hhdm_offset != 0) {
         map_page_with_root(pml4_table,
@@ -472,7 +570,7 @@ bool paging_unmap_page(uint64_t virt, uint64_t& phys_out) {
     if ((pt_entry & PTE_PRESENT) == 0) {
         return false;
     }
-    phys_out = pt_entry & ~PAGE_MASK;
+    phys_out = pt_entry & PHYSICAL_ADDRESS_MASK;
     pt[pt_index] = 0;
     asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
     return true;
@@ -590,7 +688,7 @@ void paging_destroy_address_space(uint64_t cr3) {
             continue;
         }
 
-        uint64_t child_phys = entry & ~PAGE_MASK;
+        uint64_t child_phys = entry & PHYSICAL_ADDRESS_MASK;
         destroy_table_level(child_phys, 3);
         memory::free_kernel_page(child_phys);
         root[i] = 0;
@@ -633,7 +731,7 @@ bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
     if ((pml4_entry & PTE_PRESENT) == 0) {
         return false;
     }
-    uint64_t pdpt_phys = pml4_entry & ~PAGE_MASK;
+    uint64_t pdpt_phys = pml4_entry & PHYSICAL_ADDRESS_MASK;
     uint64_t* pdpt = table_from_entry(pml4_entry);
 
     uint64_t pdpt_entry = pdpt[pdpt_index];
@@ -643,21 +741,21 @@ bool paging_unmap_page_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
     if ((pdpt_entry & PTE_LARGE) != 0) {
         return false;
     }
-    uint64_t pd_phys = pdpt_entry & ~PAGE_MASK;
+    uint64_t pd_phys = pdpt_entry & PHYSICAL_ADDRESS_MASK;
     uint64_t* pd = table_from_entry(pdpt_entry);
 
     uint64_t pd_entry = pd[pd_index];
     if ((pd_entry & PTE_PRESENT) == 0 || (pd_entry & PTE_LARGE) != 0) {
         return false;
     }
-    uint64_t pt_phys = pd_entry & ~PAGE_MASK;
+    uint64_t pt_phys = pd_entry & PHYSICAL_ADDRESS_MASK;
     uint64_t* pt = table_from_entry(pd_entry);
 
     uint64_t pt_entry = pt[pt_index];
     if ((pt_entry & PTE_PRESENT) == 0) {
         return false;
     }
-    phys_out = pt_entry & ~PAGE_MASK;
+    phys_out = pt_entry & PHYSICAL_ADDRESS_MASK;
     pt[pt_index] = 0;
     if (pml4_index < PAGE_TABLE_ENTRIES / 2) {
         if (table_empty(pt)) {
@@ -700,7 +798,8 @@ bool paging_resolve_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
         return false;
     }
     if ((pdpt_entry & PTE_LARGE) != 0) {
-        uint64_t base = pdpt_entry & ~PAGE_HUGE_MASK;
+        uint64_t base =
+            pdpt_entry & (PHYSICAL_ADDRESS_MASK & ~PAGE_HUGE_MASK);
         phys_out = base + (virt & PAGE_HUGE_MASK);
         return true;
     }
@@ -711,7 +810,8 @@ bool paging_resolve_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
         return false;
     }
     if ((pd_entry & PTE_LARGE) != 0) {
-        uint64_t base = pd_entry & ~PAGE_LARGE_MASK;
+        uint64_t base =
+            pd_entry & (PHYSICAL_ADDRESS_MASK & ~PAGE_LARGE_MASK);
         phys_out = base + (virt & PAGE_LARGE_MASK);
         return true;
     }
@@ -721,7 +821,7 @@ bool paging_resolve_cr3(uint64_t cr3, uint64_t virt, uint64_t& phys_out) {
     if ((pt_entry & PTE_PRESENT) == 0) {
         return false;
     }
-    phys_out = (pt_entry & ~PAGE_MASK) | (virt & PAGE_MASK);
+    phys_out = (pt_entry & PHYSICAL_ADDRESS_MASK) | (virt & PAGE_MASK);
     return true;
 }
 
@@ -750,7 +850,7 @@ bool paging_flags_cr3(uint64_t cr3, uint64_t virt, uint64_t& flags_out) {
     }
     effective &= pdpt_entry;
     if ((pdpt_entry & PTE_LARGE) != 0) {
-        flags_out = effective & PAGE_MASK;
+        flags_out = (effective & PAGE_MASK) | (pdpt_entry & PTE_NX);
         return true;
     }
     uint64_t* pd = table_from_entry(pdpt_entry);
@@ -761,7 +861,7 @@ bool paging_flags_cr3(uint64_t cr3, uint64_t virt, uint64_t& flags_out) {
     }
     effective &= pd_entry;
     if ((pd_entry & PTE_LARGE) != 0) {
-        flags_out = effective & PAGE_MASK;
+        flags_out = (effective & PAGE_MASK) | (pd_entry & PTE_NX);
         return true;
     }
     uint64_t* pt = table_from_entry(pd_entry);
@@ -771,7 +871,7 @@ bool paging_flags_cr3(uint64_t cr3, uint64_t virt, uint64_t& flags_out) {
         return false;
     }
     effective &= pt_entry;
-    flags_out = effective & PAGE_MASK;
+    flags_out = (effective & PAGE_MASK) | (pt_entry & PTE_NX);
     return true;
 }
 
@@ -817,6 +917,86 @@ bool paging_set_writable_cr3(uint64_t cr3, uint64_t virt, bool writable) {
     }
     pt[pt_index] = entry;
     asm volatile("invlpg (%0)" : : "r"(reinterpret_cast<void*>(virt)) : "memory");
+    return true;
+}
+
+bool paging_set_executable_cr3(uint64_t cr3,
+                               uint64_t virt,
+                               bool executable) {
+    if (cr3 == 0) {
+        return false;
+    }
+    uint64_t root_phys = cr3 & ~PAGE_MASK;
+    auto* root = reinterpret_cast<uint64_t*>(table_phys_to_virt(root_phys));
+    size_t pml4_index = (virt >> 39) & 0x1FF;
+    size_t pdpt_index = (virt >> 30) & 0x1FF;
+    size_t pd_index = (virt >> 21) & 0x1FF;
+    size_t pt_index = (virt >> 12) & 0x1FF;
+
+    uint64_t pml4_entry = root[pml4_index];
+    if ((pml4_entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    uint64_t* pdpt = table_from_entry(pml4_entry);
+    uint64_t pdpt_entry = pdpt[pdpt_index];
+    if ((pdpt_entry & PTE_PRESENT) == 0 ||
+        (pdpt_entry & PTE_LARGE) != 0) {
+        return false;
+    }
+    uint64_t* pd = table_from_entry(pdpt_entry);
+    uint64_t pd_entry = pd[pd_index];
+    if ((pd_entry & PTE_PRESENT) == 0 ||
+        (pd_entry & PTE_LARGE) != 0) {
+        return false;
+    }
+    uint64_t* pt = table_from_entry(pd_entry);
+    uint64_t entry = pt[pt_index];
+    if ((entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    if (executable) {
+        entry &= ~PTE_NX;
+    } else {
+        entry |= PTE_NX;
+    }
+    pt[pt_index] = entry;
+    asm volatile("invlpg (%0)"
+                 :
+                 : "r"(reinterpret_cast<void*>(virt))
+                 : "memory");
+    return true;
+}
+
+bool paging_flush_tlb_all_cpus() {
+    sync::IrqLockGuard guard(g_tlb_shootdown_lock);
+    if (g_tlb_shootdown_vector == 0) {
+        uint8_t vector = interrupts::allocate_vector();
+        if (vector == 0 ||
+            !interrupts::register_vector(vector, tlb_shootdown_handler)) {
+            if (vector != 0) {
+                interrupts::free_vector(vector);
+            }
+            return false;
+        }
+        g_tlb_shootdown_vector = vector;
+    }
+
+    uint64_t cr3 = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+
+    size_t online = smp::online_cpus();
+    if (online <= 1) {
+        return true;
+    }
+    __atomic_store_n(&g_tlb_shootdown_acks,
+                     static_cast<size_t>(0),
+                     __ATOMIC_RELEASE);
+    lapic::send_ipi_all_others(g_tlb_shootdown_vector);
+    while (__atomic_load_n(&g_tlb_shootdown_acks, __ATOMIC_ACQUIRE) <
+           online - 1) {
+        asm volatile("pause");
+    }
     return true;
 }
 

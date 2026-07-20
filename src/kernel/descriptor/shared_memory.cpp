@@ -125,7 +125,8 @@ bool map_segment_into_process(SharedSegment& segment,
         if (!paging_map_page_cr3(proc.cr3,
                                  virt,
                                  phys,
-                                 PAGE_FLAG_WRITE | PAGE_FLAG_USER)) {
+                                 PAGE_FLAG_WRITE | PAGE_FLAG_USER |
+                                     PAGE_FLAG_NO_EXECUTE)) {
             log_message(LogLevel::Error,
                         "SHM map failed pid=%u virt=%llx phys=%llx",
                         static_cast<unsigned int>(proc.pid),
@@ -362,7 +363,10 @@ bool open_shared_memory(process::Process& proc,
     }
     const char* user_name = reinterpret_cast<const char*>(name_ptr);
     char name_buffer[kMaxNameLength];
-    if (!vm::copy_user_string(user_name, name_buffer, sizeof(name_buffer))) {
+    if (!vm::copy_user_string(proc.cr3,
+                              user_name,
+                              name_buffer,
+                              sizeof(name_buffer))) {
         return false;
     }
     if (name_buffer[0] == '\0') {

@@ -301,15 +301,13 @@ bool load_login_users(LoginUsers& users) {
                                        len);
     }
     if (!loaded || len < sizeof(UserStoreHeader)) {
-        ensure_login_user(users, kRootUserName);
-        return users.count != 0;
+        return false;
     }
 
     UserStoreHeader header{};
     memcpy(&header, buffer, sizeof(header));
     if (header.magic != 0x4E544455u) {
-        ensure_login_user(users, kRootUserName);
-        return users.count != 0;
+        return false;
     }
     bool current_v2 = header.version == 2 &&
                       header.entry_size == sizeof(PackedUser);
@@ -318,26 +316,21 @@ bool load_login_users(LoginUsers& users) {
     bool legacy = header.version == 1 &&
                   header.entry_size == sizeof(PackedUserV1);
     if (!current_v2 && !current_v3 && !legacy) {
-        ensure_login_user(users, kRootUserName);
-        return users.count != 0;
+        return false;
     }
 
     size_t available = 0;
     size_t count = header.count;
     if (current_v3) {
         if (len < sizeof(UserStoreHeaderV3)) {
-            ensure_login_user(users, kRootUserName);
-            return users.count != 0;
+            return false;
         }
         available = (len - sizeof(UserStoreHeaderV3)) / header.entry_size;
     } else {
         available = (len - sizeof(UserStoreHeader)) / header.entry_size;
     }
     if (count > available) {
-        count = available;
-    }
-    if (count > available) {
-        count = available;
+        return false;
     }
     if (count > kMaxLoginUsers) {
         count = kMaxLoginUsers;
@@ -537,7 +530,11 @@ void run_login_loop() {
     set_console_color(0xFFF2F4F8u, 0x00000000u);
     for (;;) {
         LoginUsers users{};
-        load_login_users(users);
+        if (!load_login_users(users)) {
+            print("\nLogin unavailable: credential store is missing or invalid.\n");
+            sleep_ns(1000000000ull);
+            continue;
+        }
         print("\n");
         print("login: ");
 

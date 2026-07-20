@@ -40,7 +40,9 @@ Principal* create_principal(void* backing_user, CapabilityMask allowed_caps) {
         if (!p.active) {
             p.backing_user = backing_user;
             p.allowed_caps = allowed_caps;
-            p.generation = 1;
+            if (p.generation == 0) {
+                p.generation = 1;
+            }
             p.refcount = 1;
             p.active = true;
             return &p;
@@ -66,7 +68,10 @@ void principal_release(Principal* principal) {
     if (principal->refcount == 0) {
         principal->active = false;
         principal->allowed_caps = 0;
-        principal->generation = 0;
+        ++principal->generation;
+        if (principal->generation == 0) {
+            principal->generation = 1;
+        }
         principal->backing_user = nullptr;
     }
 }
@@ -76,6 +81,9 @@ void principal_bump_generation(Principal& principal) {
         return;
     }
     ++principal.generation;
+    if (principal.generation == 0) {
+        principal.generation = 1;
+    }
 }
 
 bool principal_allows(const Principal& principal, CapabilityKind kind) {
@@ -100,14 +108,29 @@ bool principal_is_valid(const Principal* principal) {
 }
 
 Principal* principal_from_handle(uint64_t handle) {
-    if (handle == 0) {
+    uint32_t encoded_index = static_cast<uint32_t>(handle);
+    uint64_t generation = handle >> 32;
+    if (encoded_index == 0 || generation == 0) {
         return nullptr;
     }
-    size_t idx = static_cast<size_t>(handle % kMaxPrincipals);
-    if (!g_principals[idx].active) {
+    size_t idx = static_cast<size_t>(encoded_index - 1u);
+    if (idx >= kMaxPrincipals || !g_principals[idx].active ||
+        g_principals[idx].generation != generation) {
         return nullptr;
     }
     return &g_principals[idx];
+}
+
+uint64_t principal_handle(const Principal* principal) {
+    if (principal == nullptr || !principal->active || principal->generation == 0) {
+        return 0;
+    }
+    ptrdiff_t index = principal - &g_principals[0];
+    if (index < 0 || static_cast<size_t>(index) >= kMaxPrincipals) {
+        return 0;
+    }
+    return (principal->generation << 32) |
+           (static_cast<uint64_t>(index) + 1u);
 }
 
 bool capability_from_value(uint64_t value, CapabilityKind& out_kind) {

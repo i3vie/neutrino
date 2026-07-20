@@ -38,6 +38,8 @@ void init();
 User* create(const char* name, uint64_t allowed_caps);
 User* find(const char* name);
 User* find(const UserId& id);
+uint64_t handle_for(const User* user);
+User* from_handle(uint64_t handle);
 const UserId& machine_id();
 void bump_generation(User& user);
 bool allows(const User& user, uint64_t cap_bitmask);

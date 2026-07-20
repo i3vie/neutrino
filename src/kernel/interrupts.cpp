@@ -1,9 +1,14 @@
 #include "interrupts.hpp"
 
+#include "drivers/interrupts/ioapic.hpp"
+#include "kernel/sync.hpp"
+
 namespace {
 
 interrupts::VectorHandler g_handlers[256]{};
 bool g_reserved[256]{};
+uint8_t g_isa_vectors[16]{};
+sync::SpinLock g_lock;
 constexpr uint8_t kFirstAllocVector = 0x50;
 constexpr uint8_t kLastAllocVector = 0xFE;
 
@@ -12,6 +17,7 @@ constexpr uint8_t kLastAllocVector = 0xFE;
 namespace interrupts {
 
 uint8_t allocate_vector() {
+    sync::IrqLockGuard guard(g_lock);
     for (uint16_t candidate = kFirstAllocVector;
          candidate <= kLastAllocVector;
          ++candidate) {
@@ -25,6 +31,7 @@ uint8_t allocate_vector() {
 }
 
 void free_vector(uint8_t vector) {
+    sync::IrqLockGuard guard(g_lock);
     if (vector < kFirstAllocVector || vector > kLastAllocVector) {
         return;
     }
@@ -32,6 +39,7 @@ void free_vector(uint8_t vector) {
 }
 
 bool register_vector(uint8_t vector, VectorHandler handler) {
+    sync::IrqLockGuard guard(g_lock);
     if (handler == nullptr || vector < 32) {
         return false;
     }
@@ -44,11 +52,14 @@ bool register_vector(uint8_t vector, VectorHandler handler) {
 }
 
 void unregister_vector(uint8_t vector) {
+    sync::IrqLockGuard guard(g_lock);
     if (vector < 32) {
         return;
     }
     g_handlers[vector] = nullptr;
-    free_vector(vector);
+    if (vector >= kFirstAllocVector && vector <= kLastAllocVector) {
+        g_reserved[vector] = false;
+    }
 }
 
 bool dispatch(uint8_t vector) {
@@ -58,6 +69,42 @@ bool dispatch(uint8_t vector) {
     }
     handler();
     return true;
+}
+
+bool register_isa_irq(uint8_t irq, IrqHandler handler, uint8_t* out_vector) {
+    if (irq >= 16 || handler == nullptr) return false;
+    uint8_t vector = 0;
+    {
+        sync::IrqLockGuard guard(g_lock);
+        if (g_isa_vectors[irq] != 0) return false;
+        for (uint16_t candidate = kFirstAllocVector; candidate <= kLastAllocVector; ++candidate) {
+            uint8_t possible = static_cast<uint8_t>(candidate);
+            if (!g_reserved[possible] && g_handlers[possible] == nullptr) {
+                g_reserved[possible] = true;
+                g_handlers[possible] = handler;
+                g_isa_vectors[irq] = possible;
+                vector = possible;
+                break;
+            }
+        }
+    }
+    if (vector == 0 || !ioapic::route_isa_irq(irq, vector)) {
+        if (vector != 0) unregister_isa_irq(irq);
+        return false;
+    }
+    if (out_vector != nullptr) *out_vector = vector;
+    return true;
+}
+
+void unregister_isa_irq(uint8_t irq) {
+    if (irq >= 16) return;
+    sync::IrqLockGuard guard(g_lock);
+    uint8_t vector = g_isa_vectors[irq];
+    if (vector != 0) {
+        g_handlers[vector] = nullptr;
+        g_reserved[vector] = false;
+        g_isa_vectors[irq] = 0;
+    }
 }
 
 }  // namespace interrupts

@@ -8,6 +8,7 @@
 #include "keyboard_scancode.hpp"
 #include "neutrino.h"
 #include "../crt/syscall.hpp"
+#include "../auth/secure_random.hpp"
 #include "../helpers/http.hpp"
 #include "../net/dns.hpp"
 #include "../net/tcpd_protocol.hpp"
@@ -44,9 +45,7 @@ constexpr uint32_t kMutedFg = 0xFFAAAAAAu;
 
 enum class TlsMode : uint8_t {
     None,
-    Insecure,
     Verified,
-    VerifiedNoTime,
 };
 
 struct TcpConnection {
@@ -57,15 +56,6 @@ struct TcpConnection {
     uint8_t pending[tcpd_protocol::kMaxPayload];
     size_t pending_offset = 0;
     size_t pending_length = 0;
-};
-
-struct InsecureX509Context {
-    const br_x509_class* vtable;
-    br_x509_decoder_context decoder;
-    unsigned cert_count;
-    unsigned end_error;
-    unsigned usages;
-    bool have_pkey;
 };
 
 struct Buffer {
@@ -170,7 +160,6 @@ struct Stream {
     br_sslio_context ssl_io;
     uint8_t ssl_iobuf[BR_SSL_BUFSIZE_BIDI];
     br_x509_minimal_context x509_minimal;
-    InsecureX509Context insecure_x509;
 };
 
 long g_console = -1;
@@ -799,28 +788,6 @@ int tcp_read_some(TcpConnection& conn, uint8_t* out, size_t capacity) {
     return static_cast<int>(available);
 }
 
-uint64_t read_tsc() {
-    uint32_t lo = 0;
-    uint32_t hi = 0;
-    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-
-void seed_entropy(uint8_t out[32], const char* host, uint16_t port) {
-    uint64_t mix = read_tsc();
-    mix ^= reinterpret_cast<uintptr_t>(out);
-    mix ^= reinterpret_cast<uintptr_t>(host);
-    mix ^= static_cast<uint64_t>(port) << 16;
-    for (size_t i = 0; i < 32; ++i) {
-        yield();
-        mix ^= read_tsc();
-        mix ^= (mix << 13);
-        mix ^= (mix >> 7);
-        mix ^= (mix << 17);
-        out[i] = static_cast<uint8_t>((mix >> ((i % 8) * 8)) & 0xFFu);
-    }
-}
-
 void dn_append(void* ctx, const void* src, size_t len) {
     auto* buffer = static_cast<Buffer*>(ctx);
     (void)buffer_append(*buffer, src, len);
@@ -1000,177 +967,46 @@ bool ensure_trust_store_loaded() {
     return g_trust_store->loaded;
 }
 
-int ignore_certificate_time(void*,
-                            uint32_t,
-                            uint32_t,
-                            uint32_t,
-                            uint32_t) {
-    return 0;
-}
-
-void insecure_start_chain(const br_x509_class** ctx, const char*) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    xc->vtable = &xc->vtable[0];
-    xc->cert_count = 0;
-    xc->end_error = 0;
-    xc->usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
-    xc->have_pkey = false;
-}
-
-void insecure_start_cert(const br_x509_class** ctx, uint32_t) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (xc->cert_count == 0) {
-        br_x509_decoder_init(&xc->decoder, nullptr, nullptr);
-    }
-}
-
-void insecure_append(const br_x509_class** ctx, const unsigned char* buf, size_t len) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (xc->cert_count == 0) {
-        br_x509_decoder_push(&xc->decoder, buf, len);
-    }
-}
-
-void insecure_end_cert(const br_x509_class** ctx) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (xc->cert_count == 0) {
-        int err = br_x509_decoder_last_error(&xc->decoder);
-        if (err == 0 && br_x509_decoder_get_pkey(&xc->decoder) != nullptr) {
-            xc->have_pkey = true;
-        } else if (xc->end_error == 0) {
-            xc->end_error = static_cast<unsigned>(err);
-        }
-    }
-    ++xc->cert_count;
-}
-
-unsigned insecure_end_chain(const br_x509_class** ctx) {
-    auto* xc = reinterpret_cast<InsecureX509Context*>(const_cast<br_x509_class**>(ctx));
-    if (!xc->have_pkey) {
-        return xc->end_error != 0 ? xc->end_error : static_cast<unsigned>(BR_ERR_X509_EMPTY_CHAIN);
-    }
-    return 0;
-}
-
-const br_x509_pkey* insecure_get_pkey(const br_x509_class* const* ctx, unsigned* usages) {
-    auto* xc = reinterpret_cast<const InsecureX509Context*>(ctx);
-    if (usages != nullptr) {
-        *usages = xc->usages;
-    }
-    return br_x509_decoder_get_pkey(const_cast<br_x509_decoder_context*>(&xc->decoder));
-}
-
-const br_x509_class kInsecureX509Vtable = {
-    sizeof(InsecureX509Context),
-    insecure_start_chain,
-    insecure_start_cert,
-    insecure_append,
-    insecure_end_cert,
-    insecure_end_chain,
-    insecure_get_pkey,
-};
-
-void init_tls_client(Stream& stream, const char* host) {
+bool init_tls_client(Stream& stream, const char* host) {
     print_line("browse: init_tls_client");
-    stream.tls_mode = TlsMode::Insecure;
-    if (ensure_trust_store_loaded() && g_trust_store->anchor_count != 0) {
-        print_line("browse: using verified tls mode");
-        br_ssl_client_init_full(&stream.ssl_client,
-                                &stream.x509_minimal,
-                                g_trust_store->anchors,
-                                g_trust_store->anchor_count);
-        print_line("browse: br_ssl_client_init_full ok");
-        NeutrinoWallTime now{};
-        if (neutrino_get_time(&now)) {
-            constexpr uint32_t kUnixEpochDays = 719528u;
-            uint32_t days = kUnixEpochDays +
-                            static_cast<uint32_t>(now.unix_seconds / 86400ull);
-            uint32_t seconds =
-                static_cast<uint32_t>(now.unix_seconds % 86400ull);
-            br_x509_minimal_set_time(&stream.x509_minimal, days, seconds);
-            print_line("browse: RTC time installed");
-            stream.tls_mode = TlsMode::Verified;
-        } else {
-            br_x509_minimal_set_time_callback(&stream.x509_minimal,
-                                              nullptr,
-                                              ignore_certificate_time);
-            print_line("browse: time callback installed");
-            stream.tls_mode = TlsMode::VerifiedNoTime;
-        }
-    } else {
-        print_line("browse: using insecure tls mode");
-        stream.insecure_x509.vtable = &kInsecureX509Vtable;
-        stream.insecure_x509.cert_count = 0;
-        stream.insecure_x509.end_error = 0;
-        stream.insecure_x509.usages = BR_KEYTYPE_KEYX | BR_KEYTYPE_SIGN;
-        stream.insecure_x509.have_pkey = false;
-
-        br_ssl_client_zero(&stream.ssl_client);
-        br_ssl_engine_set_versions(&stream.ssl_client.eng, BR_TLS10, BR_TLS12);
-        br_ssl_client_set_default_rsapub(&stream.ssl_client);
-        br_ssl_engine_set_default_rsavrfy(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_ecdsa(&stream.ssl_client.eng);
-
-        static const uint16_t suites[] = {
-            BR_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            BR_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            BR_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            BR_TLS_RSA_WITH_AES_128_GCM_SHA256,
-            BR_TLS_RSA_WITH_AES_256_GCM_SHA384,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-            BR_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
-            BR_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
-            BR_TLS_RSA_WITH_AES_128_CBC_SHA256,
-            BR_TLS_RSA_WITH_AES_256_CBC_SHA256,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-            BR_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-            BR_TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-            BR_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-            BR_TLS_RSA_WITH_AES_128_CBC_SHA,
-            BR_TLS_RSA_WITH_AES_256_CBC_SHA,
-        };
-        br_ssl_engine_set_suites(&stream.ssl_client.eng, suites, sizeof(suites) / sizeof(suites[0]));
-
-        static const br_hash_class* hashes[] = {
-            &br_md5_vtable,
-            &br_sha1_vtable,
-            &br_sha224_vtable,
-            &br_sha256_vtable,
-            &br_sha384_vtable,
-            &br_sha512_vtable,
-        };
-        for (int id = br_md5_ID; id <= br_sha512_ID; ++id) {
-            br_ssl_engine_set_hash(&stream.ssl_client.eng, id, hashes[id - 1]);
-        }
-
-        br_ssl_engine_set_x509(&stream.ssl_client.eng,
-                               reinterpret_cast<const br_x509_class**>(&stream.insecure_x509.vtable));
-        br_ssl_engine_set_prf10(&stream.ssl_client.eng, &br_tls10_prf);
-        br_ssl_engine_set_prf_sha256(&stream.ssl_client.eng, &br_tls12_sha256_prf);
-        br_ssl_engine_set_prf_sha384(&stream.ssl_client.eng, &br_tls12_sha384_prf);
-        br_ssl_engine_set_default_aes_cbc(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_aes_ccm(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_aes_gcm(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_des_cbc(&stream.ssl_client.eng);
-        br_ssl_engine_set_default_chapol(&stream.ssl_client.eng);
-        print_line("browse: insecure tls engine configured");
+    NeutrinoWallTime verified_time{};
+    if (!neutrino_get_time(&verified_time)) {
+        print_line("browse: HTTPS requires a valid system clock");
+        return false;
     }
+    if (!ensure_trust_store_loaded() || g_trust_store->anchor_count == 0) {
+        print_line("browse: TLS trust store unavailable; refusing HTTPS");
+        return false;
+    }
+    print_line("browse: using verified tls mode");
+    br_ssl_client_init_full(&stream.ssl_client,
+                            &stream.x509_minimal,
+                            g_trust_store->anchors,
+                            g_trust_store->anchor_count);
+    br_ssl_engine_set_versions(&stream.ssl_client.eng, BR_TLS12, BR_TLS12);
+    constexpr uint32_t kUnixEpochDays = 719528u;
+    uint32_t days = kUnixEpochDays +
+                    static_cast<uint32_t>(verified_time.unix_seconds / 86400ull);
+    uint32_t seconds =
+        static_cast<uint32_t>(verified_time.unix_seconds % 86400ull);
+    br_x509_minimal_set_time(&stream.x509_minimal, days, seconds);
+    stream.tls_mode = TlsMode::Verified;
     br_ssl_engine_set_buffer(&stream.ssl_client.eng,
                              stream.ssl_iobuf,
                              sizeof(stream.ssl_iobuf),
                              1);
     print_line("browse: tls buffer configured");
     uint8_t entropy[32];
-    seed_entropy(entropy, host, 443);
+    if (!auth::secure_random(entropy, sizeof(entropy))) {
+        print_line("browse: secure random source unavailable; refusing HTTPS");
+        return false;
+    }
     print_line("browse: entropy seeded");
     br_ssl_engine_inject_entropy(&stream.ssl_client.eng, entropy, sizeof(entropy));
     print_line("browse: entropy injected");
     br_ssl_client_reset(&stream.ssl_client, host, 0);
     print_line("browse: tls client reset");
+    return true;
 }
 
 int tcp_low_read(void* context, unsigned char* data, size_t len) {
@@ -1219,7 +1055,9 @@ bool stream_connect(Stream& stream, const Url& url) {
     if (!stream.tls) {
         return true;
     }
-    init_tls_client(stream, url.host);
+    if (!init_tls_client(stream, url.host)) {
+        return false;
+    }
     br_sslio_init(&stream.ssl_io,
                   &stream.ssl_client.eng,
                   tcp_low_read,

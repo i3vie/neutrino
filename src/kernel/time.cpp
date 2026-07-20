@@ -3,6 +3,9 @@
 #include "arch/x86_64/io.hpp"
 #include "../drivers/log/logging.hpp"
 
+#include <uacpi/acpi.h>
+#include <uacpi/tables.h>
+
 namespace {
 
 constexpr uint16_t kCmosAddressPort = 0x70;
@@ -16,7 +19,6 @@ constexpr uint8_t kRegisterMonth = 0x08;
 constexpr uint8_t kRegisterYear = 0x09;
 constexpr uint8_t kRegisterStatusA = 0x0A;
 constexpr uint8_t kRegisterStatusB = 0x0B;
-constexpr uint8_t kRegisterCentury = 0x32;
 constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
 
 struct RtcSample {
@@ -39,7 +41,20 @@ uint32_t g_tick_remainder = 0;
 uint32_t g_tick_nanos_floor = 10000000;
 uint32_t g_tick_nanos_remainder = 0;
 uint64_t g_tick_count = 0;
+uint64_t g_uptime_nanoseconds = 0;
 bool g_initialized = false;
+
+bool clock_available() {
+    return __atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE);
+}
+
+uint8_t rtc_century_register() {
+    acpi_fadt* fadt = nullptr;
+    if (uacpi_table_fadt(&fadt) == UACPI_STATUS_OK && fadt != nullptr) {
+        return fadt->century;
+    }
+    return 0;
+}
 
 uint8_t read_cmos(uint8_t reg) {
     outb(kCmosAddressPort, static_cast<uint8_t>(0x80u | reg));
@@ -59,7 +74,7 @@ void wait_for_rtc_update() {
     }
 }
 
-RtcSample read_rtc_sample() {
+RtcSample read_rtc_sample(uint8_t century_register) {
     RtcSample sample{};
     sample.second = read_cmos(kRegisterSeconds);
     sample.minute = read_cmos(kRegisterMinutes);
@@ -68,7 +83,7 @@ RtcSample read_rtc_sample() {
     sample.day = read_cmos(kRegisterDay);
     sample.month = read_cmos(kRegisterMonth);
     sample.year = read_cmos(kRegisterYear);
-    sample.century = read_cmos(kRegisterCentury);
+    sample.century = century_register != 0 ? read_cmos(century_register) : 0;
     sample.status_b = read_cmos(kRegisterStatusB);
     return sample;
 }
@@ -187,11 +202,12 @@ bool sample_to_unix_seconds(const RtcSample& sample, uint64_t& unix_seconds) {
 }
 
 bool read_rtc_unix_time(uint64_t& unix_seconds) {
+    uint8_t century_register = rtc_century_register();
     for (uint32_t attempt = 0; attempt < 8u; ++attempt) {
         wait_for_rtc_update();
-        RtcSample first = read_rtc_sample();
+        RtcSample first = read_rtc_sample(century_register);
         wait_for_rtc_update();
-        RtcSample second = read_rtc_sample();
+        RtcSample second = read_rtc_sample(century_register);
         if (!samples_match(first, second)) {
             continue;
         }
@@ -216,16 +232,12 @@ void end_write() {
 namespace timekeeping {
 
 bool init_from_rtc(uint32_t pit_frequency_hz) {
-    uint64_t unix_seconds = 0;
-    if (!read_rtc_unix_time(unix_seconds)) {
-        log_message(LogLevel::Warn, "Time: failed to read CMOS RTC");
-        return false;
-    }
-
     if (pit_frequency_hz == 0) {
         pit_frequency_hz = 100;
     }
 
+    // The monotonic clock drives scheduler deadlines and firmware timeouts,
+    // so it must remain available even when the wall-clock RTC is invalid.
     begin_write();
     g_tick_hz = pit_frequency_hz;
     g_tick_remainder = 0;
@@ -233,11 +245,21 @@ bool init_from_rtc(uint32_t pit_frequency_hz) {
         static_cast<uint32_t>(kNanosecondsPerSecond / pit_frequency_hz);
     g_tick_nanos_remainder =
         static_cast<uint32_t>(kNanosecondsPerSecond % pit_frequency_hz);
+    g_tick_count = 0;
+    g_uptime_nanoseconds = 0;
+    end_write();
+
+    uint64_t unix_seconds = 0;
+    if (!read_rtc_unix_time(unix_seconds)) {
+        log_message(LogLevel::Warn, "Time: failed to read CMOS RTC");
+        return false;
+    }
+
+    begin_write();
     g_unix_seconds = unix_seconds;
     g_nanoseconds = 0;
-    g_tick_count = 0;
-    g_initialized = true;
     end_write();
+    __atomic_store_n(&g_initialized, true, __ATOMIC_RELEASE);
 
     log_message(LogLevel::Info,
                 "Time: initialized from CMOS RTC at %llu",
@@ -246,30 +268,45 @@ bool init_from_rtc(uint32_t pit_frequency_hz) {
 }
 
 void tick_pit() {
-    if (!__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
-        return;
-    }
-
     begin_write();
-    uint64_t nanoseconds =
-        static_cast<uint64_t>(g_nanoseconds) + g_tick_nanos_floor;
     uint32_t remainder = g_tick_remainder + g_tick_nanos_remainder;
+    bool carried = false;
     if (remainder >= g_tick_hz) {
-        nanoseconds += 1ull;
         remainder -= g_tick_hz;
+        carried = true;
     }
-    while (nanoseconds >= kNanosecondsPerSecond) {
-        nanoseconds -= kNanosecondsPerSecond;
-        ++g_unix_seconds;
+    if (clock_available()) {
+        uint64_t nanoseconds =
+            static_cast<uint64_t>(g_nanoseconds) + g_tick_nanos_floor;
+        if (carried) {
+            ++nanoseconds;
+        }
+        while (nanoseconds >= kNanosecondsPerSecond) {
+            nanoseconds -= kNanosecondsPerSecond;
+            ++g_unix_seconds;
+        }
+        g_nanoseconds = static_cast<uint32_t>(nanoseconds);
     }
-    g_nanoseconds = static_cast<uint32_t>(nanoseconds);
     g_tick_remainder = remainder;
     ++g_tick_count;
+    g_uptime_nanoseconds += g_tick_nanos_floor;
+    if (carried) ++g_uptime_nanoseconds;
     end_write();
 }
 
 bool snapshot(NeutrinoWallTime& out_time) {
-    if (!__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
+    if (!clock_available()) {
+        log_message(
+            LogLevel::Warn,
+            "Time: snapshot unavailable initialized=0 unix=%llu seq=%u ticks=%llu uptime_ns=%llu",
+            static_cast<unsigned long long>(
+                __atomic_load_n(&g_unix_seconds, __ATOMIC_RELAXED)),
+            static_cast<unsigned int>(
+                __atomic_load_n(&g_time_seq, __ATOMIC_RELAXED)),
+            static_cast<unsigned long long>(
+                __atomic_load_n(&g_tick_count, __ATOMIC_RELAXED)),
+            static_cast<unsigned long long>(
+                __atomic_load_n(&g_uptime_nanoseconds, __ATOMIC_RELAXED)));
         return false;
     }
 
@@ -307,10 +344,6 @@ bool snapshot(NeutrinoWallTime& out_time) {
 }
 
 uint64_t tick_count() {
-    if (!__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
-        return 0;
-    }
-
     uint64_t ticks = 0;
     for (;;) {
         uint32_t seq_before = __atomic_load_n(&g_time_seq, __ATOMIC_ACQUIRE);
@@ -325,9 +358,12 @@ uint64_t tick_count() {
     }
 }
 
+uint64_t nanoseconds_since_boot() {
+    return __atomic_load_n(&g_uptime_nanoseconds, __ATOMIC_ACQUIRE);
+}
+
 uint64_t ticks_for_duration_ns(uint64_t duration_ns) {
-    if (duration_ns == 0 ||
-        !__atomic_load_n(&g_initialized, __ATOMIC_ACQUIRE)) {
+    if (duration_ns == 0) {
         return 0;
     }
 

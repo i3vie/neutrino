@@ -2,6 +2,7 @@
 
 #include "../../lib/mem.hpp"
 #include "../process.hpp"
+#include "../random.hpp"
 #include "../scheduler.hpp"
 #include "../vm.hpp"
 
@@ -61,7 +62,6 @@ struct EndpointHandle {
 NetEndpoint g_endpoints[kMaxEndpoints]{};
 EndpointHandle g_handles[kMaxEndpointHandles]{};
 EndpointWaiter g_waiters[kMaxEndpointWaiters]{};
-uint32_t g_next_endpoint_id = 1;
 
 inline size_t min_size(size_t a, size_t b) {
     return (a < b) ? a : b;
@@ -109,6 +109,8 @@ EndpointWaiter*& write_waiters(NetEndpoint& endpoint, Role role) {
                              : endpoint.service_write_waiters;
 }
 
+NetEndpoint* find_endpoint(uint32_t id);
+
 NetEndpoint* allocate_endpoint() {
     for (auto& endpoint : g_endpoints) {
         if (endpoint.in_use) {
@@ -125,10 +127,12 @@ NetEndpoint* allocate_endpoint() {
         endpoint.app_write_waiters = nullptr;
         endpoint.service_read_waiters = nullptr;
         endpoint.service_write_waiters = nullptr;
-        if (g_next_endpoint_id == 0) {
-            g_next_endpoint_id = 1;
-        }
-        endpoint.id = g_next_endpoint_id++;
+        endpoint.id = 0;
+        uint32_t candidate = 0;
+        do {
+            candidate = kernel_random::opaque_id();
+        } while (find_endpoint(candidate) != nullptr);
+        endpoint.id = candidate;
         return &endpoint;
     }
     return nullptr;

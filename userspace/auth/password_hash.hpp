@@ -4,10 +4,12 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "secure_random.hpp"
+
 namespace auth {
 
 constexpr uint32_t kPasswordAlgorithmPbkdf2Sha256 = 1;
-constexpr uint32_t kPasswordIterations = 4096;
+constexpr uint32_t kPasswordIterations = 100000;
 constexpr size_t kPasswordSaltSize = 16;
 constexpr size_t kPasswordHashSize = 32;
 
@@ -195,30 +197,9 @@ inline bool constant_time_equal(const uint8_t* a, const uint8_t* b, size_t len) 
     return diff == 0;
 }
 
-inline uint64_t rdtsc() {
-    uint32_t lo = 0;
-    uint32_t hi = 0;
-    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return (static_cast<uint64_t>(hi) << 32) | lo;
-}
-
-inline void make_salt(const char* name, uint8_t salt[kPasswordSaltSize]) {
-    uint8_t seed[64]{};
-    uint64_t t0 = rdtsc();
-    uintptr_t ptr = reinterpret_cast<uintptr_t>(name);
-    memcpy(seed, &t0, sizeof(t0));
-    memcpy(seed + 8, &ptr, sizeof(ptr));
-    if (name != nullptr) {
-        size_t len = strlen(name);
-        if (len > 40) len = 40;
-        memcpy(seed + 16, name, len);
-    }
-    uint8_t digest[32];
-    Sha256 ctx;
-    sha256_init(ctx);
-    sha256_update(ctx, seed, sizeof(seed));
-    sha256_final(ctx, digest);
-    memcpy(salt, digest, kPasswordSaltSize);
+inline bool make_salt(const char* name, uint8_t salt[kPasswordSaltSize]) {
+    (void)name;
+    return secure_random(salt, kPasswordSaltSize);
 }
 
 }  // namespace auth

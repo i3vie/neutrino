@@ -370,6 +370,35 @@ User* find(const UserId& id) {
     return nullptr;
 }
 
+uint64_t handle_for(const User* user) {
+    if (user == nullptr || !user->active || user->generation == 0) {
+        return 0;
+    }
+    ptrdiff_t index = user - &g_users[0];
+    if (index < 0 || static_cast<size_t>(index) >= kMaxUsers) {
+        return 0;
+    }
+    return (user->generation << 32) |
+           (static_cast<uint64_t>(index) + 1u);
+}
+
+User* from_handle(uint64_t handle) {
+    uint32_t encoded_index = static_cast<uint32_t>(handle);
+    uint64_t generation = handle >> 32;
+    if (encoded_index == 0 || generation == 0) {
+        return nullptr;
+    }
+    size_t index = static_cast<size_t>(encoded_index - 1u);
+    if (index >= kMaxUsers) {
+        return nullptr;
+    }
+    User& user = g_users[index];
+    if (!user.active || user.generation != generation) {
+        return nullptr;
+    }
+    return &user;
+}
+
 const UserId& machine_id() {
     return g_machine_id;
 }
@@ -379,6 +408,9 @@ void bump_generation(User& user) {
         return;
     }
     ++user.generation;
+    if (user.generation == 0) {
+        user.generation = 1;
+    }
     // No persistence required; tokens are ephemeral across restarts.
 }
 
@@ -583,7 +615,9 @@ bool load_from_disk() {
     }
     if (!loaded) {
         g_loading_from_disk = false;
-        persist();  // create blank store
+        // Missing and malformed credential stores must remain distinguishable
+        // from an explicitly provisioned empty store.  In particular, do not
+        // overwrite corruption with a passwordless bootstrap database.
         return false;
     }
     if (read_size < sizeof(LegacyHeader)) {

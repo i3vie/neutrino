@@ -2,6 +2,7 @@
 
 #include "arch/x86_64/io.hpp"
 #include "drivers/log/logging.hpp"
+#include "kernel/sync.hpp"
 
 namespace {
 
@@ -14,6 +15,7 @@ constexpr uint8_t kMsiCapabilityId = 0x05;
 pci::PciDevice g_devices[kMaxDeviceCount];
 size_t g_device_count = 0;
 bool g_initialized = false;
+sync::SpinLock g_config_lock;
 
 struct ProgIfDescriptor {
     uint8_t value;
@@ -446,31 +448,37 @@ const PciDevice* find_by_class(uint8_t class_code,
 
 uint32_t read_config32(uint8_t bus, uint8_t slot, uint8_t function,
                        uint8_t offset) {
+    sync::IrqLockGuard guard(g_config_lock);
     return read_config32_raw(bus, slot, function, offset);
 }
 
 void write_config32(uint8_t bus, uint8_t slot, uint8_t function,
                     uint8_t offset, uint32_t value) {
+    sync::IrqLockGuard guard(g_config_lock);
     write_config32_raw(bus, slot, function, offset, value);
 }
 
 uint16_t read_config16(uint8_t bus, uint8_t slot, uint8_t function,
                        uint8_t offset) {
+    sync::IrqLockGuard guard(g_config_lock);
     return read_config16_raw(bus, slot, function, offset);
 }
 
 void write_config16(uint8_t bus, uint8_t slot, uint8_t function,
                     uint8_t offset, uint16_t value) {
+    sync::IrqLockGuard guard(g_config_lock);
     write_config16_raw(bus, slot, function, offset, value);
 }
 
 uint8_t read_config8(uint8_t bus, uint8_t slot, uint8_t function,
                      uint8_t offset) {
+    sync::IrqLockGuard guard(g_config_lock);
     return read_config8_raw(bus, slot, function, offset);
 }
 
 void write_config8(uint8_t bus, uint8_t slot, uint8_t function,
                    uint8_t offset, uint8_t value) {
+    sync::IrqLockGuard guard(g_config_lock);
     write_config8_raw(bus, slot, function, offset, value);
 }
 

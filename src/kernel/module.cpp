@@ -60,7 +60,9 @@ enum : uint32_t {
 };
 
 enum : uint64_t {
+    SHF_WRITE = 1ull << 0,
     SHF_ALLOC = 1ull << 1,
+    SHF_EXECINSTR = 1ull << 2,
 };
 
 enum : uint32_t {
@@ -399,6 +401,9 @@ bool allocate_module_sections(const uint8_t* data,
             return false;
         }
         uint64_t alignment = section->addralign == 0 ? 1 : section->addralign;
+        if (alignment < kPageSize) {
+            alignment = kPageSize;
+        }
         required = align_up(required, alignment);
         section_addrs[i] = required;
         required += section->size;
@@ -428,7 +433,8 @@ bool allocate_module_sections(const uint8_t* data,
     for (size_t page = 0; page < pages; ++page) {
         if (!paging_map_page(virt + page * kPageSize,
                              phys + page * kPageSize,
-                             PAGE_FLAG_WRITE | PAGE_FLAG_GLOBAL)) {
+                             PAGE_FLAG_WRITE | PAGE_FLAG_GLOBAL |
+                                 PAGE_FLAG_NO_EXECUTE)) {
             log_message(LogLevel::Warn, "Module: failed to map module page");
             memory::free_kernel_block(phys);
             return false;
@@ -457,6 +463,38 @@ bool allocate_module_sections(const uint8_t* data,
     loaded.phys = phys;
     loaded.image = base;
     loaded.image_size = bytes;
+    return true;
+}
+
+bool protect_module_sections(const uint8_t* data,
+                             const Elf64Ehdr& header,
+                             const uint64_t (&section_addrs)[kMaxSections]) {
+    uint64_t cr3 = paging_kernel_cr3();
+    for (size_t i = 0; i < header.shnum; ++i) {
+        const Elf64Shdr* section = section_at(data, header, i);
+        if (section == nullptr ||
+            (section->flags & SHF_ALLOC) == 0 ||
+            section->size == 0) {
+            continue;
+        }
+        bool writable = (section->flags & SHF_WRITE) != 0;
+        bool executable = (section->flags & SHF_EXECINSTR) != 0;
+        if (writable && executable) {
+            log_message(LogLevel::Warn,
+                        "Module: refusing writable executable section");
+            return false;
+        }
+        uint64_t start = section_addrs[i] & ~(kPageSize - 1);
+        uint64_t end = align_up(section_addrs[i] + section->size, kPageSize);
+        for (uint64_t page = start; page < end; page += kPageSize) {
+            if (!paging_set_writable_cr3(cr3, page, writable) ||
+                !paging_set_executable_cr3(cr3, page, executable)) {
+                log_message(LogLevel::Warn,
+                            "Module: failed to apply section permissions");
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -893,6 +931,13 @@ bool load_from_file(const char* path) {
     }
     if (!apply_module_relocations(data, image_size, *header, section_addrs)) {
         log_message(LogLevel::Warn, "Module: failed to relocate %s", path);
+        memory::free_kernel_block(loaded->phys);
+        loaded->phys = 0;
+        loaded->image = nullptr;
+        loaded->image_size = 0;
+        return false;
+    }
+    if (!protect_module_sections(data, *header, section_addrs)) {
         memory::free_kernel_block(loaded->phys);
         loaded->phys = 0;
         loaded->image = nullptr;

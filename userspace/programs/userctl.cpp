@@ -282,7 +282,11 @@ extern "C" int main(uint64_t arg_ptr, uint64_t /*flags*/) {
         }
         uint8_t salt[auth::kPasswordSaltSize];
         uint8_t hash[auth::kPasswordHashSize];
-        auth::make_salt(name_buf, salt);
+        if (!auth::make_salt(name_buf, salt)) {
+            print("secure random source unavailable\n");
+            zero_memory(password, sizeof(password));
+            return 1;
+        }
         auth::pbkdf2_sha256(password,
                             salt,
                             auth::kPasswordSaltSize,

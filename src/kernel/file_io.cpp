@@ -77,29 +77,36 @@ bool copy_path(process::Process& proc,
         return false;
     }
 
-    size_t input_len = string_util::length(user_path);
-    if (input_len == 0 || input_len >= path_util::kMaxPathLength) {
+    char temp[path_util::kMaxPathLength];
+    if (!vm::copy_user_string(proc.cr3,
+                              user_path,
+                              temp,
+                              sizeof(temp)) ||
+        temp[0] == '\0') {
         return false;
     }
-
-    char temp[path_util::kMaxPathLength];
-    string_util::copy(temp, sizeof(temp), user_path);
     return path_util::build_absolute_path(proc.cwd, temp, out);
 }
 
-bool build_child_path(const char* base,
+bool build_child_path(process::Process& proc,
+                      const char* base,
                       const char* name,
                       char (&out)[path_util::kMaxPathLength]) {
     if (base == nullptr || name == nullptr) {
         return false;
     }
-    if (name[0] == '\0') {
+    char local_name[path_util::kMaxPathLength];
+    if (!vm::copy_user_string(proc.cr3,
+                              name,
+                              local_name,
+                              sizeof(local_name)) ||
+        local_name[0] == '\0') {
         return false;
     }
-    if (string_util::contains(name, '/')) {
+    if (string_util::contains(local_name, '/')) {
         return false;
     }
-    return path_util::build_absolute_path(base, name, out);
+    return path_util::build_absolute_path(base, local_name, out);
 }
 
 }  // namespace
@@ -355,7 +362,7 @@ int32_t open_directory_at(process::Process& proc,
         return -1;
     }
     char local_path[path_util::kMaxPathLength];
-    if (!build_child_path(parent->path, name, local_path)) {
+    if (!build_child_path(proc, parent->path, name, local_path)) {
         return -1;
     }
 
@@ -412,7 +419,7 @@ int32_t open_file_at(process::Process& proc,
         return -1;
     }
     char local_path[path_util::kMaxPathLength];
-    if (!build_child_path(parent->path, name, local_path)) {
+    if (!build_child_path(proc, parent->path, name, local_path)) {
         return -1;
     }
 
@@ -445,7 +452,7 @@ int32_t create_file_at(process::Process& proc,
         return -1;
     }
     char local_path[path_util::kMaxPathLength];
-    if (!build_child_path(parent->path, name, local_path)) {
+    if (!build_child_path(proc, parent->path, name, local_path)) {
         return -1;
     }
 

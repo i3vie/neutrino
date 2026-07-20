@@ -17,6 +17,8 @@ enum class CapabilityKind : uint16_t {
     SecurityManage = 4,
     Stream = 5,
     Monitor = 6,
+    FileSystemWrite = 7,
+    ModuleLoad = 8,
     Count,
 };
 
@@ -54,6 +56,7 @@ void principal_bump_generation(Principal& principal);
 bool principal_allows(const Principal& principal, CapabilityKind kind);
 bool principal_is_valid(const Principal* principal);
 Principal* principal_from_handle(uint64_t handle);
+uint64_t principal_handle(const Principal* principal);
 bool capability_from_value(uint64_t value, CapabilityKind& out_kind);
 inline uint64_t capability_bit(CapabilityKind kind) {
     return 1ull << static_cast<uint16_t>(kind);

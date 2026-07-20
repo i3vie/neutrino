@@ -3,6 +3,7 @@
 #include "../../drivers/log/logging.hpp"
 #include "../../lib/mem.hpp"
 #include "../process.hpp"
+#include "../random.hpp"
 #include "../scheduler.hpp"
 #include "../vm.hpp"
 
@@ -49,7 +50,6 @@ struct PipeEndpoint {
 Pipe g_pipes[kMaxPipes]{};
 PipeEndpoint g_pipe_endpoints[kMaxPipes * 2]{};
 PipeWaiter g_pipe_waiters[kMaxPipeWaiters]{};
-uint32_t g_next_pipe_id = 1;
 
 inline size_t min_size(size_t a, size_t b) {
     return (a < b) ? a : b;
@@ -64,6 +64,8 @@ void lock_pipe(Pipe& pipe) {
 void unlock_pipe(Pipe& pipe) {
     __atomic_clear(&pipe.lock, __ATOMIC_RELEASE);
 }
+
+Pipe* find_pipe_by_id(uint32_t id);
 
 Pipe* allocate_pipe() {
     for (auto& pipe : g_pipes) {
@@ -80,10 +82,12 @@ Pipe* allocate_pipe() {
         pipe.read_waiters = nullptr;
         pipe.write_waiters = nullptr;
         pipe.lock = 0;
-        if (g_next_pipe_id == 0) {
-            g_next_pipe_id = 1;
-        }
-        pipe.id = g_next_pipe_id++;
+        pipe.id = 0;
+        uint32_t candidate = 0;
+        do {
+            candidate = kernel_random::opaque_id();
+        } while (find_pipe_by_id(candidate) != nullptr);
+        pipe.id = candidate;
         memset(pipe.buffer, 0, sizeof(pipe.buffer));
         return &pipe;
     }

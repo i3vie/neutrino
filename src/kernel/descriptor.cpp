@@ -441,6 +441,13 @@ int64_t read(process::Process& proc,
     if (entry->ops == nullptr || entry->ops->read == nullptr) {
         return -1;
     }
+    if (!is_kernel_process(proc) &&
+        !vm::validate_user_buffer(proc.cr3,
+                                  user_address,
+                                  static_cast<size_t>(length),
+                                  true)) {
+        return -1;
+    }
     entry->last_access_tick = 0;
     return entry->ops->read(proc, *entry, user_address, length, offset);
 }
@@ -459,6 +466,13 @@ int64_t write(process::Process& proc,
         return -1;
     }
     if (entry->ops == nullptr || entry->ops->write == nullptr) {
+        return -1;
+    }
+    if (!is_kernel_process(proc) &&
+        !vm::validate_user_buffer(proc.cr3,
+                                  user_address,
+                                  static_cast<size_t>(length),
+                                  false)) {
         return -1;
     }
     entry->last_access_tick = 0;
@@ -530,6 +544,10 @@ int get_property(process::Process& proc,
     }
     void* out = reinterpret_cast<void*>(out_ptr);
     size_t out_size = static_cast<size_t>(size);
+    if (!is_kernel_process(proc) &&
+        !vm::validate_user_buffer(proc.cr3, out_ptr, out_size, true)) {
+        return -1;
+    }
     if (property ==
         static_cast<uint32_t>(descriptor_defs::Property::CommonName)) {
         if (entry->name == nullptr || out == nullptr || out_size == 0) {
@@ -560,7 +578,6 @@ int set_property(process::Process& proc,
                  uint32_t property,
                  uint64_t in_ptr,
                  uint64_t size) {
-    (void)proc;
     DescriptorEntry* entry = lookup_entry(table, handle);
     if (entry == nullptr) {
         return -1;
@@ -570,6 +587,13 @@ int set_property(process::Process& proc,
     }
     const void* in = reinterpret_cast<const void*>(in_ptr);
     if (in == nullptr && size != 0) {
+        return -1;
+    }
+    if (!is_kernel_process(proc) &&
+        !vm::validate_user_buffer(proc.cr3,
+                                  in_ptr,
+                                  static_cast<size_t>(size),
+                                  false)) {
         return -1;
     }
     return entry->ops->set_property(*entry, property, in, static_cast<size_t>(size));

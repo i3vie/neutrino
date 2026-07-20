@@ -63,6 +63,7 @@ enum class SystemCall : long {
     ModuleLoad           = 53,
     ModuleCount          = 54,
     ModuleInfo           = 55,
+    RandomGet            = 56,
 };
 
 enum : uint32_t {
@@ -218,6 +219,15 @@ static inline long time_get(NeutrinoWallTime* out_time) {
     return raw_syscall2(SystemCall::TimeGet,
                         static_cast<long>(reinterpret_cast<uintptr_t>(out_time)),
                         static_cast<long>(sizeof(*out_time)));
+}
+
+static inline long random_get(void* output, size_t length) {
+    if (output == nullptr && length != 0) {
+        return -1;
+    }
+    return raw_syscall2(SystemCall::RandomGet,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(output)),
+                        static_cast<long>(length));
 }
 
 static inline long descriptor_wait(descriptor_defs::DescriptorWait* items,

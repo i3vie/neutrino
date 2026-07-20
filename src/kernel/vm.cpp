@@ -112,7 +112,7 @@ Region map_user_code(uint64_t cr3,
         paging_map_page_cr3(cr3,
                             virt,
                             phys,
-                            PAGE_FLAG_WRITE | PAGE_FLAG_USER);
+                            PAGE_FLAG_USER);
 
         size_t offset = i * kPageSize;
         size_t remaining = (offset < length) ? (length - offset) : 0;
@@ -182,7 +182,8 @@ Region allocate_user_region(uint64_t cr3, size_t length) {
         paging_map_page_cr3(cr3,
                             virt,
                             phys,
-                            PAGE_FLAG_WRITE | PAGE_FLAG_USER);
+                            PAGE_FLAG_WRITE | PAGE_FLAG_USER |
+                                PAGE_FLAG_NO_EXECUTE);
     }
 
     return region;
@@ -225,7 +226,8 @@ Stack allocate_user_stack(uint64_t cr3, size_t length) {
         paging_map_page_cr3(cr3,
                             virt,
                             phys,
-                            PAGE_FLAG_WRITE | PAGE_FLAG_USER);
+                            PAGE_FLAG_WRITE | PAGE_FLAG_USER |
+                                PAGE_FLAG_NO_EXECUTE);
         memset(page, 0, kPageSize);
     }
 
@@ -248,7 +250,7 @@ uint64_t map_region(uint64_t cr3,
         return 0;
     }
 
-    uint64_t map_flags = PAGE_FLAG_USER;
+    uint64_t map_flags = PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
     if ((flags & kMapWrite) != 0) {
         map_flags |= PAGE_FLAG_WRITE;
     }
@@ -370,6 +372,28 @@ bool set_user_region_writable(uint64_t cr3,
     return true;
 }
 
+bool set_user_region_executable(uint64_t cr3,
+                                uint64_t addr,
+                                size_t length,
+                                bool executable) {
+    if (cr3 == 0 || addr == 0 || length == 0) {
+        return false;
+    }
+
+    uint64_t base = align_down(addr, kPageSize);
+    uint64_t end = align_up(addr + length, kPageSize);
+    if (end < base || !is_user_range(base, end - base)) {
+        return false;
+    }
+
+    for (uint64_t virt = base; virt < end; virt += kPageSize) {
+        if (!paging_set_executable_cr3(cr3, virt, executable)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void release_user_region(uint64_t cr3, const Region& region) {
     if (region.base == 0 || region.length == 0) {
         return;
@@ -401,7 +425,42 @@ bool is_user_range(uint64_t address, uint64_t length) {
     return true;
 }
 
-bool copy_user_string(const char* user, char* dest, size_t dest_size) {
+bool validate_user_buffer(uint64_t cr3,
+                          uint64_t address,
+                          size_t length,
+                          bool writable) {
+    if (length == 0) {
+        return true;
+    }
+    if (cr3 == 0 || address == 0 ||
+        !is_user_range(address, static_cast<uint64_t>(length))) {
+        return false;
+    }
+
+    uint64_t current = address;
+    size_t remaining = length;
+    while (remaining != 0) {
+        uint64_t phys = 0;
+        uint64_t flags = 0;
+        if (!paging_resolve_cr3(cr3, current, phys) ||
+            !paging_flags_cr3(cr3, current, flags) ||
+            (flags & PAGE_FLAG_USER) == 0 ||
+            (writable && (flags & PAGE_FLAG_WRITE) == 0)) {
+            return false;
+        }
+        size_t page_remaining =
+            kPageSize - static_cast<size_t>(current & kPageMask);
+        size_t chunk = remaining < page_remaining ? remaining : page_remaining;
+        current += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+bool copy_user_string(uint64_t cr3,
+                      const char* user,
+                      char* dest,
+                      size_t dest_size) {
     if (dest == nullptr || dest_size == 0) {
         return false;
     }
@@ -412,12 +471,11 @@ bool copy_user_string(const char* user, char* dest, size_t dest_size) {
     size_t idx = 0;
     while (idx + 1 < dest_size) {
         uint64_t addr = reinterpret_cast<uint64_t>(user + idx);
-        if (!is_user_range(addr, 1)) {
+        if (!copy_from_user(cr3, &dest[idx], addr, 1)) {
             dest[0] = '\0';
             return false;
         }
-        char ch = user[idx];
-        dest[idx++] = ch;
+        char ch = dest[idx++];
         if (ch == '\0') {
             return true;
         }
@@ -449,6 +507,7 @@ bool copy_to_user(uint64_t cr3,
         }
         uint64_t page_flags = 0;
         if (!paging_flags_cr3(cr3, dest_addr, page_flags) ||
+            (page_flags & PAGE_FLAG_USER) == 0 ||
             (page_flags & PAGE_FLAG_WRITE) == 0) {
             return false;
         }
@@ -485,6 +544,11 @@ bool copy_from_user(uint64_t cr3,
         if (!paging_resolve_cr3(cr3, src_addr, phys)) {
             return false;
         }
+        uint64_t page_flags = 0;
+        if (!paging_flags_cr3(cr3, src_addr, page_flags) ||
+            (page_flags & PAGE_FLAG_USER) == 0) {
+            return false;
+        }
         size_t page_off = static_cast<size_t>(src_addr & kPageMask);
         size_t chunk = kPageSize - page_off;
         if (chunk > length - offset) {
@@ -515,6 +579,12 @@ bool fill_user(uint64_t cr3,
         uint64_t dest_addr = dest + offset;
         uint64_t phys = 0;
         if (!paging_resolve_cr3(cr3, dest_addr, phys)) {
+            return false;
+        }
+        uint64_t page_flags = 0;
+        if (!paging_flags_cr3(cr3, dest_addr, page_flags) ||
+            (page_flags & PAGE_FLAG_USER) == 0 ||
+            (page_flags & PAGE_FLAG_WRITE) == 0) {
             return false;
         }
         size_t page_off = static_cast<size_t>(dest_addr & kPageMask);

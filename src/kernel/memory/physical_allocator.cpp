@@ -30,6 +30,12 @@ struct Range {
     uint64_t length;
 };
 
+struct AllocationHeader {
+    uint64_t phys;
+    uint64_t magic;
+};
+constexpr uint64_t kAllocationMagic = 0x4E45555452494E4Full;
+
 constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
@@ -376,6 +382,32 @@ void free_kernel_block(uint64_t phys) {
 }
 
 void free_kernel_page(uint64_t phys) {
+    free_kernel_block(phys);
+}
+
+void* alloc_kernel(size_t bytes, size_t alignment) {
+    if (bytes == 0) return nullptr;
+    if (alignment < alignof(AllocationHeader)) alignment = alignof(AllocationHeader);
+    if ((alignment & (alignment - 1)) != 0) return nullptr;
+    if (bytes > static_cast<size_t>(-1) - alignment - sizeof(AllocationHeader)) return nullptr;
+    const size_t total = bytes + alignment - 1 + sizeof(AllocationHeader);
+    const size_t pages = static_cast<size_t>(align_up(total, kPageSize) / kPageSize);
+    uint64_t phys = alloc_kernel_block_pages(pages);
+    if (phys == 0) return nullptr;
+    uintptr_t start = reinterpret_cast<uintptr_t>(paging_phys_to_virt(phys));
+    uintptr_t result = align_up(start + sizeof(AllocationHeader), alignment);
+    auto* header = reinterpret_cast<AllocationHeader*>(result - sizeof(AllocationHeader));
+    header->phys = phys;
+    header->magic = kAllocationMagic;
+    return reinterpret_cast<void*>(result);
+}
+
+void free_kernel(void* ptr) {
+    if (ptr == nullptr) return;
+    auto* header = reinterpret_cast<AllocationHeader*>(reinterpret_cast<uintptr_t>(ptr) - sizeof(AllocationHeader));
+    if (header->magic != kAllocationMagic) return;
+    uint64_t phys = header->phys;
+    header->magic = 0;
     free_kernel_block(phys);
 }
 

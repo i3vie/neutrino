@@ -4,6 +4,7 @@
 #include "lib/mem.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 #include "fs/vfs.hpp"
+#include "kernel/memory/physical_allocator.hpp"
 #include "vm.hpp"
 
 namespace {
@@ -39,6 +40,7 @@ enum : uint32_t {
 };
 
 enum : uint32_t {
+    PF_X = 1,
     PF_W = 2,
 };
 
@@ -151,9 +153,6 @@ struct LoadedObject {
     DynamicInfo dynamic;
     bool main_object;
 };
-
-alignas(16) uint8_t g_shared_object_images[kMaxSharedObjects - 1]
-                                           [kMaxSharedObjectImageSize];
 
 constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -274,23 +273,29 @@ const uint8_t* image_ptr_at_vaddr(const loader::ProgramImage& image,
     return nullptr;
 }
 
-bool read_file_into_buffer(const char* path,
-                           uint8_t* buffer,
-                           size_t capacity,
-                           loader::ProgramImage& out_image) {
-    if (path == nullptr || buffer == nullptr || capacity == 0) {
+bool read_shared_object_image(const char* path,
+                              loader::ProgramImage& out_image,
+                              uint8_t*& out_buffer) {
+    out_image = {};
+    out_buffer = nullptr;
+    if (path == nullptr) {
         return false;
     }
     vfs::FileHandle handle{};
     if (!vfs::open_file(path, handle)) {
         return false;
     }
-    if (handle.size == 0 || handle.size > capacity) {
+    if (handle.size == 0 || handle.size > kMaxSharedObjectImageSize) {
         vfs::close_file(handle);
         return false;
     }
 
     size_t total = static_cast<size_t>(handle.size);
+    auto* buffer = static_cast<uint8_t*>(memory::alloc_kernel(total, 16));
+    if (buffer == nullptr) {
+        vfs::close_file(handle);
+        return false;
+    }
     size_t offset = 0;
     while (offset < total) {
         size_t read = 0;
@@ -300,6 +305,7 @@ bool read_file_into_buffer(const char* path,
                             total - offset,
                             read)) {
             vfs::close_file(handle);
+            memory::free_kernel(buffer);
             return false;
         }
         if (read == 0) {
@@ -309,8 +315,10 @@ bool read_file_into_buffer(const char* path,
     }
     vfs::close_file(handle);
     if (offset != total) {
+        memory::free_kernel(buffer);
         return false;
     }
+    out_buffer = buffer;
     out_image.data = buffer;
     out_image.size = total;
     out_image.entry_offset = 0;
@@ -777,6 +785,7 @@ bool protect_elf_object_pages(const LoadedObject& object,
 
     for (uint64_t page = aligned_min; page < aligned_max; page += kPageSize) {
         bool writable = false;
+        bool executable = false;
         bool covered = false;
 
         for (uint16_t i = 0; i < header->phnum; ++i) {
@@ -792,16 +801,28 @@ bool protect_elf_object_pages(const LoadedObject& object,
             covered = true;
             if ((ph->flags & PF_W) != 0) {
                 writable = true;
-                break;
+            }
+            if ((ph->flags & PF_X) != 0) {
+                executable = true;
             }
         }
-        if (!covered || writable) {
+        if (!covered) {
             continue;
         }
+        if (writable && executable) {
+            log_message(LogLevel::Error,
+                        "Loader: refusing writable executable ELF object page");
+            return false;
+        }
+        uint64_t address = object.load_bias + page;
         if (!vm::set_user_region_writable(proc.cr3,
-                                          object.load_bias + page,
+                                          address,
                                           kPageSize,
-                                          false)) {
+                                          writable) ||
+            !vm::set_user_region_executable(proc.cr3,
+                                            address,
+                                            kPageSize,
+                                            executable)) {
             log_message(LogLevel::Error,
                         "Loader: failed to protect ELF object page");
             return false;
@@ -973,12 +994,9 @@ bool load_needed_object(const char* name,
         return false;
     }
 
-    size_t buffer_index = object_count - 1;
     loader::ProgramImage image{};
-    if (!read_file_into_buffer(path,
-                               g_shared_object_images[buffer_index],
-                               kMaxSharedObjectImageSize,
-                               image)) {
+    uint8_t* image_buffer = nullptr;
+    if (!read_shared_object_image(path, image, image_buffer)) {
         log_message(LogLevel::Error,
                     "Loader: failed to read shared object %s",
                     path);
@@ -988,11 +1006,13 @@ bool load_needed_object(const char* name,
         log_message(LogLevel::Error,
                     "Loader: shared object is not ELF: %s",
                     path);
+        memory::free_kernel(image_buffer);
         return false;
     }
 
     LoadedObject object{};
     if (!map_elf_object(image, proc, name, false, object)) {
+        memory::free_kernel(image_buffer);
         return false;
     }
     objects[object_count++] = object;
@@ -1015,6 +1035,14 @@ bool load_needed_object(const char* name,
     return true;
 }
 
+void free_dependency_images(LoadedObject* objects, size_t object_count) {
+    for (size_t i = 1; i < object_count; ++i) {
+        memory::free_kernel(const_cast<uint8_t*>(objects[i].data));
+        objects[i].data = nullptr;
+        objects[i].size = 0;
+    }
+}
+
 bool load_dynamic_elf_binary(const loader::ProgramImage& image,
                              process::Process& proc) {
     LoadedObject objects[kMaxSharedObjects]{};
@@ -1033,18 +1061,22 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
                             sizeof(needed))) {
             log_message(LogLevel::Error,
                         "Loader: failed to read dependency name");
+            free_dependency_images(objects, object_count);
             return false;
         }
         if (!load_needed_object(needed, objects, object_count, proc)) {
+            free_dependency_images(objects, object_count);
             return false;
         }
     }
 
     if (!apply_dynamic_relocations(objects, object_count, proc)) {
+        free_dependency_images(objects, object_count);
         return false;
     }
     for (size_t i = 0; i < object_count; ++i) {
         if (!protect_elf_object_pages(objects[i], proc)) {
+            free_dependency_images(objects, object_count);
             return false;
         }
     }
@@ -1063,12 +1095,14 @@ bool load_dynamic_elf_binary(const loader::ProgramImage& image,
                                           entry_page,
                                           kPageSize,
                                           false)) {
+            free_dependency_images(objects, object_count);
             return false;
         }
     }
 
     proc.code_region = objects[0].region;
     proc.user_ip = entry_va;
+    free_dependency_images(objects, object_count);
     return true;
 }
 
@@ -1293,6 +1327,7 @@ bool load_elf_binary(const loader::ProgramImage& image,
 
     for (uint64_t page = aligned_min; page < aligned_max; page += kPageSize) {
         bool writable = false;
+        bool executable = false;
         bool covered = false;
 
         for (uint16_t i = 0; i < header->phnum; ++i) {
@@ -1313,19 +1348,31 @@ bool load_elf_binary(const loader::ProgramImage& image,
             covered = true;
             if ((ph->flags & PF_W) != 0) {
                 writable = true;
-                break;
+            }
+            if ((ph->flags & PF_X) != 0) {
+                executable = true;
             }
         }
 
-        if (!covered || writable) {
+        if (!covered) {
             continue;
+        }
+
+        if (writable && executable) {
+            log_message(LogLevel::Error,
+                        "Loader: refusing writable executable ELF page");
+            return false;
         }
 
         uint64_t page_addr = load_bias + page;
         if (!vm::set_user_region_writable(proc.cr3,
                                           page_addr,
                                           kPageSize,
-                                          false)) {
+                                          writable) ||
+            !vm::set_user_region_executable(proc.cr3,
+                                            page_addr,
+                                            kPageSize,
+                                            executable)) {
             log_message(LogLevel::Error,
                         "Loader: failed to protect ELF page 0x%llx",
                         static_cast<unsigned long long>(page_addr));

@@ -763,7 +763,18 @@ bool open_block_device(process::Process& proc,
                        Allocation& alloc) {
     BlockDeviceRecord* record = nullptr;
     if (name_ptr != 0) {
-        const char* name = reinterpret_cast<const char*>(name_ptr);
+        char name[kMaxBlockDeviceNameLen];
+        if (is_kernel_process(proc)) {
+            string_util::copy(name,
+                              sizeof(name),
+                              reinterpret_cast<const char*>(name_ptr));
+        } else if (!vm::copy_user_string(
+                       proc.cr3,
+                       reinterpret_cast<const char*>(name_ptr),
+                       name,
+                       sizeof(name))) {
+            return false;
+        }
         record = find_block_device_by_name(name);
     } else {
         record = find_block_device_by_index(index);
@@ -796,16 +807,24 @@ bool open_block_device(process::Process& proc,
     return true;
 }
 
-bool open_disk(process::Process&,
+bool open_disk(process::Process& proc,
                uint64_t name_ptr,
                uint64_t index,
                uint64_t,
                Allocation& alloc) {
     char disk_name[kMaxBlockDeviceNameLen]{};
     if (name_ptr != 0) {
-        string_util::copy(disk_name,
-                          sizeof(disk_name),
-                          reinterpret_cast<const char*>(name_ptr));
+        if (is_kernel_process(proc)) {
+            string_util::copy(disk_name,
+                              sizeof(disk_name),
+                              reinterpret_cast<const char*>(name_ptr));
+        } else if (!vm::copy_user_string(
+                       proc.cr3,
+                       reinterpret_cast<const char*>(name_ptr),
+                       disk_name,
+                       sizeof(disk_name))) {
+            return false;
+        }
     } else if (!disk_name_by_index(index, disk_name, sizeof(disk_name))) {
         return false;
     }

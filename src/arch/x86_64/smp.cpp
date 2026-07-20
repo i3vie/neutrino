@@ -43,6 +43,9 @@ extern "C" void smp_ap_entry(struct LIMINE_MP(info)* info) {
 
     idt_install();
 
+    // The APIC enable bit is local to each processor.  Initializing it only on
+    // the BSP leaves APs unable to receive fixed IPIs such as TLB shootdowns.
+    lapic::init(paging_hhdm_offset());
     lapic::setup_timer(0x40, 10'000'000);
 
     __atomic_fetch_add(&g_online_cpus, 1, __ATOMIC_SEQ_CST);
@@ -55,6 +58,7 @@ extern "C" void smp_ap_entry(struct LIMINE_MP(info)* info) {
 }
 
 void init() {
+    log_message(LogLevel::Info, "SMP: probing Limine CPU topology");
     auto* response = smp_request.response;
     if (response == nullptr || response->cpu_count == 0) {
         log_message(LogLevel::Warn,
@@ -64,6 +68,8 @@ void init() {
     }
 
     g_cpu_count = response->cpu_count;
+    log_message(LogLevel::Info, "SMP: preparing %u CPU(s)",
+                static_cast<unsigned int>(response->cpu_count));
 
     percpu::Cpu* bsp_cpu = percpu::find_by_lapic(response->bsp_lapic_id);
     size_t ap_slots = 0;
@@ -90,6 +96,9 @@ void init() {
             continue;
         }
         scheduler::register_cpu(ap_cpu);
+        log_message(LogLevel::Debug,
+                    "SMP: releasing AP processor_id=%u lapic_id=%u",
+                    cpu->processor_id, cpu->lapic_id);
         cpu->extra_argument = reinterpret_cast<uint64_t>(ap_cpu);
         cpu->goto_address = smp_ap_entry;
         ++ap_slots;
