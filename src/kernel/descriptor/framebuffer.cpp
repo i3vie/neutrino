@@ -4,6 +4,7 @@
 #include "../../lib/mem.hpp"
 #include "../memory/physical_allocator.hpp"
 #include "../process.hpp"
+#include "../sync.hpp"
 #include "../vm.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 
@@ -27,8 +28,28 @@ struct FramebufferSlot {
 FramebufferSlot g_framebuffers[kFramebufferSlots]{};
 Framebuffer g_hw_fb{};
 uint8_t* g_hw_base = nullptr;
+uint64_t g_hw_physical_base = 0;
 size_t g_frame_bytes = 0;
 uint32_t g_active_slot = 0;
+sync::SpinLock g_selection_lock;
+
+class SelectionGuard {
+public:
+    SelectionGuard()
+        : interrupt_flags_(sync::disable_interrupts()),
+          locked_(g_selection_lock.try_lock()) {}
+    ~SelectionGuard() {
+        if (locked_) {
+            g_selection_lock.unlock();
+        }
+        sync::restore_interrupts(interrupt_flags_);
+    }
+    bool locked() const { return locked_; }
+
+private:
+    uint64_t interrupt_flags_;
+    bool locked_;
+};
 
 FramebufferSlot* slot_from_entry(DescriptorEntry& entry) {
     return static_cast<FramebufferSlot*>(entry.object);
@@ -65,6 +86,18 @@ void copy_to_hardware(const FramebufferSlot& slot) {
         bytes = slot.buffer_bytes;
     }
     memcpy_simd(g_hw_base, slot.buffer, bytes);
+}
+
+void copy_from_hardware(FramebufferSlot& slot) {
+    if (g_hw_base == nullptr || g_frame_bytes == 0 || slot.buffer == nullptr ||
+        slot.buffer == g_hw_base) {
+        return;
+    }
+    size_t bytes = g_frame_bytes;
+    if (slot.buffer_bytes < bytes) {
+        bytes = slot.buffer_bytes;
+    }
+    memcpy_simd(slot.buffer, g_hw_base, bytes);
 }
 
 bool copy_rect_to_hardware(const FramebufferSlot& slot,
@@ -116,12 +149,19 @@ bool map_slot_into_process(process::Process& proc,
     }
     uint64_t base = region.base;
     uint64_t total = region.length;
+    uint32_t slot_index = static_cast<uint32_t>(&slot - g_framebuffers);
+    bool direct = slot_index != 0 && slot_index == g_active_slot;
+    uint64_t physical_base = direct ? g_hw_physical_base : slot.physical_base;
+    uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
+    if (direct) {
+        flags |= PAGE_FLAG_WRITE_COMBINING;
+    }
     for (uint64_t offset = 0; offset < total; offset += kPageSize) {
-        uint64_t phys = slot.physical_base + offset;
+        uint64_t phys = physical_base + offset;
         if (!paging_map_page_cr3(proc.cr3,
                                  base + offset,
                                  phys,
-                                 PAGE_FLAG_WRITE | PAGE_FLAG_USER)) {
+                                 flags)) {
             for (uint64_t rollback = 0; rollback < offset; rollback += kPageSize) {
                 uint64_t freed = 0;
                 paging_unmap_page_cr3(proc.cr3, base + rollback, freed);
@@ -130,6 +170,39 @@ bool map_slot_into_process(process::Process& proc,
         }
     }
     out_base = base;
+    return true;
+}
+
+bool remap_slot_mappings(FramebufferSlot& slot, bool direct) {
+    process::Process* owner = slot.owner;
+    if (owner == nullptr || is_kernel_process(*owner)) {
+        return true;
+    }
+    uint64_t physical_base = direct ? g_hw_physical_base : slot.physical_base;
+    if (owner->cr3 == 0 || physical_base == 0) {
+        return false;
+    }
+    uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
+    if (direct) {
+        flags |= PAGE_FLAG_WRITE_COMBINING;
+    }
+    for (size_t i = 0; i < kMaxDescriptors; ++i) {
+        DescriptorEntry& entry = owner->descriptors.entries[i];
+        if (!entry.in_use || entry.type != kTypeFramebuffer ||
+            entry.object != &slot || entry.subsystem_data == nullptr) {
+            continue;
+        }
+        uint64_t base = reinterpret_cast<uint64_t>(entry.subsystem_data);
+        for (uint64_t offset = 0; offset < slot.buffer_bytes;
+             offset += kPageSize) {
+            if (!paging_map_page_cr3(owner->cr3,
+                                     base + offset,
+                                     physical_base + offset,
+                                     flags)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -153,7 +226,10 @@ int64_t framebuffer_read(process::Process&,
     if (offset + length > frame_bytes) {
         return -1;
     }
-    auto* src = slot->buffer;
+    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+    auto* src = (slot_index != 0 && slot_index == g_active_slot)
+                    ? g_hw_base
+                    : slot->buffer;
     auto* dest = reinterpret_cast<uint8_t*>(user_address);
     if (src == nullptr || dest == nullptr) {
         return -1;
@@ -184,19 +260,16 @@ int64_t framebuffer_write(process::Process&,
     if (offset + length > frame_bytes) {
         return -1;
     }
-    auto* dest = slot->buffer;
+    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+    auto* dest = (slot_index != 0 && slot_index == g_active_slot)
+                     ? g_hw_base
+                     : slot->buffer;
     auto* src = reinterpret_cast<const uint8_t*>(user_address);
     if (dest == nullptr || src == nullptr) {
         return -1;
     }
     for (uint64_t i = 0; i < length; ++i) {
         dest[offset + i] = src[i];
-    }
-    uint32_t slot_index =
-        static_cast<uint32_t>(slot - g_framebuffers);
-    if (g_active_slot == slot_index && g_hw_base != nullptr &&
-        slot->buffer != g_hw_base) {
-        memcpy_simd(g_hw_base + offset, dest + offset, length);
     }
     return static_cast<int64_t>(length);
 }
@@ -216,7 +289,11 @@ int framebuffer_get_property(DescriptorEntry& entry,
             return -1;
         }
         auto* info = reinterpret_cast<descriptor_defs::FramebufferInfo*>(out);
-        info->physical_base = slot->physical_base;
+        uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+        info->physical_base =
+            (slot_index != 0 && slot_index == g_active_slot)
+                ? g_hw_physical_base
+                : slot->physical_base;
         if (entry.subsystem_data != nullptr) {
             info->virtual_base =
                 reinterpret_cast<uint64_t>(entry.subsystem_data);
@@ -258,6 +335,12 @@ int framebuffer_set_property(DescriptorEntry& entry,
     if (g_active_slot != slot_index) {
         return -1;
     }
+    // Active user slots are mapped directly onto the hardware framebuffer.
+    // Present remains a successful compatibility operation for applications
+    // that were written for the old back-buffered ABI.
+    if (slot_index != 0) {
+        return 0;
+    }
     if (size == 0 || in == nullptr) {
         copy_to_hardware(*slot);
         return 0;
@@ -281,11 +364,30 @@ void framebuffer_close(DescriptorEntry& entry) {
     if (slot == nullptr) {
         return;
     }
+    process::Process* owner = slot->owner;
     if (slot->open_count > 0) {
         --slot->open_count;
     }
     if (slot->open_count == 0 && !slot->kernel_reserved) {
+        uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+        while (g_active_slot == slot_index) {
+            framebuffer_select(0);
+            if (g_active_slot == slot_index) {
+                asm volatile("pause");
+            }
+        }
         slot->owner = nullptr;
+    }
+    if (owner != nullptr && !is_kernel_process(*owner) &&
+        entry.subsystem_data != nullptr) {
+        uint64_t base = reinterpret_cast<uint64_t>(entry.subsystem_data);
+        for (uint64_t offset = 0; offset < slot->buffer_bytes;
+             offset += kPageSize) {
+            uint64_t ignored = 0;
+            (void)paging_unmap_page_cr3(owner->cr3,
+                                        base + offset,
+                                        ignored);
+        }
     }
 }
 
@@ -375,6 +477,7 @@ void register_framebuffer_device(Framebuffer& framebuffer,
     using namespace framebuffer_descriptor;
     g_hw_fb = framebuffer;
     g_hw_base = framebuffer.base;
+    g_hw_physical_base = physical_base;
     g_frame_bytes = (framebuffer.pitch != 0)
                         ? framebuffer.pitch * framebuffer.height
                         : 0;
@@ -395,10 +498,20 @@ void register_framebuffer_device(Framebuffer& framebuffer,
 
 void framebuffer_select(uint32_t index) {
     using namespace framebuffer_descriptor;
+    SelectionGuard guard;
+    if (!guard.locked()) {
+        return;
+    }
     if (index >= kFramebufferSlots) {
         return;
     }
     if (g_frame_bytes == 0 || g_hw_base == nullptr) {
+        return;
+    }
+    if (index == g_active_slot) {
+        return;
+    }
+    if (!paging_flush_tlb_all_cpus()) {
         return;
     }
     if (index != 0) {
@@ -406,6 +519,31 @@ void framebuffer_select(uint32_t index) {
             return;
         }
     }
+
+    uint32_t previous = g_active_slot;
+    if (previous != 0) {
+        FramebufferSlot& outgoing = g_framebuffers[previous];
+        copy_from_hardware(outgoing);
+        if (!remap_slot_mappings(outgoing, false)) {
+            return;
+        }
+        (void)paging_flush_tlb_all_cpus();
+    }
+
+    if (index != 0) {
+        FramebufferSlot& incoming = g_framebuffers[index];
+        copy_to_hardware(incoming);
+        if (!remap_slot_mappings(incoming, true)) {
+            if (previous != 0) {
+                copy_to_hardware(g_framebuffers[previous]);
+                (void)remap_slot_mappings(g_framebuffers[previous], true);
+                (void)paging_flush_tlb_all_cpus();
+            }
+            return;
+        }
+        (void)paging_flush_tlb_all_cpus();
+    }
+
     g_active_slot = index;
     if (index == 0) {
         if (kconsole != nullptr) {
@@ -413,8 +551,6 @@ void framebuffer_select(uint32_t index) {
         } else {
             copy_to_hardware(g_framebuffers[0]);
         }
-    } else {
-        copy_to_hardware(g_framebuffers[index]);
     }
 }
 
