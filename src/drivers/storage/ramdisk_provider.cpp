@@ -3,10 +3,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/x86_64/memory/paging.hpp"
 #include "drivers/fs/block_device.hpp"
 #include "drivers/fs/mount_manager.hpp"
 #include "drivers/limine/limine_requests.hpp"
 #include "drivers/log/logging.hpp"
+#include "kernel/memory/physical_allocator.hpp"
+#include "kernel/sync.hpp"
 #include "lib/mem.hpp"
 
 namespace {
@@ -16,6 +19,13 @@ constexpr size_t kMaxModules = 16;
 constexpr size_t kMaxPartitionsPerModule = 4;
 constexpr size_t kMaxDevices = kMaxModules * (kMaxPartitionsPerModule + 1);
 constexpr size_t kMaxNameLen = 32;
+constexpr size_t kPageSize = 4096;
+constexpr size_t kSectorsPerOverlayPage = kPageSize / kSectorSize;
+constexpr size_t kOverlayBucketCount = 256;
+// The kernel allocator has a 64 MiB pool. Keep enough metadata to describe at
+// most that many overlay pages; allocation will normally stop earlier as the
+// rest of the kernel also uses that pool.
+constexpr size_t kMaxOverlayPages = (64 * 1024 * 1024) / kPageSize;
 
 struct PartitionInfo {
     uint8_t type;
@@ -27,10 +37,25 @@ struct PartitionInfo {
 struct RamdiskPartitionContext {
     const uint8_t* base;
     uint64_t sector_count;
+    struct OverlayPage* overlay[kOverlayBucketCount];
+    sync::SpinLock overlay_lock;
+    bool allocation_failure_logged;
+};
+
+struct OverlayPage {
+    OverlayPage* next;
+    uint8_t* data;
+    uint32_t first_lba;
 };
 
 RamdiskPartitionContext g_partition_contexts[kMaxDevices];
 char g_name_storage[kMaxDevices][kMaxNameLen];
+OverlayPage g_overlay_pages[kMaxOverlayPages];
+size_t g_overlay_page_count = 0;
+
+size_t overlay_bucket(uint32_t first_lba) {
+    return (first_lba / kSectorsPerOverlayPage) % kOverlayBucketCount;
+}
 
 uint32_t read_u32_le(const uint8_t* data) {
     return static_cast<uint32_t>(data[0]) |
@@ -185,11 +210,153 @@ fs::BlockIoStatus ramdisk_read(void* context,
         return fs::BlockIoStatus::IoError;
     }
 
-    uint64_t offset =
-        static_cast<uint64_t>(lba) * static_cast<uint64_t>(kSectorSize);
-    uint64_t byte_count =
-        requested * static_cast<uint64_t>(kSectorSize);
-    memcpy(buffer, ctx->base + offset, static_cast<size_t>(byte_count));
+    auto* out = static_cast<uint8_t*>(buffer);
+    uint32_t current_lba = lba;
+    uint64_t remaining = requested;
+    while (remaining != 0) {
+        uint32_t first_lba =
+            current_lba - (current_lba % kSectorsPerOverlayPage);
+        size_t page_offset =
+            static_cast<size_t>(current_lba - first_lba) * kSectorSize;
+        size_t page_sectors = kSectorsPerOverlayPage -
+                              static_cast<size_t>(current_lba - first_lba);
+        if (page_sectors > remaining) {
+            page_sectors = static_cast<size_t>(remaining);
+        }
+        size_t byte_count = page_sectors * kSectorSize;
+
+        bool found = false;
+        {
+            sync::IrqLockGuard guard(ctx->overlay_lock);
+            size_t bucket = overlay_bucket(first_lba);
+            for (OverlayPage* page = ctx->overlay[bucket]; page != nullptr;
+                 page = page->next) {
+                if (page->first_lba == first_lba) {
+                    memcpy(out, page->data + page_offset, byte_count);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            uint64_t offset = static_cast<uint64_t>(current_lba) * kSectorSize;
+            memcpy(out, ctx->base + offset, byte_count);
+        }
+
+        out += byte_count;
+        current_lba += static_cast<uint32_t>(page_sectors);
+        remaining -= page_sectors;
+    }
+    return fs::BlockIoStatus::Ok;
+}
+
+OverlayPage* find_overlay_page(RamdiskPartitionContext& context,
+                               uint32_t first_lba) {
+    size_t bucket = overlay_bucket(first_lba);
+    for (OverlayPage* page = context.overlay[bucket]; page != nullptr;
+         page = page->next) {
+        if (page->first_lba == first_lba) {
+            return page;
+        }
+    }
+    return nullptr;
+}
+
+OverlayPage* create_overlay_page(RamdiskPartitionContext& context,
+                                 uint32_t first_lba) {
+    uint64_t physical_address = memory::alloc_kernel_page();
+    if (physical_address == 0) {
+        return nullptr;
+    }
+
+    auto* data = static_cast<uint8_t*>(paging_phys_to_virt(physical_address));
+    uint64_t available = context.sector_count - first_lba;
+    size_t sectors_to_copy = available < kSectorsPerOverlayPage
+                                 ? static_cast<size_t>(available)
+                                 : kSectorsPerOverlayPage;
+    memcpy(data,
+           context.base + static_cast<uint64_t>(first_lba) * kSectorSize,
+           sectors_to_copy * kSectorSize);
+
+    sync::IrqLockGuard guard(context.overlay_lock);
+    OverlayPage* existing = find_overlay_page(context, first_lba);
+    if (existing != nullptr) {
+        memory::free_kernel_page(physical_address);
+        return existing;
+    }
+
+    size_t node_index =
+        __atomic_fetch_add(&g_overlay_page_count, size_t{1}, __ATOMIC_RELAXED);
+    if (node_index >= kMaxOverlayPages) {
+        memory::free_kernel_page(physical_address);
+        return nullptr;
+    }
+
+    OverlayPage& page = g_overlay_pages[node_index];
+    size_t bucket = overlay_bucket(first_lba);
+    page.next = context.overlay[bucket];
+    page.data = data;
+    page.first_lba = first_lba;
+    context.overlay[bucket] = &page;
+    return &page;
+}
+
+fs::BlockIoStatus ramdisk_write(void* context,
+                                uint32_t lba,
+                                uint8_t sector_count,
+                                const void* buffer) {
+    if (context == nullptr || buffer == nullptr || sector_count == 0) {
+        return fs::BlockIoStatus::NoDevice;
+    }
+
+    auto* ctx = static_cast<RamdiskPartitionContext*>(context);
+    uint64_t requested = static_cast<uint64_t>(sector_count);
+    if (static_cast<uint64_t>(lba) >= ctx->sector_count ||
+        requested > ctx->sector_count - static_cast<uint64_t>(lba)) {
+        return fs::BlockIoStatus::IoError;
+    }
+
+    const auto* in = static_cast<const uint8_t*>(buffer);
+    uint32_t current_lba = lba;
+    uint64_t remaining = requested;
+    while (remaining != 0) {
+        uint32_t first_lba =
+            current_lba - (current_lba % kSectorsPerOverlayPage);
+        size_t page_sector_offset = current_lba - first_lba;
+        size_t page_sectors = kSectorsPerOverlayPage - page_sector_offset;
+        if (page_sectors > remaining) {
+            page_sectors = static_cast<size_t>(remaining);
+        }
+
+        OverlayPage* page = nullptr;
+        {
+            sync::IrqLockGuard guard(ctx->overlay_lock);
+            page = find_overlay_page(*ctx, first_lba);
+        }
+        if (page == nullptr) {
+            page = create_overlay_page(*ctx, first_lba);
+            if (page == nullptr) {
+                if (!__atomic_exchange_n(&ctx->allocation_failure_logged,
+                                         true,
+                                         __ATOMIC_RELAXED)) {
+                    log_message(LogLevel::Error,
+                                "Ramdisk: RAM write overlay allocation failed at LBA %u",
+                                static_cast<unsigned int>(current_lba));
+                }
+                return fs::BlockIoStatus::IoError;
+            }
+        }
+
+        size_t byte_offset = page_sector_offset * kSectorSize;
+        size_t byte_count = page_sectors * kSectorSize;
+        {
+            sync::IrqLockGuard guard(ctx->overlay_lock);
+            memcpy(page->data + byte_offset, in, byte_count);
+        }
+        in += byte_count;
+        current_lba += static_cast<uint32_t>(page_sectors);
+        remaining -= page_sectors;
+    }
     return fs::BlockIoStatus::Ok;
 }
 
@@ -329,11 +496,11 @@ size_t enumerate_ramdisks(fs::BlockDevice* out_devices, size_t max_devices) {
             device.sector_size = kSectorSize;
             device.sector_count = sectors;
             device.read = ramdisk_read;
-            device.write = nullptr;
+            device.write = ramdisk_write;
             device.context = &context;
 
             log_message(LogLevel::Info,
-                        "Ramdisk: registered %s (%s, start=%llu sectors=%llu bpb=%02x%02x sig=%02x%02x)",
+                        "Ramdisk: registered %s (%s, start=%llu sectors=%llu, RAM write overlay, bpb=%02x%02x sig=%02x%02x)",
                         device.name,
                         module_label(module),
                         static_cast<unsigned long long>(start_sector),

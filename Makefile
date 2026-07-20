@@ -294,9 +294,9 @@ $(LIVE_ROOTFS_IMG): userspace/Makefile shared/include/TOSH-SAT.F14 $(KERNEL_MODU
 	truncate -s $(LIVE_ROOTFS_SIZE) $@
 	mkfs.fat -F 32 --mbr=y $@
 	$(MAKE) -C userspace install-mtools HDD_IMAGE=$(abspath $@) PROGRAMS="$(LIVE_ROOTFS_PROGRAMS)" CONFIG_DIR="$(LIVE_ROOTFS_CONFIG_DIR)"
-	# The live medium is read-only at runtime.  Seed it with an explicit valid,
-	# empty v3 credential store so init can distinguish intentional bootstrap
-	# mode from a missing, truncated, or corrupt database.
+	# The live medium uses an ephemeral RAM write overlay at runtime. Seed it
+	# with an explicit valid, empty v3 credential store so init can distinguish
+	# intentional bootstrap mode from a missing, truncated, or corrupt database.
 	mmd -i $@ ::/system
 	printf '\125\104\124\116\003\000\200\000\000\000\000\000\001\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000\000\000\000' > $(OUT_DIR)/live-users.ntd
 	mcopy -i $@ $(OUT_DIR)/live-users.ntd ::/system/users.ntd
