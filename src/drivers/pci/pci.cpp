@@ -574,7 +574,7 @@ bool enable_msi(const PciDevice& device, uint8_t vector, uint8_t apic_id) {
 
     write_config16(device, data_offset, vector);
     if (mask_capable) {
-        write_config32(device, static_cast<uint8_t>(data_offset + 2), 0);
+        write_config32(device, static_cast<uint8_t>(data_offset + 4), 0);
     }
 
     control &= static_cast<uint16_t>(~(0x7u << 4));

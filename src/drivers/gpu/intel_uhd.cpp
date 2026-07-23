@@ -282,7 +282,9 @@ uint8_t* map_physical_range(uint64_t phys_base,
     for (size_t i = 0; i < page_count; ++i) {
         uint64_t phys = page_phys + static_cast<uint64_t>(i) * kPageSize;
         uint64_t virt = virt_base + static_cast<uint64_t>(i) * kPageSize;
-        if (!paging_map_page(virt, phys, page_flags)) {
+        if (!paging_map_page(virt,
+                             phys,
+                             page_flags | PAGE_FLAG_NO_EXECUTE)) {
             log_message(LogLevel::Warn,
                         "intel-uhd: failed to map %s page phys=%016llx",
                         (label != nullptr) ? label : "range",
@@ -655,18 +657,36 @@ bool bind_current_scanout() {
             append_pipe_summary(pipe, plane, pipe_state, "size");
             continue;
         }
-        if (stride_bytes < plane.width * 4u) {
+        if (plane.width > UINT32_MAX / 4u ||
+            stride_bytes < plane.width * 4u) {
             append_pipe_summary(pipe, plane, pipe_state, "stride");
             continue;
         }
 
         uint32_t surf_reg = (plane.surf_live != 0) ? plane.surf_live : plane.surf;
         uint64_t ggtt_offset = static_cast<uint64_t>(surf_reg & 0xFFFFF000u);
-        ggtt_offset += static_cast<uint64_t>(plane.offset_y) * stride_bytes;
-        ggtt_offset += static_cast<uint64_t>(plane.offset_x) * 4u;
+        uint64_t y_offset =
+            static_cast<uint64_t>(plane.offset_y) * stride_bytes;
+        uint64_t x_offset = static_cast<uint64_t>(plane.offset_x) * 4u;
+        if (y_offset > UINT64_MAX - ggtt_offset ||
+            x_offset > UINT64_MAX - (ggtt_offset + y_offset)) {
+            append_pipe_summary(pipe, plane, pipe_state, "offset");
+            continue;
+        }
+        ggtt_offset += y_offset + x_offset;
 
-        size_t frame_bytes =
-            static_cast<size_t>(stride_bytes) * plane.height;
+        if (plane.height > static_cast<size_t>(-1) / stride_bytes) {
+            append_pipe_summary(pipe, plane, pipe_state, "bytes");
+            continue;
+        }
+        size_t frame_bytes = static_cast<size_t>(stride_bytes) * plane.height;
+        if (g_state.aperture_phys == 0 || g_state.aperture_size == 0 ||
+            ggtt_offset > g_state.aperture_size ||
+            frame_bytes > g_state.aperture_size - ggtt_offset ||
+            ggtt_offset > UINT64_MAX - g_state.aperture_phys) {
+            append_pipe_summary(pipe, plane, pipe_state, "aperture");
+            continue;
+        }
         uint64_t phys = g_state.aperture_phys + ggtt_offset;
         uint8_t* base = map_physical_range(phys, frame_bytes, PAGE_FLAG_WRITE, "scanout");
         if (base == nullptr) {

@@ -12,7 +12,6 @@
 #include "kernel/module.hpp"
 #include "kernel/process.hpp"
 #include "kernel/scheduler.hpp"
-#include "kernel/time.hpp"
 #include "lib/mem.hpp"
 
 namespace xhci {
@@ -21,6 +20,7 @@ namespace {
 constexpr uint64_t kPageSize = 0x1000;
 constexpr uint64_t kMmioVirtBase = 0xffff900200000000ull;
 constexpr uint64_t kMmioWindowSize = 16ull * 1024 * 1024;
+constexpr uint64_t kControllerMmioSize = 0x10000;
 constexpr size_t kMaxControllers = 4;
 constexpr uint32_t kSpinTimeout = 5000000;
 constexpr uint32_t kHaltSpinTimeout = 10000;
@@ -52,6 +52,7 @@ constexpr uint32_t kTrbTypeEnableSlotCommand = 9;
 constexpr uint32_t kTrbTypeDisableSlotCommand = 10;
 constexpr uint32_t kTrbTypeAddressDeviceCommand = 11;
 constexpr uint32_t kTrbTypeConfigureEndpointCommand = 12;
+constexpr uint32_t kTrbTypeEvaluateContextCommand = 13;
 constexpr uint32_t kTrbTypeResetEndpointCommand = 14;
 constexpr uint32_t kTrbTypeSetTrDequeuePointerCommand = 16;
 constexpr uint32_t kTrbTypeTransferEvent = 32;
@@ -117,8 +118,9 @@ struct Controller {
     size_t command_enqueue;
     uint8_t event_cycle;
     size_t event_dequeue;
+    volatile int io_lock;
+    volatile uint8_t command_quarantined;
     bool port_enumeration_attempted[256];
-    uint64_t port_retry_after[256];
     bool active;
 };
 
@@ -141,14 +143,21 @@ struct Ring {
 };
 
 struct DeviceSlot {
-    bool used;
+    volatile uint8_t allocated;
+    volatile uint8_t used;
+    volatile uint8_t quarantined;
     Controller* controller;
     uint8_t slot_id;
     uint8_t address;
     uint8_t port;
+    uint8_t route_depth;
+    uint8_t tt_hub_slot_id;
+    uint8_t tt_port;
+    uint32_t route_string;
     usb::Speed speed;
     uint64_t input_context_phys;
     uint64_t output_context_phys;
+    uint64_t quarantined_dma_phys;
     Ring endpoint_rings[kMaxEndpointContexts];
     usb::Device device;
 };
@@ -163,9 +172,50 @@ process::Process* g_enumeration_worker = nullptr;
 Controller* g_pending_controller = nullptr;
 uint8_t g_pending_port = 0;
 volatile uint8_t g_enumeration_pending = 0;
+volatile int g_enumeration_request_lock = 0;
+
+usb::TransferStatus enumerate_hub_port(void* context,
+                                       uint8_t downstream_port,
+                                       usb::Speed speed);
 
 void cpu_relax() {
     asm volatile("pause");
+}
+
+void lock_controller_io(Controller& controller) {
+    while (__atomic_test_and_set(&controller.io_lock, __ATOMIC_ACQUIRE)) {
+        cpu_relax();
+    }
+}
+
+void unlock_controller_io(Controller& controller) {
+    __atomic_clear(&controller.io_lock, __ATOMIC_RELEASE);
+}
+
+class ControllerIoGuard {
+public:
+    explicit ControllerIoGuard(Controller& controller)
+        : controller_(controller) {
+        lock_controller_io(controller_);
+    }
+    ~ControllerIoGuard() { unlock_controller_io(controller_); }
+
+    ControllerIoGuard(const ControllerIoGuard&) = delete;
+    ControllerIoGuard& operator=(const ControllerIoGuard&) = delete;
+
+private:
+    Controller& controller_;
+};
+
+void lock_enumeration_request() {
+    while (__atomic_test_and_set(&g_enumeration_request_lock,
+                                 __ATOMIC_ACQUIRE)) {
+        cpu_relax();
+    }
+}
+
+void unlock_enumeration_request() {
+    __atomic_clear(&g_enumeration_request_lock, __ATOMIC_RELEASE);
 }
 
 uint64_t align_down_u64(uint64_t value, uint64_t alignment) {
@@ -227,6 +277,10 @@ volatile uint8_t* map_mmio_range(uint64_t phys_base, uint64_t length) {
     if (phys_base == 0 || length == 0) {
         return nullptr;
     }
+    if (length > UINT64_MAX - phys_base ||
+        phys_base + length > UINT64_MAX - (kPageSize - 1)) {
+        return nullptr;
+    }
 
     uint64_t page_phys = align_down_u64(phys_base, kPageSize);
     uint64_t page_end = align_up_u64(phys_base + length, kPageSize);
@@ -246,8 +300,8 @@ volatile uint8_t* map_mmio_range(uint64_t phys_base, uint64_t length) {
         return nullptr;
     }
 
-    const uint64_t flags =
-        PAGE_FLAG_WRITE | PAGE_FLAG_WRITE_THROUGH | PAGE_FLAG_CACHE_DISABLE;
+    const uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_WRITE_THROUGH |
+                           PAGE_FLAG_CACHE_DISABLE | PAGE_FLAG_NO_EXECUTE;
     for (size_t i = 0; i < page_count; ++i) {
         uint64_t phys = page_phys + static_cast<uint64_t>(i) * kPageSize;
         uint64_t virt = virt_base + static_cast<uint64_t>(i) * kPageSize;
@@ -310,9 +364,15 @@ CapabilityInfo read_capabilities(volatile uint8_t* mmio) {
 }
 
 void claim_bios_ownership(volatile uint8_t* capability,
-                          uint16_t extended_capabilities_offset) {
+                          uint16_t extended_capabilities_offset,
+                          uint32_t mapped_bytes) {
     uint32_t offset = static_cast<uint32_t>(extended_capabilities_offset) * 4u;
     for (size_t guard = 0; offset != 0 && guard < 64; ++guard) {
+        if (offset > mapped_bytes - sizeof(uint32_t)) {
+            log_message(LogLevel::Warn,
+                        "xhci: extended capability offset out of range");
+            return;
+        }
         uint32_t value = read32(capability, offset);
         uint8_t capability_id = static_cast<uint8_t>(value & 0xFFu);
         uint8_t next_offset = static_cast<uint8_t>((value >> 8) & 0xFFu);
@@ -333,7 +393,11 @@ void claim_bios_ownership(volatile uint8_t* capability,
         if (next_offset == 0) {
             return;
         }
-        offset += static_cast<uint32_t>(next_offset) * 4u;
+        uint32_t step = static_cast<uint32_t>(next_offset) * 4u;
+        if (step > UINT32_MAX - offset) {
+            return;
+        }
+        offset += step;
     }
 }
 
@@ -526,6 +590,35 @@ bool setup_scratchpads(Controller& controller) {
     return true;
 }
 
+void free_unpublished_controller_dma(Controller& controller) {
+    for (size_t i = 0; i < kMaxScratchpadBuffers; ++i) {
+        if (controller.scratchpad_phys[i] != 0) {
+            memory::free_kernel_block(controller.scratchpad_phys[i]);
+            controller.scratchpad_phys[i] = 0;
+        }
+    }
+    if (controller.scratchpad_array_phys != 0) {
+        memory::free_kernel_block(controller.scratchpad_array_phys);
+        controller.scratchpad_array_phys = 0;
+    }
+    if (controller.erst_phys != 0) {
+        memory::free_kernel_block(controller.erst_phys);
+        controller.erst_phys = 0;
+    }
+    if (controller.event_ring_phys != 0) {
+        memory::free_kernel_block(controller.event_ring_phys);
+        controller.event_ring_phys = 0;
+    }
+    if (controller.command_ring_phys != 0) {
+        memory::free_kernel_block(controller.command_ring_phys);
+        controller.command_ring_phys = 0;
+    }
+    if (controller.dcbaa_phys != 0) {
+        memory::free_kernel_block(controller.dcbaa_phys);
+        controller.dcbaa_phys = 0;
+    }
+}
+
 bool setup_rings(Controller& controller) {
     controller.dcbaa_phys = alloc_zeroed_pages(1);
     controller.command_ring_phys = alloc_zeroed_pages(kRingPageCount);
@@ -535,10 +628,12 @@ bool setup_rings(Controller& controller) {
         controller.command_ring_phys == 0 ||
         controller.event_ring_phys == 0 ||
         controller.erst_phys == 0) {
+        free_unpublished_controller_dma(controller);
         return false;
     }
 
     if (!setup_scratchpads(controller)) {
+        free_unpublished_controller_dma(controller);
         return false;
     }
 
@@ -758,20 +853,49 @@ bool wait_transfer_completion(DeviceSlot& slot,
     return false;
 }
 
-bool issue_command(Controller& controller,
-                   uint64_t parameter,
-                   uint32_t status,
-                   uint32_t control,
-                   Trb& event) {
+bool issue_command_locked(Controller& controller,
+                          uint64_t parameter,
+                          uint32_t status,
+                          uint32_t control,
+                          Trb& event) {
+    if (__atomic_load_n(&controller.command_quarantined,
+                        __ATOMIC_ACQUIRE) != 0) {
+        return false;
+    }
     uint64_t trb_phys = enqueue_command_trb(controller, parameter, status, control);
     ring_command_doorbell(controller);
     if (!wait_command_completion(controller, trb_phys, event)) {
+        // The controller can still own this command TRB and may report its
+        // completion later.  Never wrap/reuse the command ring or submit a
+        // command whose completion could be confused with that late event.
+        __atomic_store_n(&controller.command_quarantined,
+                         1,
+                         __ATOMIC_RELEASE);
+        log_message(LogLevel::Warn,
+                    "xhci: quarantining controller command ring after timeout");
         return false;
     }
     return completion_code(event) == kCompletionSuccess;
 }
 
+bool issue_command(Controller& controller,
+                   uint64_t parameter,
+                   uint32_t status,
+                   uint32_t control,
+                   Trb& event) {
+    ControllerIoGuard guard(controller);
+    return issue_command_locked(controller, parameter, status, control, event);
+}
+
+bool controller_commands_quarantined(const Controller& controller) {
+    return __atomic_load_n(&controller.command_quarantined,
+                           __ATOMIC_ACQUIRE) != 0;
+}
+
 bool allocate_ring(Ring& ring) {
+    if (ring.phys != 0) {
+        return false;
+    }
     ring.phys = alloc_zeroed_pages(kRingPageCount);
     if (ring.phys == 0) {
         return false;
@@ -785,6 +909,48 @@ bool allocate_ring(Ring& ring) {
     trbs[kTrbsPerPage - 1].control =
         (kTrbTypeLink << 10) | kTrbToggleCycle | kTrbCycle;
     return true;
+}
+
+void free_ring(Ring& ring) {
+    if (ring.phys != 0) {
+        memory::free_kernel_block(ring.phys);
+    }
+    ring = {};
+}
+
+void free_device_slot_memory(DeviceSlot& slot) {
+    if (slot.quarantined_dma_phys != 0) {
+        memory::free_kernel_block(slot.quarantined_dma_phys);
+        slot.quarantined_dma_phys = 0;
+    }
+    for (size_t i = 0; i < kMaxEndpointContexts; ++i) {
+        free_ring(slot.endpoint_rings[i]);
+    }
+    if (slot.input_context_phys != 0) {
+        memory::free_kernel_block(slot.input_context_phys);
+        slot.input_context_phys = 0;
+    }
+    if (slot.output_context_phys != 0) {
+        memory::free_kernel_block(slot.output_context_phys);
+        slot.output_context_phys = 0;
+    }
+}
+
+bool slot_quarantined(const DeviceSlot& slot) {
+    return __atomic_load_n(&slot.quarantined, __ATOMIC_ACQUIRE) != 0;
+}
+
+bool slot_active(const DeviceSlot& slot) {
+    return __atomic_load_n(&slot.used, __ATOMIC_ACQUIRE) != 0;
+}
+
+void quarantine_timed_out_transfer(DeviceSlot& slot,
+                                   uint64_t controller_owned_dma_phys) {
+    // Controller I/O serialization guarantees that this is the first and
+    // only transfer allowed to time out for the slot.  Preserve every object
+    // the controller may still reference and reject all future submissions.
+    slot.quarantined_dma_phys = controller_owned_dma_phys;
+    __atomic_store_n(&slot.quarantined, 1, __ATOMIC_RELEASE);
 }
 
 usb::Speed port_speed(uint32_t speed_id) {
@@ -812,6 +978,21 @@ uint16_t default_control_packet_size(usb::Speed speed) {
         case usb::Speed::High:
         default:
             return 64;
+    }
+}
+
+uint32_t xhci_speed_id(usb::Speed speed) {
+    switch (speed) {
+        case usb::Speed::Full:
+            return 1;
+        case usb::Speed::Low:
+            return 2;
+        case usb::Speed::High:
+            return 3;
+        case usb::Speed::Super:
+            return 4;
+        default:
+            return 0;
     }
 }
 
@@ -859,16 +1040,19 @@ bool reset_port(Controller& controller, uint8_t port) {
 
 DeviceSlot* allocate_device_slot(Controller& controller) {
     for (size_t i = 0; i < kMaxDeviceSlots; ++i) {
-        if (g_device_slots[i].used) {
+        if (__atomic_load_n(&g_device_slots[i].allocated,
+                            __ATOMIC_ACQUIRE) != 0) {
             continue;
         }
         DeviceSlot& slot = g_device_slots[i];
         slot = {};
+        __atomic_store_n(&slot.allocated, 1, __ATOMIC_RELEASE);
         slot.controller = &controller;
         slot.input_context_phys = alloc_zeroed_pages(1);
         slot.output_context_phys = alloc_zeroed_pages(1);
         if (slot.input_context_phys == 0 || slot.output_context_phys == 0 ||
             !allocate_ring(slot.endpoint_rings[1])) {
+            free_device_slot_memory(slot);
             slot = {};
             return nullptr;
         }
@@ -887,24 +1071,51 @@ bool enable_slot(Controller& controller, uint8_t& slot_id) {
         return false;
     }
     slot_id = static_cast<uint8_t>((event.control >> 24) & 0xFFu);
-    return slot_id != 0;
+    return slot_id != 0 && slot_id <= controller.caps.max_slots;
 }
 
 void release_device_slot(DeviceSlot& slot) {
+    __atomic_store_n(&slot.used, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot.quarantined, 1, __ATOMIC_RELEASE);
+
     if (slot.controller != nullptr && slot.slot_id != 0) {
+        Controller& controller = *slot.controller;
+        ControllerIoGuard io_guard(controller);
         Trb event{};
-        (void)issue_command(*slot.controller,
-                            0,
-                            0,
-                            (kTrbTypeDisableSlotCommand << 10) |
-                                (static_cast<uint32_t>(slot.slot_id) << 24),
-                            event);
+        bool controller_released = issue_command_locked(
+            controller,
+            0,
+            0,
+            (kTrbTypeDisableSlotCommand << 10) |
+                (static_cast<uint32_t>(slot.slot_id) << 24),
+            event);
+        if (!controller_released) {
+            // A timed-out or rejected Disable Slot command does not prove that
+            // the controller stopped fetching the device contexts and rings.
+            // Keep the local slot reserved and retain all controller-visible
+            // DMA.  allocated remains set, so this entry cannot be reused.
+            log_message(LogLevel::Warn,
+                        "xhci: quarantining slot %u after disable failure",
+                        static_cast<unsigned int>(slot.slot_id));
+            return;
+        }
+
+        auto* dcbaa = static_cast<uint64_t*>(
+            paging_phys_to_virt(controller.dcbaa_phys));
+        dcbaa[slot.slot_id] = 0;
+        free_device_slot_memory(slot);
+        slot = {};
+        return;
     }
+
+    // No xHCI slot was enabled, so none of these allocations was ever made
+    // visible to the controller.
+    free_device_slot_memory(slot);
     slot = {};
 }
 
 void prepare_address_context(DeviceSlot& slot,
-                             uint8_t port,
+                             uint8_t root_port,
                              usb::Speed speed,
                              uint16_t ep0_packet_size) {
     Controller& controller = *slot.controller;
@@ -915,12 +1126,12 @@ void prepare_address_context(DeviceSlot& slot,
     input_control[1] = (1u << 0) | (1u << 1);
 
     uint32_t* slot_ctx = input_context(controller, slot.input_context_phys, 0);
-    slot_ctx[0] = (static_cast<uint32_t>((read32(controller.operational,
-                                                port_offset(port)) >> 10) &
-                                         0xFu)
-                   << 20) |
+    slot_ctx[0] = slot.route_string |
+                  (xhci_speed_id(speed) << 20) |
                   (1u << 27);
-    slot_ctx[1] = static_cast<uint32_t>(port) << 16;
+    slot_ctx[1] = static_cast<uint32_t>(root_port) << 16;
+    slot_ctx[2] = static_cast<uint32_t>(slot.tt_hub_slot_id) |
+                  (static_cast<uint32_t>(slot.tt_port) << 8);
 
     uint32_t* ep0_ctx = input_context(controller, slot.input_context_phys, 1);
     ep0_ctx[1] = (3u << 1) | (4u << 3) |
@@ -929,7 +1140,7 @@ void prepare_address_context(DeviceSlot& slot,
         slot.endpoint_rings[1].phys | slot.endpoint_rings[1].cycle);
     ep0_ctx[3] = static_cast<uint32_t>(slot.endpoint_rings[1].phys >> 32);
     ep0_ctx[4] = 8;
-    slot.port = port;
+    slot.port = root_port;
     slot.speed = speed;
 }
 
@@ -948,8 +1159,35 @@ usb::TransferStatus control_transfer(void* context,
                                      const usb::ControlRequest& request,
                                      void* data) {
     auto* slot = static_cast<DeviceSlot*>(context);
-    if (slot == nullptr || !slot->used || slot->controller == nullptr) {
+    if (slot == nullptr || slot_quarantined(*slot) || !slot_active(*slot)) {
         return usb::TransferStatus::NoDevice;
+    }
+    Controller* controller = slot->controller;
+    if (controller == nullptr) {
+        return usb::TransferStatus::NoDevice;
+    }
+    if (request.length != 0 && data == nullptr) {
+        return usb::TransferStatus::IoError;
+    }
+
+    uint64_t data_phys = 0;
+    void* dma_buffer = nullptr;
+    if (request.length != 0) {
+        size_t page_count =
+            (static_cast<size_t>(request.length) + kPageSize - 1) / kPageSize;
+        data_phys = memory::alloc_kernel_block_pages(page_count);
+        if (data_phys == 0) {
+            return usb::TransferStatus::IoError;
+        }
+        dma_buffer = paging_phys_to_virt(data_phys);
+        if (dma_buffer == nullptr) {
+            memory::free_kernel_block(data_phys);
+            return usb::TransferStatus::IoError;
+        }
+        memset(dma_buffer, 0, page_count * kPageSize);
+        if ((request.request_type & 0x80u) == 0) {
+            memcpy(dma_buffer, data, request.length);
+        }
     }
 
     uint64_t setup = static_cast<uint64_t>(request.request_type) |
@@ -962,6 +1200,14 @@ usb::TransferStatus control_transfer(void* context,
         trt = (request.request_type & 0x80u) ? 2u : 3u;
     }
 
+    ControllerIoGuard io_guard(*controller);
+    if (slot_quarantined(*slot) || !slot_active(*slot) ||
+        slot->controller != controller) {
+        if (data_phys != 0) {
+            memory::free_kernel_block(data_phys);
+        }
+        return usb::TransferStatus::NoDevice;
+    }
     Ring& ring = slot->endpoint_rings[1];
     (void)enqueue_ring_trb(ring,
                            setup,
@@ -970,13 +1216,9 @@ usb::TransferStatus control_transfer(void* context,
                                (trt << 16));
 
     if (request.length != 0) {
-        uint64_t phys = paging_virt_to_phys(reinterpret_cast<uint64_t>(data));
-        if (phys == 0) {
-            return usb::TransferStatus::IoError;
-        }
         (void)enqueue_ring_trb(
             ring,
-            phys,
+            data_phys,
             request.length,
             (kTrbTypeDataStage << 10) |
                 ((request.request_type & 0x80u) ? kTrbDataStageDirectionIn : 0));
@@ -992,8 +1234,30 @@ usb::TransferStatus control_transfer(void* context,
 
     size_t transferred = 0;
     usb::TransferStatus status = usb::TransferStatus::Ok;
-    (void)wait_transfer_completion(
+    bool completed = wait_transfer_completion(
         *slot, 1, status_trb, request.length, transferred, status);
+    if (dma_buffer != nullptr) {
+        if (completed && status == usb::TransferStatus::Ok &&
+            (request.request_type & 0x80u) != 0) {
+            size_t copy_bytes = transferred < request.length
+                                    ? transferred
+                                    : request.length;
+            memcpy(data, dma_buffer, copy_bytes);
+        }
+        if (completed) {
+            memory::free_kernel_block(data_phys);
+        } else {
+            quarantine_timed_out_transfer(*slot, data_phys);
+            log_message(LogLevel::Warn,
+                        "xhci: quarantining slot %u after control timeout",
+                        static_cast<unsigned int>(slot->slot_id));
+        }
+    } else if (!completed) {
+        quarantine_timed_out_transfer(*slot, 0);
+        log_message(LogLevel::Warn,
+                    "xhci: quarantining slot %u after control timeout",
+                    static_cast<unsigned int>(slot->slot_id));
+    }
     return status;
 }
 
@@ -1004,7 +1268,11 @@ usb::TransferStatus bulk_transfer(void* context,
                                   size_t& transferred) {
     auto* slot = static_cast<DeviceSlot*>(context);
     transferred = 0;
-    if (slot == nullptr || !slot->used || slot->controller == nullptr) {
+    if (slot == nullptr || slot_quarantined(*slot) || !slot_active(*slot)) {
+        return usb::TransferStatus::NoDevice;
+    }
+    Controller* controller = slot->controller;
+    if (controller == nullptr) {
         return usb::TransferStatus::NoDevice;
     }
     uint8_t endpoint_id = endpoint_id_from_address(endpoint);
@@ -1016,51 +1284,108 @@ usb::TransferStatus bulk_transfer(void* context,
         return usb::TransferStatus::IoError;
     }
 
-    Ring& ring = slot->endpoint_rings[endpoint_id];
-    uint8_t* cursor = static_cast<uint8_t*>(data);
-    size_t remaining = length;
-    uint64_t last_trb_phys = 0;
-
-    if (length == 0) {
-        last_trb_phys = enqueue_ring_trb(
-            ring, 0, 0, (kTrbTypeNormal << 10) | kTrbInterruptOnCompletion);
-    }
-
-    while (remaining > 0) {
-        uint64_t virt = reinterpret_cast<uint64_t>(cursor);
-        uint64_t phys = paging_virt_to_phys(virt);
-        if (phys == 0) {
+    uint64_t data_phys = 0;
+    uint8_t* dma_buffer = nullptr;
+    if (length != 0) {
+        size_t page_count = length / kPageSize;
+        if ((length % kPageSize) != 0) {
+            ++page_count;
+        }
+        data_phys = memory::alloc_kernel_block_pages(page_count);
+        if (data_phys == 0) {
             return usb::TransferStatus::IoError;
         }
-        size_t page_remaining = kPageSize - (virt & (kPageSize - 1));
-        size_t chunk = remaining < page_remaining ? remaining : page_remaining;
-        if (chunk > 0x10000u) {
-            chunk = 0x10000u;
+        dma_buffer = static_cast<uint8_t*>(paging_phys_to_virt(data_phys));
+        if (dma_buffer == nullptr) {
+            memory::free_kernel_block(data_phys);
+            return usb::TransferStatus::IoError;
         }
-
-        remaining -= chunk;
-        uint32_t control = kTrbTypeNormal << 10;
-        if (remaining != 0) {
-            control |= kTrbChain;
-        } else {
-            control |= kTrbInterruptOnCompletion;
+        memset(dma_buffer, 0, length);
+        if ((endpoint & 0x80u) == 0) {
+            memcpy(dma_buffer, data, length);
         }
-        last_trb_phys = enqueue_ring_trb(
-            ring, phys, static_cast<uint32_t>(chunk), control);
-        cursor += chunk;
     }
 
-    ring_endpoint_doorbell(*slot, endpoint_id);
-
     usb::TransferStatus status = usb::TransferStatus::Ok;
-    (void)wait_transfer_completion(
-        *slot, endpoint_id, last_trb_phys, length, transferred, status);
+    bool completed = false;
+    {
+        ControllerIoGuard io_guard(*controller);
+        if (slot_quarantined(*slot) || !slot_active(*slot) ||
+            slot->controller != controller ||
+            slot->endpoint_rings[endpoint_id].phys == 0) {
+            if (data_phys != 0) {
+                memory::free_kernel_block(data_phys);
+            }
+            return usb::TransferStatus::NoDevice;
+        }
+        Ring& ring = slot->endpoint_rings[endpoint_id];
+        size_t remaining = length;
+        size_t dma_offset = 0;
+        uint64_t last_trb_phys = 0;
+
+        if (length == 0) {
+            last_trb_phys = enqueue_ring_trb(
+                ring,
+                0,
+                0,
+                (kTrbTypeNormal << 10) | kTrbInterruptOnCompletion);
+        }
+
+        while (remaining > 0) {
+            uint64_t phys = data_phys + dma_offset;
+            size_t page_remaining =
+                static_cast<size_t>(kPageSize - (phys & (kPageSize - 1)));
+            size_t chunk = remaining < page_remaining ? remaining
+                                                      : page_remaining;
+
+            remaining -= chunk;
+            uint32_t control = kTrbTypeNormal << 10;
+            if (remaining != 0) {
+                control |= kTrbChain;
+            } else {
+                control |= kTrbInterruptOnCompletion;
+            }
+            last_trb_phys = enqueue_ring_trb(
+                ring, phys, static_cast<uint32_t>(chunk), control);
+            dma_offset += chunk;
+        }
+
+        ring_endpoint_doorbell(*slot, endpoint_id);
+        completed = wait_transfer_completion(
+            *slot, endpoint_id, last_trb_phys, length, transferred, status);
+        if (!completed) {
+            quarantine_timed_out_transfer(*slot, data_phys);
+        }
+    }
+
+    if (dma_buffer != nullptr) {
+        if (completed && status == usb::TransferStatus::Ok &&
+            (endpoint & 0x80u) != 0) {
+            size_t copy_bytes = transferred < length ? transferred : length;
+            memcpy(data, dma_buffer, copy_bytes);
+        }
+        if (completed) {
+            memory::free_kernel_block(data_phys);
+        } else {
+            log_message(LogLevel::Warn,
+                        "xhci: quarantining slot %u after bulk timeout",
+                        static_cast<unsigned int>(slot->slot_id));
+        }
+    } else if (!completed) {
+        log_message(LogLevel::Warn,
+                    "xhci: quarantining slot %u after bulk timeout",
+                    static_cast<unsigned int>(slot->slot_id));
+    }
     return status;
 }
 
 usb::TransferStatus reset_endpoint(void* context, uint8_t endpoint) {
     auto* slot = static_cast<DeviceSlot*>(context);
-    if (slot == nullptr || !slot->used || slot->controller == nullptr) {
+    if (slot == nullptr || slot_quarantined(*slot) || !slot_active(*slot)) {
+        return usb::TransferStatus::NoDevice;
+    }
+    Controller* controller_ptr = slot->controller;
+    if (controller_ptr == nullptr) {
         return usb::TransferStatus::NoDevice;
     }
 
@@ -1073,7 +1398,12 @@ usb::TransferStatus reset_endpoint(void* context, uint8_t endpoint) {
         return usb::TransferStatus::Unsupported;
     }
 
-    Controller& controller = *slot->controller;
+    Controller& controller = *controller_ptr;
+    ControllerIoGuard io_guard(controller);
+    if (slot_quarantined(*slot) || !slot_active(*slot) ||
+        slot->controller != controller_ptr || ring.phys == 0) {
+        return usb::TransferStatus::NoDevice;
+    }
     uint32_t* ep_context =
         device_context(controller, slot->output_context_phys, endpoint_id);
     constexpr uint32_t kEndpointStateMask = 0x7u;
@@ -1089,7 +1419,10 @@ usb::TransferStatus reset_endpoint(void* context, uint8_t endpoint) {
         (kTrbTypeResetEndpointCommand << 10) |
         (static_cast<uint32_t>(endpoint_id) << 16) |
         (static_cast<uint32_t>(slot->slot_id) << 24);
-    if (!issue_command(controller, 0, 0, reset_control, event)) {
+    if (!issue_command_locked(controller, 0, 0, reset_control, event)) {
+        if (controller_commands_quarantined(controller)) {
+            quarantine_timed_out_transfer(*slot, 0);
+        }
         return usb::TransferStatus::IoError;
     }
 
@@ -1110,8 +1443,76 @@ usb::TransferStatus reset_endpoint(void* context, uint8_t endpoint) {
         (kTrbTypeSetTrDequeuePointerCommand << 10) |
         (static_cast<uint32_t>(endpoint_id) << 16) |
         (static_cast<uint32_t>(slot->slot_id) << 24);
-    if (!issue_command(controller, ring.phys | ring.cycle, 0,
-                       dequeue_control, event)) {
+    if (!issue_command_locked(controller, ring.phys | ring.cycle, 0,
+                              dequeue_control, event)) {
+        if (controller_commands_quarantined(controller)) {
+            quarantine_timed_out_transfer(*slot, 0);
+        }
+        return usb::TransferStatus::IoError;
+    }
+    return usb::TransferStatus::Ok;
+}
+
+usb::TransferStatus configure_hub(void* context,
+                                  uint8_t port_count,
+                                  bool multi_tt,
+                                  uint8_t tt_think_time) {
+    auto* slot = static_cast<DeviceSlot*>(context);
+    if (slot == nullptr || slot_quarantined(*slot) || !slot_active(*slot)) {
+        return usb::TransferStatus::NoDevice;
+    }
+    if (port_count == 0 || tt_think_time > 3) {
+        return usb::TransferStatus::Unsupported;
+    }
+    Controller* controller_ptr = slot->controller;
+    if (controller_ptr == nullptr) {
+        return usb::TransferStatus::NoDevice;
+    }
+
+    Controller& controller = *controller_ptr;
+    ControllerIoGuard io_guard(controller);
+    if (slot_quarantined(*slot) || !slot_active(*slot) ||
+        slot->controller != controller_ptr) {
+        return usb::TransferStatus::NoDevice;
+    }
+
+    memset(paging_phys_to_virt(slot->input_context_phys), 0, kPageSize);
+    uint32_t* input_control = input_control_context(slot->input_context_phys);
+    input_control[1] = 1u << 0;
+    uint32_t* slot_ctx = input_context(controller,
+                                       slot->input_context_phys,
+                                       0);
+    uint32_t* current_slot_ctx = device_context(controller,
+                                                slot->output_context_phys,
+                                                0);
+    for (size_t i = 0; i < context_size(controller) / sizeof(uint32_t); ++i) {
+        slot_ctx[i] = current_slot_ctx[i];
+    }
+    constexpr uint32_t kSlotContextMultiTt = 1u << 25;
+    constexpr uint32_t kSlotContextHub = 1u << 26;
+    constexpr uint32_t kSlotContextTtThinkTimeMask = 0x3u << 16;
+    slot_ctx[0] |= kSlotContextHub;
+    if (multi_tt) {
+        slot_ctx[0] |= kSlotContextMultiTt;
+    } else {
+        slot_ctx[0] &= ~kSlotContextMultiTt;
+    }
+    slot_ctx[1] &= 0x00FFFFFFu;
+    slot_ctx[1] |= static_cast<uint32_t>(port_count) << 24;
+    slot_ctx[2] &= ~kSlotContextTtThinkTimeMask;
+    slot_ctx[2] |= static_cast<uint32_t>(tt_think_time) << 16;
+
+    Trb event{};
+    uint32_t control = (kTrbTypeEvaluateContextCommand << 10) |
+                       (static_cast<uint32_t>(slot->slot_id) << 24);
+    if (!issue_command_locked(controller,
+                              slot->input_context_phys,
+                              0,
+                              control,
+                              event)) {
+        if (controller_commands_quarantined(controller)) {
+            quarantine_timed_out_transfer(*slot, 0);
+        }
         return usb::TransferStatus::IoError;
     }
     return usb::TransferStatus::Ok;
@@ -1209,8 +1610,11 @@ bool configure_endpoints(DeviceSlot& slot) {
     for (size_t i = 0; i < slot.device.endpoint_count; ++i) {
         const usb::Endpoint& endpoint = slot.device.endpoints[i];
         uint8_t endpoint_id = endpoint_id_from_address(endpoint.address);
-        if (endpoint_id == 0 || endpoint_id >= kMaxEndpointContexts) {
-            continue;
+        uint32_t ep_type = endpoint_type_value(endpoint);
+        if (endpoint_id <= 1 || endpoint_id >= kMaxEndpointContexts ||
+            ep_type == 0 || endpoint.max_packet_size == 0 ||
+            slot.endpoint_rings[endpoint_id].phys != 0) {
+            return false;
         }
         if (!allocate_ring(slot.endpoint_rings[endpoint_id])) {
             return false;
@@ -1224,10 +1628,6 @@ bool configure_endpoints(DeviceSlot& slot) {
         uint32_t* ep_ctx = input_context(controller,
                                          slot.input_context_phys,
                                          endpoint_id);
-        uint32_t ep_type = endpoint_type_value(endpoint);
-        if (ep_type == 0) {
-            continue;
-        }
         ep_ctx[0] = static_cast<uint32_t>(endpoint.interval) << 16;
         ep_ctx[1] = (3u << 1) | (ep_type << 3) |
                     (static_cast<uint32_t>(endpoint.max_packet_size) << 16);
@@ -1255,58 +1655,59 @@ bool configure_endpoints(DeviceSlot& slot) {
     return issue_command(controller, slot.input_context_phys, 0, control, event);
 }
 
-bool enumerate_device(Controller& controller, uint8_t port) {
-    uint32_t portsc = read32(controller.operational, port_offset(port));
-    if ((portsc & kPortScCurrentConnectStatus) == 0) {
-        log_message(LogLevel::Warn,
-                    "xhci: port %u disconnected before enumeration portsc=%x",
-                    static_cast<unsigned int>(port),
-                    static_cast<unsigned long long>(portsc));
+bool enumerate_device_at_path(Controller& controller,
+                              uint8_t root_port,
+                              usb::Speed speed,
+                              uint8_t route_depth,
+                              uint32_t route_string,
+                              uint8_t tt_hub_slot_id,
+                              uint8_t tt_port) {
+    if (controller_commands_quarantined(controller)) {
         return false;
     }
-    log_message(LogLevel::Info,
-                "xhci: enumerating port %u portsc=%x",
-                static_cast<unsigned int>(port),
-                static_cast<unsigned long long>(portsc));
-    if (!reset_port(controller, port)) {
-        log_message(LogLevel::Warn, "xhci: port %u reset failed", port);
-        return false;
-    }
-
-    portsc = read32(controller.operational, port_offset(port));
-    usb::Speed speed = port_speed((portsc >> 10) & 0xFu);
 
     DeviceSlot* slot = allocate_device_slot(controller);
     if (slot == nullptr) {
         log_message(LogLevel::Warn, "xhci: no local device slots available");
         return false;
     }
+    // Record ownership before issuing Enable Slot so a command that cannot be
+    // safely unwound still reserves this physical port against replug churn.
+    slot->port = root_port;
+    slot->route_depth = route_depth;
+    slot->route_string = route_string;
+    slot->tt_hub_slot_id = tt_hub_slot_id;
+    slot->tt_port = tt_port;
     if (!enable_slot(controller, slot->slot_id)) {
-        log_message(LogLevel::Warn, "xhci: enable slot failed on port %u", port);
-        *slot = {};
+        log_message(LogLevel::Warn,
+                    "xhci: enable slot failed for route=%05x",
+                    static_cast<unsigned int>(route_string));
+        release_device_slot(*slot);
         return false;
     }
     log_message(LogLevel::Info,
-                "xhci: port %u enabled slot=%u",
-                static_cast<unsigned int>(port),
+                "xhci: root port %u route=%05x enabled slot=%u",
+                static_cast<unsigned int>(root_port),
+                static_cast<unsigned int>(route_string),
                 static_cast<unsigned int>(slot->slot_id));
 
     prepare_address_context(
-        *slot, port, speed, default_control_packet_size(speed));
+        *slot, root_port, speed, default_control_packet_size(speed));
     if (!address_device(*slot)) {
         log_message(LogLevel::Warn,
-                    "xhci: address device failed on port %u slot=%u",
-                    port,
+                    "xhci: address device failed route=%05x slot=%u",
+                    static_cast<unsigned int>(route_string),
                     static_cast<unsigned int>(slot->slot_id));
         release_device_slot(*slot);
         return false;
     }
     log_message(LogLevel::Info,
-                "xhci: port %u addressed slot=%u",
-                static_cast<unsigned int>(port),
+                "xhci: root port %u route=%05x addressed slot=%u",
+                static_cast<unsigned int>(root_port),
+                static_cast<unsigned int>(route_string),
                 static_cast<unsigned int>(slot->slot_id));
 
-    slot->used = true;
+    __atomic_store_n(&slot->used, 1, __ATOMIC_RELEASE);
     slot->address = g_next_usb_address++;
     if (g_next_usb_address == 0) {
         g_next_usb_address = 1;
@@ -1334,6 +1735,8 @@ bool enumerate_device(Controller& controller, uint8_t port) {
     device.transport.control = control_transfer;
     device.transport.bulk = bulk_transfer;
     device.transport.reset_endpoint = reset_endpoint;
+    device.transport.configure_hub = configure_hub;
+    device.transport.enumerate_hub_port = enumerate_hub_port;
 
     uint8_t config_header[9]{};
     if (!get_descriptor(*slot, 2, 0, config_header, sizeof(config_header))) {
@@ -1401,10 +1804,102 @@ bool enumerate_device(Controller& controller, uint8_t port) {
     return true;
 }
 
+bool enumerate_device(Controller& controller, uint8_t port) {
+    if (controller_commands_quarantined(controller)) {
+        return false;
+    }
+    uint32_t portsc = read32(controller.operational, port_offset(port));
+    if ((portsc & kPortScCurrentConnectStatus) == 0) {
+        log_message(LogLevel::Warn,
+                    "xhci: port %u disconnected before enumeration portsc=%x",
+                    static_cast<unsigned int>(port),
+                    static_cast<unsigned long long>(portsc));
+        return false;
+    }
+    log_message(LogLevel::Info,
+                "xhci: enumerating port %u portsc=%x",
+                static_cast<unsigned int>(port),
+                static_cast<unsigned long long>(portsc));
+    if (!reset_port(controller, port)) {
+        log_message(LogLevel::Warn, "xhci: port %u reset failed", port);
+        return false;
+    }
+
+    portsc = read32(controller.operational, port_offset(port));
+    usb::Speed speed = port_speed((portsc >> 10) & 0xFu);
+    if (speed == usb::Speed::Unknown) {
+        return false;
+    }
+    return enumerate_device_at_path(controller, port, speed, 0, 0, 0, 0);
+}
+
+usb::TransferStatus enumerate_hub_port(void* context,
+                                       uint8_t downstream_port,
+                                       usb::Speed speed) {
+    auto* hub = static_cast<DeviceSlot*>(context);
+    if (hub == nullptr || slot_quarantined(*hub) || !slot_active(*hub)) {
+        return usb::TransferStatus::NoDevice;
+    }
+    if (downstream_port == 0 || downstream_port > 15 ||
+        hub->route_depth >= 5 || speed == usb::Speed::Unknown ||
+        speed == usb::Speed::Super) {
+        return usb::TransferStatus::Unsupported;
+    }
+    Controller* controller = hub->controller;
+    if (controller == nullptr || !controller->active) {
+        return usb::TransferStatus::NoDevice;
+    }
+
+    uint8_t child_depth = static_cast<uint8_t>(hub->route_depth + 1);
+    uint32_t child_route =
+        hub->route_string |
+        (static_cast<uint32_t>(downstream_port) << (hub->route_depth * 4));
+    for (size_t i = 0; i < kMaxDeviceSlots; ++i) {
+        const DeviceSlot& existing = g_device_slots[i];
+        if (__atomic_load_n(&existing.allocated, __ATOMIC_ACQUIRE) != 0 &&
+            existing.controller == controller &&
+            existing.port == hub->port &&
+            existing.route_depth == child_depth &&
+            existing.route_string == child_route) {
+            return usb::TransferStatus::Ok;
+        }
+    }
+
+    uint8_t tt_hub_slot_id = 0;
+    uint8_t tt_port = 0;
+    if (speed == usb::Speed::Low || speed == usb::Speed::Full) {
+        if (hub->speed == usb::Speed::High) {
+            tt_hub_slot_id = hub->slot_id;
+            tt_port = downstream_port;
+        } else {
+            tt_hub_slot_id = hub->tt_hub_slot_id;
+            tt_port = hub->tt_port;
+        }
+    }
+
+    log_message(LogLevel::Info,
+                "xhci: enumerating hub slot=%u port=%u route=%05x speed=%s",
+                static_cast<unsigned int>(hub->slot_id),
+                static_cast<unsigned int>(downstream_port),
+                static_cast<unsigned int>(child_route),
+                usb::speed_name(speed));
+    return enumerate_device_at_path(*controller,
+                                    hub->port,
+                                    speed,
+                                    child_depth,
+                                    child_route,
+                                    tt_hub_slot_id,
+                                    tt_port)
+               ? usb::TransferStatus::Ok
+               : usb::TransferStatus::IoError;
+}
+
 bool port_has_device(const Controller& controller, uint8_t port) {
     for (size_t i = 0; i < kMaxDeviceSlots; ++i) {
         const DeviceSlot& slot = g_device_slots[i];
-        if (slot.used && slot.controller == &controller && slot.port == port) {
+        if (__atomic_load_n(&slot.allocated, __ATOMIC_ACQUIRE) != 0 &&
+            slot.controller == &controller &&
+            slot.port == port) {
             return true;
         }
     }
@@ -1457,14 +1952,8 @@ void scan_ports(Controller& controller) {
                         "xhci: boot device enumeration complete on port %u",
                         static_cast<unsigned int>(port));
         } else {
-            // Keep transiently unready devices eligible for the normal
-            // post-boot retry path rather than requiring a reconnect.
-            controller.port_enumeration_attempted[port] = false;
-            controller.port_retry_after[port] =
-                timekeeping::tick_count() +
-                timekeeping::ticks_for_duration_ns(5000000000ull);
             log_message(LogLevel::Warn,
-                        "xhci: boot device enumeration failed on port %u; retrying later",
+                        "xhci: boot device enumeration failed on port %u; reconnect to retry",
                         static_cast<unsigned int>(port));
         }
     }
@@ -1499,16 +1988,39 @@ void power_ports(Controller& controller) {
     }
 }
 
+bool take_enumeration_request(Controller*& controller, uint8_t& port) {
+    lock_enumeration_request();
+    if (__atomic_load_n(&g_enumeration_pending, __ATOMIC_ACQUIRE) == 0) {
+        unlock_enumeration_request();
+        return false;
+    }
+    controller = g_pending_controller;
+    port = g_pending_port;
+    __atomic_store_n(&g_enumeration_pending, 0, __ATOMIC_RELEASE);
+    unlock_enumeration_request();
+    return true;
+}
+
+void park_enumeration_worker(process::Process& proc) {
+    proc.waiting_on = nullptr;
+    process::store_state(proc, process::State::Blocked);
+    // A producer that ran while this callback was still Running could not
+    // wake it.  Recheck after publishing Blocked to close that race.
+    if (__atomic_load_n(&g_enumeration_pending, __ATOMIC_ACQUIRE) != 0) {
+        (void)process::wake(proc);
+    }
+}
+
 void enumeration_worker(process::Process& proc) {
-    if (__atomic_exchange_n(&g_enumeration_pending, 0, __ATOMIC_ACQUIRE) == 0) {
-        proc.state = process::State::Blocked;
+    Controller* controller = nullptr;
+    uint8_t port = 0;
+    if (!take_enumeration_request(controller, port)) {
+        park_enumeration_worker(proc);
         return;
     }
 
-    Controller* controller = g_pending_controller;
-    uint8_t port = g_pending_port;
     if (controller == nullptr || port == 0 || !controller->active) {
-        proc.state = process::State::Ready;
+        park_enumeration_worker(proc);
         return;
     }
 
@@ -1518,38 +2030,34 @@ void enumeration_worker(process::Process& proc) {
                 static_cast<unsigned int>(port),
                 static_cast<unsigned long long>(portsc));
     if (enumerate_device(*controller, port)) {
-        controller->port_retry_after[port] = 0;
         log_message(LogLevel::Info,
                     "xhci: port %u background enumeration complete",
                     static_cast<unsigned int>(port));
     } else {
-        controller->port_enumeration_attempted[port] = false;
-        controller->port_retry_after[port] =
-            timekeeping::tick_count() +
-            timekeeping::ticks_for_duration_ns(5000000000ull);
         log_message(LogLevel::Warn,
-                    "xhci: port %u background enumeration failed; retrying",
+                    "xhci: port %u background enumeration failed; reconnect to retry",
                     static_cast<unsigned int>(port));
     }
 
-    proc.state =
-        __atomic_load_n(&g_enumeration_pending, __ATOMIC_ACQUIRE) != 0
-            ? process::State::Ready
-            : process::State::Blocked;
+    park_enumeration_worker(proc);
 }
 
 void queue_port_enumeration(Controller& controller, uint8_t port) {
-    if (__atomic_load_n(&g_enumeration_pending, __ATOMIC_ACQUIRE) != 0) {
+    bool queued = false;
+    lock_enumeration_request();
+    if (__atomic_load_n(&g_enumeration_pending, __ATOMIC_ACQUIRE) == 0) {
+        g_pending_controller = &controller;
+        g_pending_port = port;
+        __atomic_store_n(&g_enumeration_pending, 1, __ATOMIC_RELEASE);
+        queued = true;
+    }
+    unlock_enumeration_request();
+    if (!queued) {
         return;
     }
-    g_pending_controller = &controller;
-    g_pending_port = port;
-    __atomic_store_n(&g_enumeration_pending, 1, __ATOMIC_RELEASE);
 
-    if (g_enumeration_worker != nullptr &&
-        g_enumeration_worker->state == process::State::Blocked) {
-        g_enumeration_worker->waiting_on = nullptr;
-        scheduler::enqueue(g_enumeration_worker);
+    if (g_enumeration_worker != nullptr) {
+        (void)process::wake(*g_enumeration_worker);
     }
 }
 
@@ -1567,15 +2075,10 @@ void poll_ports() {
                 read32(controller.operational, port_offset(port));
             if ((portsc & kPortScCurrentConnectStatus) == 0) {
                 controller.port_enumeration_attempted[port] = false;
-                controller.port_retry_after[port] = 0;
                 continue;
             }
             if (port_has_device(controller, port) ||
                 controller.port_enumeration_attempted[port]) {
-                continue;
-            }
-            uint64_t retry_after = controller.port_retry_after[port];
-            if (retry_after != 0 && timekeeping::tick_count() < retry_after) {
                 continue;
             }
             if (__atomic_load_n(&g_enumeration_pending,
@@ -1607,12 +2110,23 @@ bool init_controller(const pci::PciDevice& device) {
 
     enable_pci_device(device);
 
-    volatile uint8_t* mmio = map_mmio_range(bar0, 0x10000);
+    volatile uint8_t* mmio = map_mmio_range(bar0, kControllerMmioSize);
     if (mmio == nullptr) {
         return false;
     }
 
     CapabilityInfo caps = read_capabilities(mmio);
+    uint64_t operational_end =
+        static_cast<uint64_t>(caps.cap_length) + 0x400u +
+        static_cast<uint64_t>(caps.max_ports - 1u) * 0x10u +
+        sizeof(uint32_t);
+    uint64_t runtime_end =
+        static_cast<uint64_t>(caps.runtime_offset) + 0x40u;
+    uint64_t doorbell_end =
+        static_cast<uint64_t>(caps.doorbell_offset) +
+        (static_cast<uint64_t>(caps.max_slots) + 1u) * sizeof(uint32_t);
+    uint64_t extended_offset =
+        static_cast<uint64_t>(caps.extended_capabilities_offset) * 4u;
     if (caps.cap_length < 0x20 || caps.max_ports == 0 ||
         caps.doorbell_offset == 0 || caps.runtime_offset == 0) {
         log_message(LogLevel::Warn,
@@ -1622,8 +2136,22 @@ bool init_controller(const pci::PciDevice& device) {
                     device.function);
         return false;
     }
+    if (operational_end > kControllerMmioSize ||
+        runtime_end > kControllerMmioSize ||
+        doorbell_end > kControllerMmioSize ||
+        (extended_offset != 0 &&
+         extended_offset > kControllerMmioSize - sizeof(uint32_t))) {
+        log_message(LogLevel::Warn,
+                    "xhci: controller register window exceeds mapping at %02u:%02u.%u",
+                    device.bus,
+                    device.slot,
+                    device.function);
+        return false;
+    }
 
-    claim_bios_ownership(mmio, caps.extended_capabilities_offset);
+    claim_bios_ownership(mmio,
+                         caps.extended_capabilities_offset,
+                         static_cast<uint32_t>(kControllerMmioSize));
 
     Controller& controller = g_controllers[g_controller_count];
     controller.pci_device = device;
@@ -1641,9 +2169,10 @@ bool init_controller(const pci::PciDevice& device) {
     controller.command_enqueue = 0;
     controller.event_cycle = 1;
     controller.event_dequeue = 0;
+    controller.io_lock = 0;
+    controller.command_quarantined = 0;
     for (size_t i = 0; i < 256; ++i) {
         controller.port_enumeration_attempted[i] = false;
-        controller.port_retry_after[i] = 0;
     }
     controller.active = false;
     for (size_t i = 0; i < kMaxScratchpadBuffers; ++i) {
@@ -1780,7 +2309,8 @@ void init() {
             // on real hardware, making an attached device appear forever
             // stuck before enumeration.
             g_enumeration_worker->preferred_cpu = 0;
-            g_enumeration_worker->state = process::State::Blocked;
+            process::store_state(*g_enumeration_worker,
+                                 process::State::Blocked);
         } else {
             log_message(LogLevel::Warn,
                         "xhci: failed to allocate enumeration worker");

@@ -291,8 +291,8 @@ volatile uint8_t* map_capability_region(const pci::PciDevice& device,
         return nullptr;
     }
 
-    const uint64_t mmio_flags =
-        PAGE_FLAG_WRITE | PAGE_FLAG_WRITE_THROUGH | PAGE_FLAG_CACHE_DISABLE;
+    const uint64_t mmio_flags = PAGE_FLAG_WRITE | PAGE_FLAG_WRITE_THROUGH |
+                                PAGE_FLAG_CACHE_DISABLE | PAGE_FLAG_NO_EXECUTE;
     for (size_t i = 0; i < page_count; ++i) {
         uint64_t phys = page_phys + static_cast<uint64_t>(i) * kPageSize;
         uint64_t virt = virt_base + static_cast<uint64_t>(i) * kPageSize;

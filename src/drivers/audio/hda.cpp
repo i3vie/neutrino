@@ -124,7 +124,7 @@ volatile uint8_t* map_mmio(uint64_t phys) {
     size_t offset = static_cast<size_t>(phys - first);
     size_t pages = (offset + kMmioLength + kPageSize - 1) / kPageSize;
     uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_WRITE_THROUGH |
-                     PAGE_FLAG_CACHE_DISABLE;
+                     PAGE_FLAG_CACHE_DISABLE | PAGE_FLAG_NO_EXECUTE;
     for (size_t i = 0; i < pages; ++i) {
         if (!paging_map_page(kMmioVirtBase + i * kPageSize,
                              first + i * kPageSize, flags))

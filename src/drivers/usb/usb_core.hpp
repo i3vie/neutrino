@@ -44,12 +44,21 @@ using BulkTransferFn =
                        size_t length, size_t& transferred);
 using ResetEndpointFn =
     TransferStatus (*)(void* context, uint8_t endpoint);
+using ConfigureHubFn = TransferStatus (*)(void* context,
+                                          uint8_t port_count,
+                                          bool multi_tt,
+                                          uint8_t tt_think_time);
+using EnumerateHubPortFn = TransferStatus (*)(void* context,
+                                              uint8_t port,
+                                              Speed speed);
 
 struct Transport {
     void* context;
     ControlTransferFn control;
     BulkTransferFn bulk;
     ResetEndpointFn reset_endpoint;
+    ConfigureHubFn configure_hub;
+    EnumerateHubPortFn enumerate_hub_port;
 };
 
 struct Endpoint {
