@@ -90,6 +90,12 @@ struct LoginUsers {
     size_t count;
 };
 
+constexpr size_t kUserStoreBufferSize =
+    sizeof(UserStoreHeaderV3) +
+    sizeof(PackedUser) * kMaxLoginUsers + 1;
+constexpr uint32_t kMaxPasswordIterations =
+    auth::kPasswordIterations * 10u;
+
 struct TelnetSession {
     uint32_t endpoint;
     bool client_echo_suppressed;
@@ -154,6 +160,32 @@ void zero_memory(void* ptr, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         bytes[i] = 0;
     }
+}
+
+bool copy_packed_user_name(const char* packed,
+                           size_t packed_size,
+                           char* out,
+                           size_t out_size) {
+    if (packed == nullptr || packed_size == 0 || out == nullptr ||
+        out_size == 0) {
+        return false;
+    }
+    size_t length = 0;
+    while (length < packed_size && packed[length] != '\0') {
+        unsigned char ch = static_cast<unsigned char>(packed[length]);
+        if (ch < 0x20 || ch == 0x7F || ch == '/' || ch == '\\') {
+            return false;
+        }
+        ++length;
+    }
+    if (length == 0 || length == packed_size || length >= out_size ||
+        (length == 1 && packed[0] == '.') ||
+        (length == 2 && packed[0] == '.' && packed[1] == '.')) {
+        return false;
+    }
+    memcpy(out, packed, length);
+    out[length] = '\0';
+    return true;
 }
 
 void endpoint_write(uint32_t endpoint, const char* text) {
@@ -457,7 +489,7 @@ void set_login_user_password(LoginUsers& users,
 
 bool load_login_users(LoginUsers& users) {
     users.count = 0;
-    char buffer[4096];
+    char buffer[kUserStoreBufferSize];
     size_t len = 0;
     bool loaded = read_file_into_buffer(kPrimaryUserStorePath,
                                         buffer,
@@ -502,31 +534,51 @@ bool load_login_users(LoginUsers& users) {
         return false;
     }
     if (count > kMaxLoginUsers) {
-        count = kMaxLoginUsers;
+        return false;
     }
 
     if (legacy) {
         const PackedUserV1* entries =
             reinterpret_cast<const PackedUserV1*>(buffer + sizeof(UserStoreHeader));
         for (size_t i = 0; i < count; ++i) {
-            if (entries[i].active == 0 || entries[i].name[0] == '\0') {
+            if (entries[i].active == 0) {
                 continue;
             }
-            ensure_login_user(users, entries[i].name);
+            char name[kMaxUserNameLength];
+            if (!copy_packed_user_name(entries[i].name,
+                                       sizeof(entries[i].name),
+                                       name,
+                                       sizeof(name)) ||
+                user_exists(users, name)) {
+                return false;
+            }
+            ensure_login_user(users, name);
         }
     } else {
         const PackedUser* entries = reinterpret_cast<const PackedUser*>(
             buffer + (current_v3 ? sizeof(UserStoreHeaderV3) : sizeof(UserStoreHeader)));
         for (size_t i = 0; i < count; ++i) {
-            if (entries[i].active == 0 || entries[i].name[0] == '\0') {
+            if (entries[i].active == 0) {
                 continue;
             }
-            ensure_login_user(users, entries[i].name);
-            if (entries[i].password_set != 0 &&
-                entries[i].password_algorithm == auth::kPasswordAlgorithmPbkdf2Sha256 &&
-                entries[i].password_iterations != 0) {
+            char name[kMaxUserNameLength];
+            if (!copy_packed_user_name(entries[i].name,
+                                       sizeof(entries[i].name),
+                                       name,
+                                       sizeof(name)) ||
+                user_exists(users, name)) {
+                return false;
+            }
+            ensure_login_user(users, name);
+            if (entries[i].password_set != 0) {
+                if (entries[i].password_algorithm !=
+                        auth::kPasswordAlgorithmPbkdf2Sha256 ||
+                    entries[i].password_iterations == 0 ||
+                    entries[i].password_iterations > kMaxPasswordIterations) {
+                    return false;
+                }
                 set_login_user_password(users,
-                                        entries[i].name,
+                                        name,
                                         entries[i].password_iterations,
                                         entries[i].password_salt,
                                         entries[i].password_hash);
@@ -534,7 +586,6 @@ bool load_login_users(LoginUsers& users) {
         }
     }
 
-    ensure_login_user(users, kRootUserName);
     return users.count != 0;
 }
 
@@ -617,9 +668,6 @@ void* ensure_user_principal(const char* user_name) {
     }
     void* user = user_find(user_name);
     if (user == nullptr) {
-        user = user_create(user_name, kAllCapabilities);
-    }
-    if (user == nullptr) {
         return nullptr;
     }
     principal = principal_create(user, kAllCapabilities);
@@ -628,14 +676,6 @@ void* ensure_user_principal(const char* user_name) {
     }
     cache_principal(user_name, principal);
     return principal;
-}
-
-bool activate_user_principal(const char* user_name) {
-    void* principal = ensure_user_principal(user_name);
-    if (principal == nullptr) {
-        return false;
-    }
-    return principal_set(principal) == 0;
 }
 
 void print_u32(uint32_t value) {
@@ -832,11 +872,11 @@ bool spawn_shell_for_connection(uint32_t endpoint_id) {
         descriptor_close(static_cast<uint32_t>(endpoint));
         return false;
     }
-    if (!activate_user_principal(user_name)) {
+    void* principal = ensure_user_principal(user_name);
+    if (principal == nullptr) {
         endpoint_write(static_cast<uint32_t>(endpoint),
-                       "Failed to activate user session\r\n");
+                       "Failed to prepare user session\r\n");
         descriptor_close(static_cast<uint32_t>(endpoint));
-        activate_user_principal(kRootUserName);
         return false;
     }
 
@@ -847,8 +887,12 @@ bool spawn_shell_for_connection(uint32_t endpoint_id) {
     stdio.stdout_handle = static_cast<uint32_t>(endpoint);
     stdio.stderr_handle = static_cast<uint32_t>(endpoint);
     stdio.reserved = 0;
-    long pid = child_with_stdio("/binary/shell.elf", shell_args, 0, nullptr, &stdio);
-    activate_user_principal(kRootUserName);
+    long pid = child_with_stdio_as("/binary/shell.elf",
+                                   shell_args,
+                                   0,
+                                   nullptr,
+                                   &stdio,
+                                   principal);
     descriptor_close(static_cast<uint32_t>(endpoint));
     return pid >= 0;
 }

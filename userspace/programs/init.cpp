@@ -20,6 +20,7 @@ constexpr const char* kRootUserName = "root";
 constexpr uint64_t kAllCapabilities = ~0ull;
 
 uint32_t g_console_handle = kInvalidDescriptor;
+bool g_allow_passwordless_root_bootstrap = false;
 
 struct PrincipalCacheEntry {
     bool in_use;
@@ -75,6 +76,12 @@ struct LoginUsers {
     size_t count;
 };
 
+constexpr size_t kUserStoreBufferSize =
+    sizeof(UserStoreHeaderV3) +
+    sizeof(PackedUser) * kMaxLoginUsers + 1;
+constexpr uint32_t kMaxPasswordIterations =
+    auth::kPasswordIterations * 10u;
+
 void print(const char* text) {
     if (g_console_handle == kInvalidDescriptor || text == nullptr) {
         return;
@@ -123,6 +130,32 @@ void zero_memory(void* ptr, size_t size) {
     }
 }
 
+bool copy_packed_user_name(const char* packed,
+                           size_t packed_size,
+                           char* out,
+                           size_t out_size) {
+    if (packed == nullptr || packed_size == 0 || out == nullptr ||
+        out_size == 0) {
+        return false;
+    }
+    size_t length = 0;
+    while (length < packed_size && packed[length] != '\0') {
+        unsigned char ch = static_cast<unsigned char>(packed[length]);
+        if (ch < 0x20 || ch == 0x7F || ch == '/' || ch == '\\') {
+            return false;
+        }
+        ++length;
+    }
+    if (length == 0 || length == packed_size || length >= out_size ||
+        (length == 1 && packed[0] == '.') ||
+        (length == 2 && packed[0] == '.' && packed[1] == '.')) {
+        return false;
+    }
+    memcpy(out, packed, length);
+    out[length] = '\0';
+    return true;
+}
+
 void* find_cached_principal(const char* user_name) {
     if (user_name == nullptr || user_name[0] == '\0') {
         return nullptr;
@@ -155,7 +188,8 @@ bool cache_principal(const char* user_name, void* principal) {
     return false;
 }
 
-void* ensure_user_principal(const char* user_name) {
+void* ensure_user_principal(const char* user_name,
+                            bool allow_root_bootstrap = false) {
     if (user_name == nullptr || user_name[0] == '\0') {
         return nullptr;
     }
@@ -166,7 +200,8 @@ void* ensure_user_principal(const char* user_name) {
     }
 
     void* user = user_find(user_name);
-    if (user == nullptr) {
+    if (user == nullptr && allow_root_bootstrap &&
+        strcmp(user_name, kRootUserName) == 0) {
         user = user_create(user_name, kAllCapabilities);
     }
     if (user == nullptr) {
@@ -181,8 +216,10 @@ void* ensure_user_principal(const char* user_name) {
     return principal;
 }
 
-bool activate_user_principal(const char* user_name) {
-    void* principal = ensure_user_principal(user_name);
+bool activate_initial_root_principal(bool allow_root_bootstrap) {
+    const char* user_name = kRootUserName;
+    void* principal =
+        ensure_user_principal(user_name, allow_root_bootstrap);
     if (principal == nullptr) {
         print("init: failed to ensure principal for ");
         print(user_name);
@@ -285,10 +322,14 @@ void set_login_user_password(LoginUsers& users,
     }
 }
 
-bool load_login_users(LoginUsers& users) {
+bool load_login_users(LoginUsers& users,
+                      bool* out_explicit_empty = nullptr) {
     users.count = 0;
+    if (out_explicit_empty != nullptr) {
+        *out_explicit_empty = false;
+    }
 
-    char buffer[4096];
+    char buffer[kUserStoreBufferSize];
     size_t len = 0;
     bool loaded = read_file_into_buffer(kPrimaryUserStorePath,
                                         buffer,
@@ -333,31 +374,54 @@ bool load_login_users(LoginUsers& users) {
         return false;
     }
     if (count > kMaxLoginUsers) {
-        count = kMaxLoginUsers;
+        return false;
+    }
+    if (out_explicit_empty != nullptr && current_v3 && header.count == 0) {
+        *out_explicit_empty = true;
     }
 
     if (legacy) {
         const PackedUserV1* entries =
             reinterpret_cast<const PackedUserV1*>(buffer + sizeof(UserStoreHeader));
         for (size_t i = 0; i < count; ++i) {
-            if (entries[i].active == 0 || entries[i].name[0] == '\0') {
+            if (entries[i].active == 0) {
                 continue;
             }
-            ensure_login_user(users, entries[i].name);
+            char name[kMaxUserNameLength];
+            if (!copy_packed_user_name(entries[i].name,
+                                       sizeof(entries[i].name),
+                                       name,
+                                       sizeof(name)) ||
+                user_exists(users, name)) {
+                return false;
+            }
+            ensure_login_user(users, name);
         }
     } else {
         const PackedUser* entries = reinterpret_cast<const PackedUser*>(
             buffer + (current_v3 ? sizeof(UserStoreHeaderV3) : sizeof(UserStoreHeader)));
         for (size_t i = 0; i < count; ++i) {
-            if (entries[i].active == 0 || entries[i].name[0] == '\0') {
+            if (entries[i].active == 0) {
                 continue;
             }
-            ensure_login_user(users, entries[i].name);
-            if (entries[i].password_set != 0 &&
-                entries[i].password_algorithm == auth::kPasswordAlgorithmPbkdf2Sha256 &&
-                entries[i].password_iterations != 0) {
+            char name[kMaxUserNameLength];
+            if (!copy_packed_user_name(entries[i].name,
+                                       sizeof(entries[i].name),
+                                       name,
+                                       sizeof(name)) ||
+                user_exists(users, name)) {
+                return false;
+            }
+            ensure_login_user(users, name);
+            if (entries[i].password_set != 0) {
+                if (entries[i].password_algorithm !=
+                        auth::kPasswordAlgorithmPbkdf2Sha256 ||
+                    entries[i].password_iterations == 0 ||
+                    entries[i].password_iterations > kMaxPasswordIterations) {
+                    return false;
+                }
                 set_login_user_password(users,
-                                        entries[i].name,
+                                        name,
                                         entries[i].password_iterations,
                                         entries[i].password_salt,
                                         entries[i].password_hash);
@@ -365,7 +429,6 @@ bool load_login_users(LoginUsers& users) {
         }
     }
 
-    ensure_login_user(users, kRootUserName);
     return users.count != 0;
 }
 
@@ -492,8 +555,12 @@ const LoginUsers* find_login_user(const LoginUsers& users,
 }
 
 bool verify_login_password(const LoginUsers& users, size_t index) {
-    if (index >= users.count || !users.password_set[index]) {
-        return true;
+    if (index >= users.count) {
+        return false;
+    }
+    if (!users.password_set[index]) {
+        return g_allow_passwordless_root_bootstrap &&
+               strcmp(users.names[index], kRootUserName) == 0;
     }
     print("password: ");
     char password[96];
@@ -553,16 +620,16 @@ void run_login_loop() {
             print("Login incorrect\n");
             continue;
         }
-        if (!activate_user_principal(name)) {
-            print("Failed to activate user session\n");
-            activate_user_principal(kRootUserName);
+        void* principal = ensure_user_principal(name);
+        if (principal == nullptr) {
+            print("Failed to prepare user session\n");
             continue;
         }
 
         char shell_args[48];
         build_shell_args(name, shell_args, sizeof(shell_args));
-        long result = exec(kDefaultShellPath, shell_args, 0, nullptr);
-        activate_user_principal(kRootUserName);
+        long result =
+            exec_as(kDefaultShellPath, shell_args, 0, nullptr, principal);
         if (result < 0) {
             print("Failed to start shell\n");
         }
@@ -616,7 +683,8 @@ bool spawn_command_line(char* line) {
         return false;
     }
 
-    if (!activate_user_principal(user_name)) {
+    void* principal = ensure_user_principal(user_name);
+    if (principal == nullptr) {
         return false;
     }
 
@@ -634,7 +702,7 @@ bool spawn_command_line(char* line) {
         }
     }
 
-    long pid = child(command, args, 0, nullptr);
+    long pid = child_as(command, args, 0, nullptr, principal);
     if (pid >= 0) {
         print("init: spawned ");
         print(command);
@@ -695,8 +763,20 @@ int main(uint64_t, uint64_t) {
         g_console_handle = static_cast<uint32_t>(console);
     }
 
-    activate_user_principal(kRootUserName);
-    (void)ensure_user_principal(kRootUserName);
+    // A valid, explicitly empty v3 store is the live/first-boot bootstrap
+    // marker. Missing, malformed, or nonempty stores never authorize creating
+    // a new root account, and the exception is local to this boot.
+    LoginUsers startup_users{};
+    bool explicit_empty_store = false;
+    (void)load_login_users(startup_users, &explicit_empty_store);
+    g_allow_passwordless_root_bootstrap = explicit_empty_store;
+
+    if (!activate_initial_root_principal(explicit_empty_store)) {
+        print("init: unable to establish the root security principal\n");
+        for (;;) {
+            sleep_ns(1000000000ull);
+        }
+    }
     (void)spawn_from_config();
     run_login_loop();
 }
