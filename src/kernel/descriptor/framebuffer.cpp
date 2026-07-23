@@ -21,7 +21,9 @@ struct FramebufferSlot {
     size_t buffer_bytes;
     uint64_t physical_base;
     process::Process* owner;
+    process::Process* session_owner;
     uint32_t open_count;
+    uint32_t session_id;
     bool kernel_reserved;
 };
 
@@ -32,6 +34,16 @@ uint64_t g_hw_physical_base = 0;
 size_t g_frame_bytes = 0;
 uint32_t g_active_slot = 0;
 sync::SpinLock g_selection_lock;
+sync::SpinLock g_lease_lock;
+uint32_t g_next_session_id = 1;
+
+class LeaseGuard {
+public:
+    LeaseGuard() { g_lease_lock.lock(); }
+    ~LeaseGuard() { g_lease_lock.unlock(); }
+    LeaseGuard(const LeaseGuard&) = delete;
+    LeaseGuard& operator=(const LeaseGuard&) = delete;
+};
 
 class SelectionGuard {
 public:
@@ -51,6 +63,14 @@ private:
     bool locked_;
 };
 
+class BlockingSelectionGuard {
+public:
+    BlockingSelectionGuard() { g_selection_lock.lock(); }
+    ~BlockingSelectionGuard() { g_selection_lock.unlock(); }
+    BlockingSelectionGuard(const BlockingSelectionGuard&) = delete;
+    BlockingSelectionGuard& operator=(const BlockingSelectionGuard&) = delete;
+};
+
 FramebufferSlot* slot_from_entry(DescriptorEntry& entry) {
     return static_cast<FramebufferSlot*>(entry.object);
 }
@@ -60,6 +80,9 @@ bool ensure_slot_buffer(FramebufferSlot& slot) {
         return true;
     }
     if (g_frame_bytes == 0) {
+        return false;
+    }
+    if (g_frame_bytes > static_cast<size_t>(-1) - (kPageSize - 1)) {
         return false;
     }
     size_t pages = (g_frame_bytes + kPageSize - 1) / kPageSize;
@@ -77,6 +100,11 @@ bool ensure_slot_buffer(FramebufferSlot& slot) {
     return true;
 }
 
+size_t usable_frame_bytes(const FramebufferSlot& slot) {
+    return slot.buffer_bytes < g_frame_bytes ? slot.buffer_bytes
+                                             : g_frame_bytes;
+}
+
 void copy_to_hardware(const FramebufferSlot& slot) {
     if (g_hw_base == nullptr || g_frame_bytes == 0 || slot.buffer == nullptr) {
         return;
@@ -88,16 +116,30 @@ void copy_to_hardware(const FramebufferSlot& slot) {
     memcpy_simd(g_hw_base, slot.buffer, bytes);
 }
 
-void copy_from_hardware(FramebufferSlot& slot) {
-    if (g_hw_base == nullptr || g_frame_bytes == 0 || slot.buffer == nullptr ||
-        slot.buffer == g_hw_base) {
+void select_locked(uint32_t index) {
+    if (index >= kFramebufferSlots || g_frame_bytes == 0 ||
+        g_hw_base == nullptr ||
+        index == __atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE)) {
         return;
     }
-    size_t bytes = g_frame_bytes;
-    if (slot.buffer_bytes < bytes) {
-        bytes = slot.buffer_bytes;
+    if (index != 0) {
+        FramebufferSlot& target = g_framebuffers[index];
+        if (target.buffer == nullptr ||
+            __atomic_load_n(&target.open_count, __ATOMIC_ACQUIRE) == 0 ||
+            __atomic_load_n(&target.owner, __ATOMIC_ACQUIRE) == nullptr) {
+            return;
+        }
+        copy_to_hardware(target);
     }
-    memcpy_simd(slot.buffer, g_hw_base, bytes);
+
+    __atomic_store_n(&g_active_slot, index, __ATOMIC_RELEASE);
+    if (index == 0) {
+        if (kconsole != nullptr) {
+            kconsole->present();
+        } else {
+            copy_to_hardware(g_framebuffers[0]);
+        }
+    }
 }
 
 bool copy_rect_to_hardware(const FramebufferSlot& slot,
@@ -118,20 +160,43 @@ bool copy_rect_to_hardware(const FramebufferSlot& slot,
     if (width == 0 || height == 0) {
         return false;
     }
-    if (x + width > fb->width) {
-        width = fb->width - x;
+    if (static_cast<size_t>(width) > fb->width - x) {
+        width = static_cast<uint32_t>(fb->width - x);
     }
-    if (y + height > fb->height) {
-        height = fb->height - y;
+    if (static_cast<size_t>(height) > fb->height - y) {
+        height = static_cast<uint32_t>(fb->height - y);
     }
     uint32_t bytes_per_pixel = (fb->bpp + 7u) / 8u;
     if (bytes_per_pixel == 0) {
         return false;
     }
+    if (static_cast<size_t>(width) >
+        static_cast<size_t>(-1) / bytes_per_pixel) {
+        return false;
+    }
     size_t row_bytes = static_cast<size_t>(width) * bytes_per_pixel;
+    if (static_cast<size_t>(x) >
+        static_cast<size_t>(-1) / bytes_per_pixel) {
+        return false;
+    }
+    size_t x_offset = static_cast<size_t>(x) * bytes_per_pixel;
+    if (x_offset > fb->pitch || row_bytes > fb->pitch - x_offset) {
+        return false;
+    }
+    size_t frame_bytes = usable_frame_bytes(slot);
     for (uint32_t row = 0; row < height; ++row) {
-        size_t offset = static_cast<size_t>(y + row) * fb->pitch +
-                        static_cast<size_t>(x) * bytes_per_pixel;
+        size_t row_index = static_cast<size_t>(y) + row;
+        if (row_index > static_cast<size_t>(-1) / fb->pitch) {
+            return false;
+        }
+        size_t row_offset = row_index * fb->pitch;
+        if (row_offset > static_cast<size_t>(-1) - x_offset) {
+            return false;
+        }
+        size_t offset = row_offset + x_offset;
+        if (offset > frame_bytes || row_bytes > frame_bytes - offset) {
+            return false;
+        }
         memcpy_simd(g_hw_base + offset, slot.buffer + offset, row_bytes);
     }
     return true;
@@ -149,13 +214,8 @@ bool map_slot_into_process(process::Process& proc,
     }
     uint64_t base = region.base;
     uint64_t total = region.length;
-    uint32_t slot_index = static_cast<uint32_t>(&slot - g_framebuffers);
-    bool direct = slot_index != 0 && slot_index == g_active_slot;
-    uint64_t physical_base = direct ? g_hw_physical_base : slot.physical_base;
+    uint64_t physical_base = slot.physical_base;
     uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
-    if (direct) {
-        flags |= PAGE_FLAG_WRITE_COMBINING;
-    }
     for (uint64_t offset = 0; offset < total; offset += kPageSize) {
         uint64_t phys = physical_base + offset;
         if (!paging_map_page_cr3(proc.cr3,
@@ -173,39 +233,6 @@ bool map_slot_into_process(process::Process& proc,
     return true;
 }
 
-bool remap_slot_mappings(FramebufferSlot& slot, bool direct) {
-    process::Process* owner = slot.owner;
-    if (owner == nullptr || is_kernel_process(*owner)) {
-        return true;
-    }
-    uint64_t physical_base = direct ? g_hw_physical_base : slot.physical_base;
-    if (owner->cr3 == 0 || physical_base == 0) {
-        return false;
-    }
-    uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
-    if (direct) {
-        flags |= PAGE_FLAG_WRITE_COMBINING;
-    }
-    for (size_t i = 0; i < kMaxDescriptors; ++i) {
-        DescriptorEntry& entry = owner->descriptors.entries[i];
-        if (!entry.in_use || entry.type != kTypeFramebuffer ||
-            entry.object != &slot || entry.subsystem_data == nullptr) {
-            continue;
-        }
-        uint64_t base = reinterpret_cast<uint64_t>(entry.subsystem_data);
-        for (uint64_t offset = 0; offset < slot.buffer_bytes;
-             offset += kPageSize) {
-            if (!paging_map_page_cr3(owner->cr3,
-                                     base + offset,
-                                     physical_base + offset,
-                                     flags)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
 int64_t framebuffer_read(process::Process&,
                          DescriptorEntry& entry,
                          uint64_t user_address,
@@ -215,21 +242,17 @@ int64_t framebuffer_read(process::Process&,
     if (slot == nullptr || slot->buffer == nullptr) {
         return -1;
     }
-    Framebuffer* fb = &slot->fb;
-    size_t frame_bytes = fb->pitch * fb->height;
+    size_t frame_bytes = usable_frame_bytes(*slot);
     if (offset > frame_bytes) {
         return -1;
     }
     if (length == 0) {
         return 0;
     }
-    if (offset + length > frame_bytes) {
+    if (length > static_cast<uint64_t>(frame_bytes) - offset) {
         return -1;
     }
-    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
-    auto* src = (slot_index != 0 && slot_index == g_active_slot)
-                    ? g_hw_base
-                    : slot->buffer;
+    auto* src = slot->buffer;
     auto* dest = reinterpret_cast<uint8_t*>(user_address);
     if (src == nullptr || dest == nullptr) {
         return -1;
@@ -249,21 +272,17 @@ int64_t framebuffer_write(process::Process&,
     if (slot == nullptr || slot->buffer == nullptr) {
         return -1;
     }
-    Framebuffer* fb = &slot->fb;
-    size_t frame_bytes = fb->pitch * fb->height;
+    size_t frame_bytes = usable_frame_bytes(*slot);
     if (offset > frame_bytes) {
         return -1;
     }
     if (length == 0) {
         return 0;
     }
-    if (offset + length > frame_bytes) {
+    if (length > static_cast<uint64_t>(frame_bytes) - offset) {
         return -1;
     }
-    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
-    auto* dest = (slot_index != 0 && slot_index == g_active_slot)
-                     ? g_hw_base
-                     : slot->buffer;
+    auto* dest = slot->buffer;
     auto* src = reinterpret_cast<const uint8_t*>(user_address);
     if (dest == nullptr || src == nullptr) {
         return -1;
@@ -290,10 +309,10 @@ int framebuffer_get_property(DescriptorEntry& entry,
         }
         auto* info = reinterpret_cast<descriptor_defs::FramebufferInfo*>(out);
         uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+        // Users need the mapped virtual address, not a kernel/device physical
+        // address disclosure. Slot zero is kernel-only.
         info->physical_base =
-            (slot_index != 0 && slot_index == g_active_slot)
-                ? g_hw_physical_base
-                : slot->physical_base;
+            slot_index == 0 ? g_hw_physical_base : 0;
         if (entry.subsystem_data != nullptr) {
             info->virtual_base =
                 reinterpret_cast<uint64_t>(entry.subsystem_data);
@@ -326,20 +345,15 @@ int framebuffer_set_property(DescriptorEntry& entry,
         static_cast<uint32_t>(descriptor_defs::Property::FramebufferPresent)) {
         return -1;
     }
+    BlockingSelectionGuard selection_guard;
     auto* slot = slot_from_entry(entry);
     if (slot == nullptr || slot->buffer == nullptr) {
         return -1;
     }
     uint32_t slot_index =
         static_cast<uint32_t>(slot - g_framebuffers);
-    if (g_active_slot != slot_index) {
+    if (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) != slot_index) {
         return -1;
-    }
-    // Active user slots are mapped directly onto the hardware framebuffer.
-    // Present remains a successful compatibility operation for applications
-    // that were written for the old back-buffered ABI.
-    if (slot_index != 0) {
-        return 0;
     }
     if (size == 0 || in == nullptr) {
         copy_to_hardware(*slot);
@@ -364,19 +378,32 @@ void framebuffer_close(DescriptorEntry& entry) {
     if (slot == nullptr) {
         return;
     }
-    process::Process* owner = slot->owner;
-    if (slot->open_count > 0) {
-        --slot->open_count;
-    }
-    if (slot->open_count == 0 && !slot->kernel_reserved) {
-        uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
-        while (g_active_slot == slot_index) {
-            framebuffer_select(0);
-            if (g_active_slot == slot_index) {
-                asm volatile("pause");
+    process::Process* owner = nullptr;
+    {
+        BlockingSelectionGuard selection_guard;
+        LeaseGuard lease_guard;
+        owner = slot->owner;
+        uint32_t open_count =
+            __atomic_load_n(&slot->open_count, __ATOMIC_RELAXED);
+        if (open_count > 0) {
+            --open_count;
+            __atomic_store_n(&slot->open_count,
+                             open_count,
+                             __ATOMIC_RELEASE);
+        }
+        if (open_count == 0 && !slot->kernel_reserved) {
+            uint32_t slot_index =
+                static_cast<uint32_t>(slot - g_framebuffers);
+            if (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) ==
+                slot_index) {
+                select_locked(0);
+            }
+            if (slot->owner == owner) {
+                __atomic_store_n(&slot->owner,
+                                 static_cast<process::Process*>(nullptr),
+                                 __ATOMIC_RELEASE);
             }
         }
-        slot->owner = nullptr;
     }
     if (owner != nullptr && !is_kernel_process(*owner) &&
         entry.subsystem_data != nullptr) {
@@ -399,9 +426,20 @@ const Ops kFramebufferOps{
 };
 
 FramebufferSlot* allocate_user_slot(process::Process& proc) {
+    // A graphical session reserves its display slot before opening the
+    // framebuffer, making the session descriptor the authority for display
+    // and input ownership.
     for (size_t i = 1; i < kFramebufferSlots; ++i) {
         FramebufferSlot& slot = g_framebuffers[i];
-        if (slot.owner == nullptr || slot.owner == &proc) {
+        if (slot.session_owner == &proc &&
+            (slot.owner == nullptr || slot.owner == &proc)) {
+            return &slot;
+        }
+    }
+    for (size_t i = 1; i < kFramebufferSlots; ++i) {
+        FramebufferSlot& slot = g_framebuffers[i];
+        if (slot.session_owner == nullptr &&
+            (slot.owner == nullptr || slot.owner == &proc)) {
             return &slot;
         }
     }
@@ -413,6 +451,7 @@ bool open_framebuffer(process::Process& proc,
                       uint64_t,
                       uint64_t,
                       Allocation& alloc) {
+    LeaseGuard lease_guard;
     bool is_kernel = is_kernel_process(proc);
     FramebufferSlot* slot = nullptr;
     if (arg0 != 0) {
@@ -432,11 +471,21 @@ bool open_framebuffer(process::Process& proc,
     if (!is_kernel && slot->kernel_reserved) {
         return false;
     }
+    if (!is_kernel && slot->session_owner != nullptr &&
+        slot->session_owner != &proc) {
+        return false;
+    }
     if (slot->owner != nullptr && slot->owner != &proc) {
         return false;
     }
+    bool first_open_for_owner = slot->owner == nullptr;
     if (!ensure_slot_buffer(*slot)) {
         return false;
+    }
+    if (!is_kernel && first_open_for_owner) {
+        // Slots are recycled across sessions; never expose the previous
+        // owner's pixels or page-rounded tail bytes to a new process.
+        memset(slot->buffer, 0, slot->buffer_bytes);
     }
     uint64_t mapped_base = 0;
     if (!is_kernel) {
@@ -444,8 +493,10 @@ bool open_framebuffer(process::Process& proc,
             return false;
         }
     }
-    slot->owner = &proc;
-    ++slot->open_count;
+    __atomic_store_n(&slot->owner, &proc, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&slot->open_count,
+                       static_cast<uint32_t>(1),
+                       __ATOMIC_RELEASE);
     alloc.type = kTypeFramebuffer;
     alloc.flags = static_cast<uint64_t>(Flag::Readable) |
                   static_cast<uint64_t>(Flag::Writable) |
@@ -466,10 +517,172 @@ bool open_framebuffer(process::Process& proc,
     return true;
 }
 
+FramebufferSlot* graphical_session_slot(DescriptorEntry& entry) {
+    return static_cast<FramebufferSlot*>(entry.object);
+}
+
+int graphical_session_get_property(DescriptorEntry& entry,
+                                   uint32_t property,
+                                   void* out,
+                                   size_t size) {
+    if (property != static_cast<uint32_t>(
+                        descriptor_defs::Property::GraphicalSessionInfo) ||
+        out == nullptr ||
+        size < sizeof(descriptor_defs::GraphicalSessionInfo)) {
+        return -1;
+    }
+
+    LeaseGuard lease_guard;
+    FramebufferSlot* slot = graphical_session_slot(entry);
+    if (slot == nullptr || slot->session_owner == nullptr ||
+        slot->session_id == 0) {
+        return -1;
+    }
+    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+    auto* info =
+        static_cast<descriptor_defs::GraphicalSessionInfo*>(out);
+    info->abi_major = descriptor_defs::kGraphicalSessionAbiMajor;
+    info->abi_minor = descriptor_defs::kGraphicalSessionAbiMinor;
+    info->display_slot = static_cast<uint16_t>(slot_index);
+    info->reserved0 = 0;
+    info->session_id = slot->session_id;
+    info->flags = 0;
+    if (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) == slot_index) {
+        info->flags |= descriptor_defs::kGraphicalSessionFlagActive;
+    }
+    if (slot->owner == slot->session_owner &&
+        __atomic_load_n(&slot->open_count, __ATOMIC_ACQUIRE) != 0) {
+        info->flags |= descriptor_defs::kGraphicalSessionFlagFramebufferOpen;
+    }
+    info->features =
+        descriptor_defs::kGraphicalSessionFeatureDisplayLease |
+        descriptor_defs::kGraphicalSessionFeatureInputSeat |
+        descriptor_defs::kGraphicalSessionFeatureDamagePresent;
+    info->reserved1 = 0;
+    return 0;
+}
+
+int graphical_session_set_property(DescriptorEntry& entry,
+                                   uint32_t property,
+                                   const void* in,
+                                   size_t size) {
+    if (property != static_cast<uint32_t>(
+                        descriptor_defs::Property::GraphicalSessionControl) ||
+        in == nullptr ||
+        size < sizeof(descriptor_defs::GraphicalSessionControl)) {
+        return -1;
+    }
+    const auto* control =
+        static_cast<const descriptor_defs::GraphicalSessionControl*>(in);
+    if (control->flags != 0) {
+        return -1;
+    }
+
+    FramebufferSlot* slot = graphical_session_slot(entry);
+    if (slot == nullptr || slot->session_owner == nullptr) {
+        return -1;
+    }
+    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+    if (control->command ==
+        descriptor_defs::kGraphicalSessionCommandActivate) {
+        return framebuffer_activate_for_process(*slot->session_owner,
+                                                slot_index)
+                   ? 0
+                   : -1;
+    }
+    if (control->command ==
+        descriptor_defs::kGraphicalSessionCommandDeactivate) {
+        if (!framebuffer_is_active(slot_index)) {
+            return 0;
+        }
+        framebuffer_select(0);
+        return framebuffer_is_active(0) ? 0 : -1;
+    }
+    return -1;
+}
+
+void graphical_session_close(DescriptorEntry& entry) {
+    FramebufferSlot* slot = graphical_session_slot(entry);
+    if (slot == nullptr) {
+        return;
+    }
+    uint32_t slot_index = static_cast<uint32_t>(slot - g_framebuffers);
+    BlockingSelectionGuard selection_guard;
+    LeaseGuard lease_guard;
+    if (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) == slot_index) {
+        select_locked(0);
+    }
+    slot->session_owner = nullptr;
+    slot->session_id = 0;
+}
+
+const Ops kGraphicalSessionOps{
+    .read = nullptr,
+    .write = nullptr,
+    .get_property = graphical_session_get_property,
+    .set_property = graphical_session_set_property,
+};
+
+bool open_graphical_session(process::Process& proc,
+                            uint64_t resource_selector,
+                            uint64_t requested_flags,
+                            uint64_t open_context,
+                            Allocation& alloc) {
+    if (is_kernel_process(proc) || resource_selector != 0 ||
+        requested_flags != 0 || open_context != 0) {
+        return false;
+    }
+
+    LeaseGuard lease_guard;
+    for (size_t i = 1; i < kFramebufferSlots; ++i) {
+        if (g_framebuffers[i].session_owner == &proc) {
+            return false;
+        }
+    }
+
+    FramebufferSlot* slot = nullptr;
+    for (size_t i = 1; i < kFramebufferSlots; ++i) {
+        FramebufferSlot& candidate = g_framebuffers[i];
+        if (candidate.session_owner == nullptr &&
+            (candidate.owner == nullptr || candidate.owner == &proc)) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        return false;
+    }
+
+    uint32_t session_id = g_next_session_id++;
+    if (session_id == 0) {
+        session_id = g_next_session_id++;
+    }
+    slot->session_owner = &proc;
+    slot->session_id = session_id;
+
+    alloc.type = kTypeGraphicalSession;
+    alloc.flags = static_cast<uint64_t>(Flag::Device);
+    alloc.extended_flags = 0;
+    alloc.has_extended_flags = false;
+    alloc.object = slot;
+    alloc.subsystem_data = nullptr;
+    alloc.close = graphical_session_close;
+    alloc.name = "graphical-session";
+    alloc.ops = &kGraphicalSessionOps;
+    return true;
+}
+
 }  // namespace framebuffer_descriptor
 
 bool register_framebuffer_descriptor() {
     return register_type(kTypeFramebuffer, framebuffer_descriptor::open_framebuffer, &framebuffer_descriptor::kFramebufferOps);
+}
+
+bool register_graphical_session_descriptor() {
+    return register_type(
+        kTypeGraphicalSession,
+        framebuffer_descriptor::open_graphical_session,
+        &framebuffer_descriptor::kGraphicalSessionOps);
 }
 
 void register_framebuffer_device(Framebuffer& framebuffer,
@@ -478,22 +691,28 @@ void register_framebuffer_device(Framebuffer& framebuffer,
     g_hw_fb = framebuffer;
     g_hw_base = framebuffer.base;
     g_hw_physical_base = physical_base;
-    g_frame_bytes = (framebuffer.pitch != 0)
-                        ? framebuffer.pitch * framebuffer.height
-                        : 0;
+    g_frame_bytes = 0;
+    if (framebuffer.pitch != 0 &&
+        framebuffer.height <=
+            static_cast<size_t>(-1) / framebuffer.pitch) {
+        g_frame_bytes = framebuffer.pitch * framebuffer.height;
+    }
     for (size_t i = 0; i < kFramebufferSlots; ++i) {
         FramebufferSlot& slot = g_framebuffers[i];
         slot.fb = framebuffer;
         slot.buffer = nullptr;
         slot.buffer_bytes = 0;
         slot.owner = nullptr;
+        slot.session_owner = nullptr;
         slot.open_count = 0;
+        slot.session_id = 0;
         slot.kernel_reserved = (i == 0);
         slot.physical_base = (i == 0) ? physical_base : 0;
     }
     g_framebuffers[0].buffer = g_hw_base;
     g_framebuffers[0].buffer_bytes = g_frame_bytes;
-    g_active_slot = 0;
+    __atomic_store_n(&g_active_slot, 0u, __ATOMIC_RELEASE);
+    g_next_session_id = 1;
 }
 
 void framebuffer_select(uint32_t index) {
@@ -502,66 +721,17 @@ void framebuffer_select(uint32_t index) {
     if (!guard.locked()) {
         return;
     }
-    if (index >= kFramebufferSlots) {
-        return;
-    }
-    if (g_frame_bytes == 0 || g_hw_base == nullptr) {
-        return;
-    }
-    if (index == g_active_slot) {
-        return;
-    }
-    if (!paging_flush_tlb_all_cpus()) {
-        return;
-    }
-    if (index != 0) {
-        if (!ensure_slot_buffer(g_framebuffers[index])) {
-            return;
-        }
-    }
-
-    uint32_t previous = g_active_slot;
-    if (previous != 0) {
-        FramebufferSlot& outgoing = g_framebuffers[previous];
-        copy_from_hardware(outgoing);
-        if (!remap_slot_mappings(outgoing, false)) {
-            return;
-        }
-        (void)paging_flush_tlb_all_cpus();
-    }
-
-    if (index != 0) {
-        FramebufferSlot& incoming = g_framebuffers[index];
-        copy_to_hardware(incoming);
-        if (!remap_slot_mappings(incoming, true)) {
-            if (previous != 0) {
-                copy_to_hardware(g_framebuffers[previous]);
-                (void)remap_slot_mappings(g_framebuffers[previous], true);
-                (void)paging_flush_tlb_all_cpus();
-            }
-            return;
-        }
-        (void)paging_flush_tlb_all_cpus();
-    }
-
-    g_active_slot = index;
-    if (index == 0) {
-        if (kconsole != nullptr) {
-            kconsole->present();
-        } else {
-            copy_to_hardware(g_framebuffers[0]);
-        }
-    }
+    select_locked(index);
 }
 
 bool framebuffer_is_active(uint32_t index) {
     using namespace framebuffer_descriptor;
-    return g_active_slot == index;
+    return __atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) == index;
 }
 
 uint32_t framebuffer_active_slot() {
     using namespace framebuffer_descriptor;
-    return g_active_slot;
+    return __atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE);
 }
 
 int32_t framebuffer_slot_for_process(const process::Process& proc) {
@@ -569,12 +739,56 @@ int32_t framebuffer_slot_for_process(const process::Process& proc) {
     if (is_kernel_process(proc)) {
         return 0;
     }
+    LeaseGuard lease_guard;
+    for (size_t i = 1; i < kFramebufferSlots; ++i) {
+        if (g_framebuffers[i].session_owner == &proc) {
+            return static_cast<int32_t>(i);
+        }
+    }
     for (size_t i = 1; i < kFramebufferSlots; ++i) {
         if (g_framebuffers[i].owner == &proc) {
             return static_cast<int32_t>(i);
         }
     }
     return -1;
+}
+
+bool framebuffer_process_owns_slot(const process::Process& proc,
+                                   uint32_t slot) {
+    using namespace framebuffer_descriptor;
+    if (is_kernel_process(proc)) {
+        return slot == 0;
+    }
+    if (slot == 0 || slot >= kFramebufferSlots) {
+        return false;
+    }
+    LeaseGuard lease_guard;
+    const FramebufferSlot& candidate = g_framebuffers[slot];
+    return candidate.session_owner == &proc || candidate.owner == &proc;
+}
+
+bool framebuffer_activate_for_process(const process::Process& proc,
+                                      uint32_t slot) {
+    using namespace framebuffer_descriptor;
+    if (is_kernel_process(proc) || slot == 0 || slot >= kFramebufferSlots) {
+        return false;
+    }
+
+    // User-driven activation may enter from the console or refresh the
+    // caller's already-active lease. Switching away from another graphical
+    // session is reserved for the kernel's secure session-switch path.
+    BlockingSelectionGuard selection_guard;
+    LeaseGuard lease_guard;
+    const FramebufferSlot& candidate = g_framebuffers[slot];
+    if ((candidate.session_owner != &proc && candidate.owner != &proc) ||
+        candidate.owner != &proc ||
+        __atomic_load_n(&candidate.open_count, __ATOMIC_ACQUIRE) == 0 ||
+        (__atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) != 0 &&
+         __atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) != slot)) {
+        return false;
+    }
+    select_locked(slot);
+    return __atomic_load_n(&g_active_slot, __ATOMIC_ACQUIRE) == slot;
 }
 
 }  // namespace descriptor

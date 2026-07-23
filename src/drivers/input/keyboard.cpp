@@ -5,6 +5,7 @@
 #include "../interrupts/pic.hpp"
 #include "../log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/sync.hpp"
 
 namespace keyboard {
 namespace {
@@ -24,9 +25,11 @@ struct SlotBuffer {
     descriptor_defs::KeyboardEvent data[kBufferSize];
     size_t head;
     size_t tail;
+    sync::SpinLock lock;
 };
 
 SlotBuffer g_buffers[kInputSlots];
+sync::SpinLock g_state_lock;
 
 bool g_shift = false;
 bool g_caps_lock = false;
@@ -78,18 +81,19 @@ uint8_t read_data() {
     return inb(kDataPort);
 }
 
-void enqueue(uint32_t slot, const descriptor_defs::KeyboardEvent& event) {
+bool enqueue(uint32_t slot, const descriptor_defs::KeyboardEvent& event) {
     if (slot >= kInputSlots) {
-        return;
+        return false;
     }
     SlotBuffer& buf = g_buffers[slot];
+    sync::IrqLockGuard guard(buf.lock);
     size_t next = (buf.head + 1) % kBufferSize;
     if (next == buf.tail) {
-        return;
+        return false;
     }
     buf.data[buf.head] = event;
     buf.head = next;
-    descriptor::wake_waiters();
+    return true;
 }
 
 bool dequeue(uint32_t slot, descriptor_defs::KeyboardEvent& event) {
@@ -97,6 +101,7 @@ bool dequeue(uint32_t slot, descriptor_defs::KeyboardEvent& event) {
         return false;
     }
     SlotBuffer& buf = g_buffers[slot];
+    sync::IrqLockGuard guard(buf.lock);
     if (buf.head == buf.tail) {
         return false;
     }
@@ -131,62 +136,73 @@ uint8_t current_mods() {
 }
 
 void process_scancode(uint8_t scancode, bool extended, bool pressed) {
-    if (!extended) {
-        if (scancode == 0x2A) {
-            g_left_shift_down = pressed;
-        } else if (scancode == 0x36) {
-            g_right_shift_down = pressed;
-        } else if (scancode == 0x1D) {
-            g_left_ctrl_down = pressed;
-        } else if (scancode == 0x38) {
-            g_left_alt_down = pressed;
-        } else if (scancode == 0x3A && pressed) {
-            g_caps_lock = !g_caps_lock;
-        }
-    } else {
-        if (scancode == 0x1D) {
-            g_right_ctrl_down = pressed;
-        } else if (scancode == 0x38) {
-            g_right_alt_down = pressed;
-        }
-    }
-
-    update_modifier_state();
-
-    bool ctrl = g_left_ctrl_down || g_right_ctrl_down;
-    bool alt = g_left_alt_down || g_right_alt_down;
-    if (pressed && ctrl && alt && g_shift) {
-        if (scancode >= 0x3B && scancode <= 0x40) {
-            uint32_t index = static_cast<uint32_t>(scancode - 0x3B);
-            descriptor::framebuffer_select(index);
-            return;
-        }
-    }
-    if (pressed && ctrl && g_shift) {
-        if (scancode >= 0x02 && scancode <= 0x07) {
-            uint32_t index = static_cast<uint32_t>(scancode - 0x02);
-            descriptor::framebuffer_select(index);
-            return;
-        }
-    }
-
     descriptor_defs::KeyboardEvent event{};
-    event.scancode = scancode;
-    event.flags = 0;
-    if (pressed) {
-        event.flags |= descriptor_defs::kKeyboardFlagPressed;
-    }
-    if (extended) {
-        event.flags |= descriptor_defs::kKeyboardFlagExtended;
-    }
-    event.mods = current_mods();
-    event.reserved = 0;
+    bool select_framebuffer = false;
+    uint32_t framebuffer_index = 0;
+    bool queued = false;
+    {
+        sync::IrqLockGuard guard(g_state_lock);
+        if (!extended) {
+            if (scancode == 0x2A) {
+                g_left_shift_down = pressed;
+            } else if (scancode == 0x36) {
+                g_right_shift_down = pressed;
+            } else if (scancode == 0x1D) {
+                g_left_ctrl_down = pressed;
+            } else if (scancode == 0x38) {
+                g_left_alt_down = pressed;
+            } else if (scancode == 0x3A && pressed) {
+                g_caps_lock = !g_caps_lock;
+            }
+        } else {
+            if (scancode == 0x1D) {
+                g_right_ctrl_down = pressed;
+            } else if (scancode == 0x38) {
+                g_right_alt_down = pressed;
+            }
+        }
 
-    uint32_t slot = descriptor::framebuffer_active_slot();
-    if (slot >= kInputSlots) {
-        slot = 0;
+        update_modifier_state();
+
+        bool ctrl = g_left_ctrl_down || g_right_ctrl_down;
+        bool alt = g_left_alt_down || g_right_alt_down;
+        if (pressed && ctrl && alt && g_shift &&
+            scancode >= 0x3B && scancode <= 0x40) {
+            select_framebuffer = true;
+            framebuffer_index = static_cast<uint32_t>(scancode - 0x3B);
+        } else if (pressed && ctrl && g_shift &&
+                   scancode >= 0x02 && scancode <= 0x07) {
+            select_framebuffer = true;
+            framebuffer_index = static_cast<uint32_t>(scancode - 0x02);
+        }
+
+        event.scancode = scancode;
+        event.flags = 0;
+        if (pressed) {
+            event.flags |= descriptor_defs::kKeyboardFlagPressed;
+        }
+        if (extended) {
+            event.flags |= descriptor_defs::kKeyboardFlagExtended;
+        }
+        event.mods = current_mods();
+        event.reserved = 0;
+
+        if (!select_framebuffer) {
+            uint32_t slot = descriptor::framebuffer_active_slot();
+            if (slot >= kInputSlots) {
+                slot = 0;
+            }
+            queued = enqueue(slot, event);
+        }
     }
-    enqueue(slot, event);
+
+    if (select_framebuffer) {
+        descriptor::framebuffer_select(framebuffer_index);
+        return;
+    }
+    if (queued) {
+        descriptor::wake_waiters();
+    }
 }
 
 }  // namespace
@@ -267,7 +283,8 @@ bool has_data(uint32_t slot) {
     if (slot >= kInputSlots) {
         return false;
     }
-    const SlotBuffer& buf = g_buffers[slot];
+    SlotBuffer& buf = g_buffers[slot];
+    sync::IrqLockGuard guard(buf.lock);
     return buf.head != buf.tail;
 }
 

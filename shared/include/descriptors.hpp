@@ -11,6 +11,7 @@ enum class Type : uint16_t {
     Keyboard    = 0x003,
     Mouse       = 0x004,
     Framebuffer = 0x010,
+    GraphicalSession = 0x011,
     BlockDevice = 0x020,
     Disk        = 0x021,
     Partition   = 0x022,
@@ -24,6 +25,7 @@ enum class Type : uint16_t {
     NetEndpoint = 0x071,
     Pci         = 0x080,
     AudioOutput = 0x090,
+    Sensor      = 0x0A0,
 };
 
 enum class Flag : uint64_t {
@@ -50,6 +52,8 @@ enum class Property : uint32_t {
     ConsoleFont       = 0x00000009,
     FramebufferInfo   = 0x00010001,
     FramebufferPresent= 0x00010002,
+    GraphicalSessionInfo = 0x00011001,
+    GraphicalSessionControl = 0x00011002,
     BlockGeometry     = 0x00020001,
     DiskInfo          = 0x00020002,
     PartitionInfo     = 0x00020003,
@@ -69,7 +73,41 @@ enum class Property : uint32_t {
     AudioFormat       = 0x00080001,
     AudioStatus       = 0x00080002,
     AudioControl      = 0x00080003,
+    SensorInfo        = 0x00090001,
 };
+
+enum class SensorKind : uint16_t {
+    Temperature = 1,
+    Voltage = 2,
+    Fan = 3,
+};
+
+enum class SensorUnit : uint16_t {
+    MilliCelsius = 1,
+    Millivolt = 2,
+    Rpm = 3,
+};
+
+enum SensorSampleFlag : uint32_t {
+    kSensorSampleValid = 1u << 0,
+};
+
+struct SensorInfo {
+    char name[32];
+    char adapter[32];
+    SensorKind kind;
+    SensorUnit unit;
+    uint32_t index;
+};
+
+struct SensorSample {
+    int64_t value;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(SensorInfo) == 72, "SensorInfo size mismatch");
+static_assert(sizeof(SensorSample) == 16, "SensorSample size mismatch");
 
 struct AudioFormatInfo {
     uint32_t sample_rate;
@@ -149,6 +187,50 @@ struct FramebufferRect {
     uint32_t width;
     uint32_t height;
 };
+
+// Versioned kernel contract held by the trusted userspace display/session
+// service. The descriptor is the capability: its owner may activate only the
+// display slot assigned here and receives input for that same slot.
+constexpr uint16_t kGraphicalSessionAbiMajor = 1;
+constexpr uint16_t kGraphicalSessionAbiMinor = 0;
+
+enum GraphicalSessionFeature : uint32_t {
+    kGraphicalSessionFeatureDisplayLease = 1u << 0,
+    kGraphicalSessionFeatureInputSeat = 1u << 1,
+    kGraphicalSessionFeatureDamagePresent = 1u << 2,
+    kGraphicalSessionFeatureSharedSurfaces = 1u << 3,
+};
+
+enum GraphicalSessionFlag : uint32_t {
+    kGraphicalSessionFlagActive = 1u << 0,
+    kGraphicalSessionFlagFramebufferOpen = 1u << 1,
+};
+
+enum GraphicalSessionCommand : uint32_t {
+    kGraphicalSessionCommandActivate = 1,
+    kGraphicalSessionCommandDeactivate = 2,
+};
+
+struct GraphicalSessionInfo {
+    uint16_t abi_major;
+    uint16_t abi_minor;
+    uint16_t display_slot;
+    uint16_t reserved0;
+    uint32_t session_id;
+    uint32_t flags;
+    uint32_t features;
+    uint32_t reserved1;
+};
+
+struct GraphicalSessionControl {
+    uint32_t command;
+    uint32_t flags;
+};
+
+static_assert(sizeof(GraphicalSessionInfo) == 24,
+              "GraphicalSessionInfo size mismatch");
+static_assert(sizeof(GraphicalSessionControl) == 8,
+              "GraphicalSessionControl size mismatch");
 
 struct BlockGeometry {
     uint64_t sector_size;

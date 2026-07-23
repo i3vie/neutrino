@@ -5,6 +5,7 @@
 #include "../interrupts/pic.hpp"
 #include "../log/logging.hpp"
 #include "../../kernel/descriptor.hpp"
+#include "../../kernel/sync.hpp"
 
 namespace mouse {
 namespace {
@@ -32,6 +33,7 @@ struct SlotBuffer {
     Event data[kBufferSize];
     size_t head;
     size_t tail;
+    sync::SpinLock lock;
 };
 
 SlotBuffer g_buffers[kInputSlots];
@@ -92,12 +94,19 @@ void enqueue(uint32_t slot, const Event& ev) {
         return;
     }
     SlotBuffer& buf = g_buffers[slot];
-    size_t next = (buf.head + 1) % kBufferSize;
-    if (next == buf.tail) {
-        return;
+    bool queued = false;
+    {
+        sync::IrqLockGuard guard(buf.lock);
+        size_t next = (buf.head + 1) % kBufferSize;
+        if (next != buf.tail) {
+            buf.data[buf.head] = ev;
+            buf.head = next;
+            queued = true;
+        }
     }
-    buf.data[buf.head] = ev;
-    buf.head = next;
+    if (queued) {
+        descriptor::wake_waiters();
+    }
 }
 
 bool dequeue(uint32_t slot, Event& ev) {
@@ -105,6 +114,7 @@ bool dequeue(uint32_t slot, Event& ev) {
         return false;
     }
     SlotBuffer& buf = g_buffers[slot];
+    sync::IrqLockGuard guard(buf.lock);
     if (buf.head == buf.tail) {
         return false;
     }
@@ -210,6 +220,15 @@ size_t read(uint32_t slot, Event* buffer, size_t max_events) {
         buffer[count++] = ev;
     }
     return count;
+}
+
+bool has_data(uint32_t slot) {
+    if (slot >= kInputSlots) {
+        return false;
+    }
+    SlotBuffer& buf = g_buffers[slot];
+    sync::IrqLockGuard guard(buf.lock);
+    return buf.head != buf.tail;
 }
 
 }  // namespace mouse

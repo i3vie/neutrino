@@ -30,6 +30,52 @@ bool g_initialized = false;
 bool g_tables_initialized = false;
 alignas(void*) unsigned char g_early_table_buffer[4096];
 
+bool is_cmdline_separator(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
+
+bool cmdline_has_token(const char* cmdline, const char* expected) {
+    if (cmdline == nullptr || expected == nullptr || expected[0] == '\0') {
+        return false;
+    }
+
+    size_t expected_length = 0;
+    while (expected[expected_length] != '\0') {
+        ++expected_length;
+    }
+
+    const char* cursor = cmdline;
+    while (*cursor != '\0') {
+        while (is_cmdline_separator(*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        const char* token = cursor;
+        while (*cursor != '\0' && !is_cmdline_separator(*cursor)) {
+            ++cursor;
+        }
+        size_t token_length = static_cast<size_t>(cursor - token);
+        if (token_length != expected_length) {
+            continue;
+        }
+
+        bool matches = true;
+        for (size_t i = 0; i < expected_length; ++i) {
+            if (token[i] != expected[i]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <unsigned Irq> void interrupt_thunk() {
     Interrupt* entry = g_interrupts[Irq];
     if (entry != nullptr) (void)entry->handler(entry->context);
@@ -74,7 +120,7 @@ extern "C" void* uacpi_kernel_map(uacpi_phys_addr address, uacpi_size length) {
         // HHDM. Device-backed OperationRegions are not, so add a UC mapping.
         if (!paging_resolve_cr3(paging_kernel_cr3(), virt, resolved_phys)) {
             const uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_CACHE_DISABLE |
-                                   PAGE_FLAG_WRITE_THROUGH;
+                                   PAGE_FLAG_WRITE_THROUGH | PAGE_FLAG_NO_EXECUTE;
             if (!paging_map_page(virt, phys, flags)) return UACPI_MAP_FAILED;
         }
         if (phys == last_phys) break;
@@ -86,7 +132,23 @@ extern "C" void uacpi_kernel_log(uacpi_log_level level, const uacpi_char* messag
     LogLevel mapped = level == UACPI_LOG_ERROR ? LogLevel::Error :
                       level == UACPI_LOG_WARN ? LogLevel::Warn :
                       level == UACPI_LOG_INFO ? LogLevel::Info : LogLevel::Debug;
-    log_message(mapped, "uACPI: %s", message == nullptr ? "<null>" : message);
+
+    if (message == nullptr) {
+        log_message(mapped, "uACPI: <null>");
+        return;
+    }
+
+    size_t length = 0;
+    while (message[length] != '\0') ++length;
+    while (length > 0 && (message[length - 1] == '\n' || message[length - 1] == '\r')) {
+        --length;
+    }
+
+    char trimmed[256];
+    const size_t copy_length = length < sizeof(trimmed) - 1 ? length : sizeof(trimmed) - 1;
+    for (size_t i = 0; i < copy_length; ++i) trimmed[i] = message[i];
+    trimmed[copy_length] = '\0';
+    log_message(mapped, "uACPI: %s", trimmed);
 }
 
 extern "C" void* uacpi_kernel_alloc(uacpi_size size) { return memory::alloc_kernel(size); }
@@ -231,15 +293,38 @@ bool initialize_tables() {
     return true;
 }
 
-bool initialize() {
+bool initialize(const char* cmdline) {
     if (g_initialized) return true;
+    if (cmdline_has_token(cmdline, "ACPI=OFF")) {
+        log_message(LogLevel::Warn,
+                    "uACPI: runtime disabled by kernel command line");
+        return true;
+    }
+
+    const bool no_mode = cmdline_has_token(cmdline, "ACPI.NO_MODE");
+    const bool no_namespace_load =
+        cmdline_has_token(cmdline, "ACPI.NO_NAMESPACE_LOAD");
+    const bool no_namespace_init = no_namespace_load ||
+        cmdline_has_token(cmdline, "ACPI.NO_NAMESPACE_INIT");
+
     if (g_tables_initialized) {
         uacpi_state_reset();
         g_tables_initialized = false;
     }
-    uacpi_status status = uacpi_initialize(0);
-    if (status == UACPI_STATUS_OK) status = uacpi_namespace_load();
-    if (status == UACPI_STATUS_OK) status = uacpi_namespace_initialize();
+    log_message(LogLevel::Info,
+                "uACPI: runtime init (mode=%s namespace=%s)",
+                no_mode ? "unchanged" : "ACPI",
+                no_namespace_load ? "off" :
+                    (no_namespace_init ? "load-only" : "initialized"));
+
+    uacpi_u64 flags = no_mode ? UACPI_FLAG_NO_ACPI_MODE : 0;
+    uacpi_status status = uacpi_initialize(flags);
+    if (status == UACPI_STATUS_OK && !no_namespace_load) {
+        status = uacpi_namespace_load();
+    }
+    if (status == UACPI_STATUS_OK && !no_namespace_init) {
+        status = uacpi_namespace_initialize();
+    }
     if (status != UACPI_STATUS_OK) {
         log_message(LogLevel::Warn, "uACPI initialization failed: %s", uacpi_status_to_string(status));
         return false;
