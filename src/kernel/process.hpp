@@ -24,10 +24,14 @@ enum class State {
     Running,
     Blocked,
     Terminated,
+    Allocating,
+    Reclaiming,
+    Waking,
 };
 
 struct FileHandle {
     bool in_use;
+    bool can_write;
     vfs::FileHandle handle;
     uint64_t position;
 };
@@ -58,6 +62,8 @@ struct Process {
     bool console_transferred;
     bool has_context;
     bool is_kernel_task;
+    bool reclaim_pending;
+    uint32_t reclaim_cpu;
     void (*kernel_entry)(Process&);
     uint32_t preferred_cpu;  // UINT32_MAX means unassigned
     uint32_t vty_id;
@@ -67,6 +73,8 @@ struct Process {
     uint64_t wait_descriptors_user;
     uint32_t wait_descriptor_count;
     uint32_t wait_descriptor_reserved;
+    int64_t wait_result;
+    bool wait_result_pending;
     char cwd[128];
     char image_path[path_util::kMaxPathLength];
     uint32_t standard_descriptors[3];
@@ -79,6 +87,25 @@ struct Process {
     DirectoryHandle directory_handles[kMaxDirectoryHandles];
 };
 
+inline State load_state(const Process& proc) {
+    return __atomic_load_n(&proc.state, __ATOMIC_ACQUIRE);
+}
+
+inline void store_state(Process& proc, State state) {
+    __atomic_store_n(&proc.state, state, __ATOMIC_RELEASE);
+}
+
+inline bool compare_exchange_state(Process& proc,
+                                   State& expected,
+                                   State desired) {
+    return __atomic_compare_exchange_n(&proc.state,
+                                       &expected,
+                                       desired,
+                                       false,
+                                       __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE);
+}
+
 void init();
 Process* allocate();
 Process* allocate_init_task();
@@ -90,6 +117,15 @@ Process* find_by_pid(uint32_t pid);
 void record_tick(bool user_mode);
 size_t usage_snapshot(descriptor_defs::TaskUsage* out, size_t max_entries);
 void wake_ready_sleepers(uint64_t current_tick);
+bool wake(Process& proc);
+bool begin_wake(Process& proc);
+void finish_wake(Process& proc);
+void finish_wake_with_result(Process& proc, int64_t result);
+bool wake_with_result(Process& proc, int64_t result);
+void terminate(Process& proc, uint16_t exit_code);
+bool consume_wait_result(Process& proc, int64_t& out_result);
+void defer_reclaim(Process& proc);
+void reap_deferred();
 void reclaim(Process& proc);
 
 }  // namespace process

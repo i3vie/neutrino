@@ -30,7 +30,7 @@ static void set_tss_descriptor_bytes(uint8_t* dst, uint64_t base, uint32_t limit
     low  = (limit & 0xFFFF);
     low |= (base & 0xFFFFFF) << 16;
     low |= ((uint64_t)access) << 40;
-    low |= ((limit >> 16) & 0xF) << 48; 
+    low |= static_cast<uint64_t>((limit >> 16) & 0xF) << 48;
     low |= ((uint64_t)(gran & 0xF0)) << 52;
     low |= ((base >> 24) & 0xFF) << 56;
 

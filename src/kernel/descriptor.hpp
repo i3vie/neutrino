@@ -35,6 +35,8 @@ constexpr uint32_t kTypeMouse =
     static_cast<uint32_t>(descriptor_defs::Type::Mouse);
 constexpr uint32_t kTypeFramebuffer =
     static_cast<uint32_t>(descriptor_defs::Type::Framebuffer);
+constexpr uint32_t kTypeGraphicalSession =
+    static_cast<uint32_t>(descriptor_defs::Type::GraphicalSession);
 constexpr uint32_t kTypeBlockDevice =
     static_cast<uint32_t>(descriptor_defs::Type::BlockDevice);
 constexpr uint32_t kTypeDisk =
@@ -61,6 +63,8 @@ constexpr uint32_t kTypePci =
     static_cast<uint32_t>(descriptor_defs::Type::Pci);
 constexpr uint32_t kTypeAudioOutput =
     static_cast<uint32_t>(descriptor_defs::Type::AudioOutput);
+constexpr uint32_t kTypeSensor =
+    static_cast<uint32_t>(descriptor_defs::Type::Sensor);
 
 constexpr int64_t kWouldBlock = -2;
 
@@ -208,6 +212,14 @@ int get_property(process::Process& proc,
                  uint32_t property,
                  uint64_t out_ptr,
                  uint64_t size);
+// Query a property into a trusted kernel buffer. This is for kernel-internal
+// descriptor plumbing; syscall callers must use get_property() so user memory
+// is validated before an implementation writes to it.
+int get_property_trusted(Table& table,
+                         uint32_t handle,
+                         uint32_t property,
+                         void* out,
+                         size_t size);
 int set_property(process::Process& proc,
                  Table& table,
                  uint32_t handle,
@@ -219,6 +231,8 @@ int wait(process::Process& proc,
          uint64_t user_address,
          size_t count);
 void wake_waiters();
+// Starts the kernel task that evaluates deferred descriptor wakeups.
+void start_waiter_worker();
 
 void register_framebuffer_device(Framebuffer& framebuffer,
                                  uint64_t physical_base);
@@ -226,6 +240,10 @@ void framebuffer_select(uint32_t index);
 uint32_t framebuffer_active_slot();
 bool framebuffer_is_active(uint32_t index);
 int32_t framebuffer_slot_for_process(const process::Process& proc);
+bool framebuffer_process_owns_slot(const process::Process& proc,
+                                   uint32_t slot);
+bool framebuffer_activate_for_process(const process::Process& proc,
+                                      uint32_t slot);
 bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel);
 bool block_device_from_descriptor(process::Process& proc,
                                   uint32_t handle,
@@ -239,8 +257,6 @@ uint32_t open_kernel(uint32_t type,
                      uint64_t arg2);
 
 // Drives progress for asynchronous block I/O requests.
-void service_block_io();
-void start_block_io_worker();
 int64_t read_kernel(uint32_t handle,
                     void* buffer,
                     uint64_t length,

@@ -132,6 +132,13 @@ bool map_segment_into_process(SharedSegment& segment,
                         static_cast<unsigned int>(proc.pid),
                         static_cast<unsigned long long>(virt),
                         static_cast<unsigned long long>(phys));
+            for (size_t rollback = 0; rollback < i; ++rollback) {
+                uint64_t ignored = 0;
+                (void)paging_unmap_page_cr3(
+                    proc.cr3,
+                    mapping.region.base + (rollback * kPageSize),
+                    ignored);
+            }
             return false;
         }
     }

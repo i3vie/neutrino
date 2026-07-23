@@ -64,6 +64,8 @@ enum class SystemCall : long {
     ModuleCount          = 54,
     ModuleInfo           = 55,
     RandomGet            = 56,
+    FileGetAcl           = 57,
+    FileSetAcl           = 58,
 };
 
 enum : uint32_t {
@@ -74,9 +76,28 @@ enum : uint64_t {
     MAP_WRITE = 1ull << 0,
 };
 
+enum class AclValue : uint8_t {
+    Deny = 0,
+    Allow = 1,
+    Default = 2,
+};
+
+struct FileAclEntry {
+    uint64_t machine_id;
+    uint64_t local_id;
+    AclValue write;
+    AclValue read;
+    AclValue delete_permission;
+    AclValue edit;
+    uint8_t reserved[4];
+};
+
+static_assert(sizeof(FileAclEntry) == 24, "file ACL entry size mismatch");
+
 constexpr uint32_t kInvalidDescriptor = 0xFFFFFFFFu;
 constexpr long kDescriptorWouldBlock = -2;
 constexpr uint64_t kProcessChildFlagStdioConfig = 1ull << 0;
+constexpr uint64_t kProcessSpawnFlagPrincipalConfig = 1ull << 1;
 constexpr uint32_t kStandardInputDescriptor = 0x00010000u;
 constexpr uint32_t kStandardOutputDescriptor = 0x00010001u;
 constexpr uint32_t kStandardErrorDescriptor = 0x00010002u;
@@ -91,7 +112,11 @@ struct ProcessStdioConfig {
 struct ProcessSpawnConfig {
     uint64_t cwd_ptr;
     ProcessStdioConfig stdio;
+    uint64_t principal_handle;
 };
+
+static_assert(sizeof(ProcessSpawnConfig) == 32,
+              "ProcessSpawnConfig size mismatch");
 
 struct UserInfo {
     uint64_t id_machine;
@@ -300,6 +325,49 @@ static inline long child_with_stdio(const char* path,
                         static_cast<long>(reinterpret_cast<uintptr_t>(args)),
                         static_cast<long>(flags | kProcessChildFlagStdioConfig),
                         static_cast<long>(reinterpret_cast<uintptr_t>(&config)));
+}
+
+// Spawn-time principal assignment is atomic with child creation and requires
+// SecurityManage in addition to the normal ProcessSpawn permission.
+static inline long child_as(const char* path,
+                            const char* args,
+                            uint64_t flags,
+                            const char* cwd,
+                            void* principal) {
+    if (principal == nullptr) {
+        return -1;
+    }
+    ProcessSpawnConfig config{};
+    config.cwd_ptr = reinterpret_cast<uint64_t>(cwd);
+    config.principal_handle = reinterpret_cast<uint64_t>(principal);
+    return raw_syscall4(SystemCall::Child,
+                        static_cast<long>(reinterpret_cast<uintptr_t>(path)),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(args)),
+                        static_cast<long>(
+                            flags | kProcessSpawnFlagPrincipalConfig),
+                        static_cast<long>(reinterpret_cast<uintptr_t>(&config)));
+}
+
+static inline long child_with_stdio_as(const char* path,
+                                       const char* args,
+                                       uint64_t flags,
+                                       const char* cwd,
+                                       const ProcessStdioConfig* stdio,
+                                       void* principal) {
+    if (stdio == nullptr || principal == nullptr) {
+        return -1;
+    }
+    ProcessSpawnConfig config{};
+    config.cwd_ptr = reinterpret_cast<uint64_t>(cwd);
+    config.stdio = *stdio;
+    config.principal_handle = reinterpret_cast<uint64_t>(principal);
+    return raw_syscall4(
+        SystemCall::Child,
+        static_cast<long>(reinterpret_cast<uintptr_t>(path)),
+        static_cast<long>(reinterpret_cast<uintptr_t>(args)),
+        static_cast<long>(flags | kProcessChildFlagStdioConfig |
+                          kProcessSpawnFlagPrincipalConfig),
+        static_cast<long>(reinterpret_cast<uintptr_t>(&config)));
 }
 
 // requests a descriptor of the given type. the optional parameters allow
@@ -558,6 +626,44 @@ static inline long framebuffer_present(
         rect ? sizeof(*rect) : 0);
 }
 
+static inline long graphical_session_open() {
+    return descriptor_open(
+        static_cast<uint32_t>(descriptor_defs::Type::GraphicalSession),
+        0,
+        0,
+        0);
+}
+
+static inline long graphical_session_get_info(
+    uint32_t handle,
+    descriptor_defs::GraphicalSessionInfo* info) {
+    if (info == nullptr) {
+        return -1;
+    }
+    return descriptor_get_property(
+        handle,
+        static_cast<uint32_t>(
+            descriptor_defs::Property::GraphicalSessionInfo),
+        info,
+        sizeof(*info));
+}
+
+static inline long graphical_session_set_active(uint32_t handle,
+                                                bool active) {
+    descriptor_defs::GraphicalSessionControl control{
+        .command = active
+                       ? descriptor_defs::kGraphicalSessionCommandActivate
+                       : descriptor_defs::kGraphicalSessionCommandDeactivate,
+        .flags = 0,
+    };
+    return descriptor_set_property(
+        handle,
+        static_cast<uint32_t>(
+            descriptor_defs::Property::GraphicalSessionControl),
+        &control,
+        sizeof(control));
+}
+
 static inline long mouse_open() {
     return descriptor_open(
         static_cast<uint32_t>(descriptor_defs::Type::Mouse),
@@ -769,6 +875,25 @@ static inline long exec(const char* path,
                         static_cast<long>(reinterpret_cast<uintptr_t>(cwd)));
 }
 
+static inline long exec_as(const char* path,
+                           const char* args,
+                           uint64_t flags,
+                           const char* cwd,
+                           void* principal) {
+    if (principal == nullptr) {
+        return -1;
+    }
+    ProcessSpawnConfig config{};
+    config.cwd_ptr = reinterpret_cast<uint64_t>(cwd);
+    config.principal_handle = reinterpret_cast<uint64_t>(principal);
+    return raw_syscall4(
+        SystemCall::ProcessExec,
+        static_cast<long>(reinterpret_cast<uintptr_t>(path)),
+        static_cast<long>(reinterpret_cast<uintptr_t>(args)),
+        static_cast<long>(flags | kProcessSpawnFlagPrincipalConfig),
+        static_cast<long>(reinterpret_cast<uintptr_t>(&config)));
+}
+
 static inline long setcwd(const char* path) {
     return raw_syscall1(SystemCall::ProcessSetCwd,
                         static_cast<long>(reinterpret_cast<uintptr_t>(path)));
@@ -831,6 +956,26 @@ static inline long directory_create(const char* path) {
 static inline long file_remove(const char* path) {
     return raw_syscall1(SystemCall::FileRemove,
                         static_cast<long>(reinterpret_cast<uintptr_t>(path)));
+}
+
+static inline long file_get_acl(const char* path,
+                                FileAclEntry* entries,
+                                size_t max_entries) {
+    return raw_syscall3(
+        SystemCall::FileGetAcl,
+        reinterpret_cast<long>(path),
+        reinterpret_cast<long>(entries),
+        static_cast<long>(max_entries));
+}
+
+static inline long file_set_acl(const char* path,
+                                const FileAclEntry* entries,
+                                size_t entry_count) {
+    return raw_syscall3(
+        SystemCall::FileSetAcl,
+        reinterpret_cast<long>(path),
+        reinterpret_cast<long>(entries),
+        static_cast<long>(entry_count));
 }
 
 static inline long directory_remove(const char* path) {

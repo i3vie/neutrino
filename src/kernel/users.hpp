@@ -40,9 +40,17 @@ User* find(const char* name);
 User* find(const UserId& id);
 uint64_t handle_for(const User* user);
 User* from_handle(uint64_t handle);
-const UserId& machine_id();
+UserId machine_id();
 void bump_generation(User& user);
 bool allows(const User& user, uint64_t cap_bitmask);
+// Atomic snapshots used by capability revocation checks. These helpers keep
+// backing-user state lock-free so the capability lock is the only lock in the
+// principal/token hierarchy.
+bool active_generation(const User& user, uint64_t& out_generation);
+bool generation_allows(const User& user,
+                       uint64_t expected_generation,
+                       uint64_t cap_bitmask);
+bool snapshot_info(const User& user, UserInfo& out_info);
 bool set_password(User& user,
                   const uint8_t* salt,
                   const uint8_t* hash,

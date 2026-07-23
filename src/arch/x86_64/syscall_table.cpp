@@ -28,7 +28,7 @@ namespace syscall {
 namespace {
 
 constexpr uint64_t kAbiMajor = 1;
-constexpr uint64_t kAbiMinor = 1;
+constexpr uint64_t kAbiMinor = 4;
 
 constexpr size_t kMaxExecImageSize = 512 * 1024;
 alignas(16) uint8_t g_exec_buffer[kMaxExecImageSize];
@@ -42,6 +42,26 @@ public:
     ExecImageGuard& operator=(const ExecImageGuard&) = delete;
 };
 
+class PrincipalRefGuard {
+public:
+    explicit PrincipalRefGuard(capabilities::Principal* principal)
+        : principal_(principal) {}
+    ~PrincipalRefGuard() {
+        capabilities::principal_release(principal_);
+    }
+    PrincipalRefGuard(const PrincipalRefGuard&) = delete;
+    PrincipalRefGuard& operator=(const PrincipalRefGuard&) = delete;
+
+    capabilities::Principal* release() {
+        capabilities::Principal* principal = principal_;
+        principal_ = nullptr;
+        return principal;
+    }
+
+private:
+    capabilities::Principal* principal_;
+};
+
 struct ProcessStdioConfig {
     uint32_t stdin_handle;
     uint32_t stdout_handle;
@@ -52,7 +72,11 @@ struct ProcessStdioConfig {
 struct ProcessSpawnConfig {
     uint64_t cwd_ptr;
     ProcessStdioConfig stdio;
+    uint64_t principal_handle;
 };
+
+static_assert(sizeof(ProcessSpawnConfig) == 32,
+              "ProcessSpawnConfig size mismatch");
 
 struct UserInfo {
     uint64_t id_machine;
@@ -67,6 +91,7 @@ struct UserInfo {
 static_assert(sizeof(UserInfo) == 72, "UserInfo size mismatch");
 
 constexpr uint64_t kProcessChildFlagStdioConfig = 1ull << 0;
+constexpr uint64_t kProcessSpawnFlagPrincipalConfig = 1ull << 1;
 
 [[noreturn]] void halt_forever() {
     asm volatile("cli");
@@ -208,6 +233,73 @@ bool require_capability(process::Process& proc,
     return false;
 }
 
+bool prepare_spawn_config(process::Process& parent,
+                          const SyscallFrame& frame,
+                          uint64_t flags,
+                          bool allow_stdio,
+                          const char*& cwd,
+                          ProcessStdioConfig* stdio,
+                          capabilities::Principal*& child_principal) {
+    const bool has_stdio =
+        allow_stdio && (flags & kProcessChildFlagStdioConfig) != 0;
+    const bool has_principal =
+        (flags & kProcessSpawnFlagPrincipalConfig) != 0;
+    child_principal = parent.principal;
+    if (!has_stdio && !has_principal) {
+        return capabilities::principal_add_ref(child_principal);
+    }
+
+    auto* config_user =
+        reinterpret_cast<const ProcessSpawnConfig*>(frame.r10);
+    if (config_user == nullptr) {
+        return false;
+    }
+
+    uint64_t cwd_ptr = 0;
+    if (!vm::copy_from_user(parent.cr3,
+                            &cwd_ptr,
+                            reinterpret_cast<uint64_t>(&config_user->cwd_ptr),
+                            sizeof(cwd_ptr))) {
+        return false;
+    }
+    cwd = reinterpret_cast<const char*>(cwd_ptr);
+
+    if (has_stdio &&
+        (stdio == nullptr ||
+         !vm::copy_from_user(parent.cr3,
+                             stdio,
+                             reinterpret_cast<uint64_t>(&config_user->stdio),
+                             sizeof(*stdio)))) {
+        return false;
+    }
+
+    if (!has_principal) {
+        return capabilities::principal_add_ref(child_principal);
+    }
+    // SecurityManage is the kernel's explicit impersonation authority; the
+    // same permission is required by PrincipalSet and PrincipalCreate.
+    if (!require_capability(parent,
+                            capabilities::CapabilityKind::SecurityManage,
+                            frame)) {
+        return false;
+    }
+    uint64_t principal_handle = 0;
+    if (!vm::copy_from_user(
+            parent.cr3,
+            &principal_handle,
+            reinterpret_cast<uint64_t>(&config_user->principal_handle),
+            sizeof(principal_handle))) {
+        return false;
+    }
+    capabilities::Principal* requested =
+        capabilities::principal_acquire_from_handle(principal_handle);
+    if (requested == nullptr) {
+        return false;
+    }
+    child_principal = requested;
+    return true;
+}
+
 bool load_program_image(const char* path, loader::ProgramImage& out_image) {
     if (path == nullptr) {
         return false;
@@ -259,18 +351,37 @@ bool descriptor_type_requires_hardware_access(uint32_t type) {
            type == descriptor::kTypeBlockDevice ||
            type == descriptor::kTypeDisk ||
            type == descriptor::kTypePartition ||
-           type == descriptor::kTypeNetDevice;
+           type == descriptor::kTypeNetDevice ||
+           type == descriptor::kTypePci ||
+           type == descriptor::kTypeAudioOutput;
 }
 
 bool descriptor_type_requires_monitor_access(uint32_t type) {
     return type == descriptor::kTypeCpuStats ||
-           type == descriptor::kTypeTaskStats;
+           type == descriptor::kTypeTaskStats ||
+           type == descriptor::kTypeKernelLog ||
+           type == descriptor::kTypeSensor;
 }
 
 bool descriptor_type_requires_stream_access(uint32_t type) {
     return type == descriptor::kTypePipe ||
            type == descriptor::kTypeSharedMemory ||
-           type == descriptor::kTypeNetEndpoint;
+           type == descriptor::kTypeNetEndpoint ||
+           type == descriptor::kTypeVty;
+}
+
+bool descriptor_type_requires_graphical_session_access(uint32_t type) {
+    return type == descriptor::kTypeGraphicalSession ||
+           type == descriptor::kTypeFramebuffer;
+}
+
+bool console_property_requires_settings_access(uint32_t property) {
+    return property == static_cast<uint32_t>(
+                           descriptor_defs::Property::ConsoleKernelLog) ||
+           property == static_cast<uint32_t>(
+                           descriptor_defs::Property::ConsoleScale) ||
+           property == static_cast<uint32_t>(
+                           descriptor_defs::Property::ConsoleFont);
 }
 
 uint32_t duplicate_stream_descriptor(process::Process& from,
@@ -296,12 +407,11 @@ uint32_t duplicate_stream_descriptor(process::Process& from,
 
     if (type == descriptor::kTypePipe) {
         descriptor_defs::PipeInfo info{};
-        if (descriptor::get_property(
-                from,
+        if (descriptor::get_property_trusted(
                 from.descriptors,
                 handle,
                 static_cast<uint32_t>(descriptor_defs::Property::PipeInfo),
-                reinterpret_cast<uint64_t>(&info),
+                &info,
                 sizeof(info)) != 0 ||
             info.id == 0) {
             return descriptor::kInvalidHandle;
@@ -317,12 +427,11 @@ uint32_t duplicate_stream_descriptor(process::Process& from,
 
     if (type == descriptor::kTypeNetEndpoint) {
         descriptor_defs::NetEndpointInfo info{};
-        if (descriptor::get_property(
-                from,
+        if (descriptor::get_property_trusted(
                 from.descriptors,
                 handle,
                 static_cast<uint32_t>(descriptor_defs::Property::NetEndpointInfo),
-                reinterpret_cast<uint64_t>(&info),
+                &info,
                 sizeof(info)) != 0 ||
             info.id == 0) {
             return descriptor::kInvalidHandle;
@@ -342,23 +451,28 @@ uint32_t duplicate_stream_descriptor(process::Process& from,
 
     if (type == descriptor::kTypeVty) {
         descriptor_defs::VtyInfo info{};
-        if (descriptor::get_property(
-                from,
+        if (descriptor::get_property_trusted(
                 from.descriptors,
                 handle,
                 static_cast<uint32_t>(descriptor_defs::Property::VtyInfo),
-                reinterpret_cast<uint64_t>(&info),
+                &info,
                 sizeof(info)) != 0 ||
             info.id == 0) {
             return descriptor::kInvalidHandle;
         }
-        return descriptor::open_at(to,
-                                   to.descriptors,
-                                   target_index,
-                                   descriptor::kTypeVty,
-                                   info.id,
-                                   flags,
-                                   0);
+        uint32_t previous_vty = to.vty_id;
+        to.vty_id = info.id;
+        uint32_t duplicate = descriptor::open_at(to,
+                                                 to.descriptors,
+                                                 target_index,
+                                                 descriptor::kTypeVty,
+                                                 info.id,
+                                                 flags,
+                                                 0);
+        if (duplicate == descriptor::kInvalidHandle) {
+            to.vty_id = previous_vty;
+        }
+        return duplicate;
     }
 
     return descriptor::kInvalidHandle;
@@ -436,7 +550,7 @@ Result handle_syscall(SyscallFrame& frame) {
                 ticks > UINT64_MAX - now_ticks ? UINT64_MAX
                                                 : now_ticks + ticks;
             proc->waiting_on = nullptr;
-            proc->state = process::State::Blocked;
+            process::store_state(*proc, process::State::Blocked);
             frame.rax = 0;
             return Result::Reschedule;
         }
@@ -468,6 +582,14 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            if (descriptor_type_requires_graphical_session_access(type) &&
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::GraphicalSession,
+                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             uint32_t handle =
                 descriptor::open(*proc,
                                  proc->descriptors,
@@ -495,9 +617,6 @@ Result handle_syscall(SyscallFrame& frame) {
                                               frame.r10);
             if (result == descriptor::kWouldBlock) {
                 frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
-                if (proc->state != process::State::Blocked) {
-                    return Result::Continue;
-                }
                 return Result::Reschedule;
             }
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
@@ -518,9 +637,6 @@ Result handle_syscall(SyscallFrame& frame) {
                                                frame.r10);
             if (result == descriptor::kWouldBlock) {
                 frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
-                if (proc->state != process::State::Blocked) {
-                    return Result::Continue;
-                }
                 return Result::Reschedule;
             }
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
@@ -611,11 +727,26 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            uint32_t handle =
+                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu);
+            uint32_t property =
+                static_cast<uint32_t>(frame.rsi & 0xFFFFFFFFu);
+            uint16_t type = 0;
+            if (descriptor::get_type(proc->descriptors, handle, type) &&
+                type == descriptor::kTypeConsole &&
+                console_property_requires_settings_access(property) &&
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::SysSettingsWrite,
+                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             int result = descriptor::set_property(
                 *proc,
                 proc->descriptors,
-                static_cast<uint32_t>(frame.rdi & 0xFFFFFFFFu),
-                static_cast<uint32_t>(frame.rsi & 0xFFFFFFFFu),
+                handle,
+                property,
                 frame.rdx,
                 frame.r10);
             frame.rax = (result == 0) ? 0 : static_cast<uint64_t>(-1);
@@ -634,9 +765,6 @@ Result handle_syscall(SyscallFrame& frame) {
             if (result == descriptor::kWouldBlock) {
                 frame.rax = static_cast<uint64_t>(
                     static_cast<int64_t>(result));
-                if (proc->state != process::State::Blocked) {
-                    return Result::Continue;
-                }
                 return Result::Reschedule;
             }
             frame.rax = static_cast<uint64_t>(static_cast<int64_t>(result));
@@ -907,6 +1035,18 @@ Result handle_syscall(SyscallFrame& frame) {
             const char* args = reinterpret_cast<const char*>(frame.rsi);
             uint64_t flags = frame.rdx;
             const char* cwd_user = reinterpret_cast<const char*>(frame.r10);
+            capabilities::Principal* child_principal = nullptr;
+            if (!prepare_spawn_config(*proc,
+                                      frame,
+                                      flags,
+                                      false,
+                                      cwd_user,
+                                      nullptr,
+                                      child_principal)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            PrincipalRefGuard child_principal_ref(child_principal);
 
             if (path_user == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
@@ -949,10 +1089,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->exit_code = 0;
             child->has_exited = false;
             child->vty_id = proc->vty_id;
-            child->principal = proc->principal;
-            if (child->principal != nullptr) {
-                capabilities::principal_add_ref(child->principal);
-            }
+            child->principal = child_principal_ref.release();
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
@@ -992,18 +1129,18 @@ Result handle_syscall(SyscallFrame& frame) {
             child->context.user_rflags = 0x202;
             child->context.r11 = 0x202;
             child->context.rdi = arg_ptr;
-            child->context.rsi = flags;
+            child->context.rsi =
+                flags & ~kProcessSpawnFlagPrincipalConfig;
             child->context.rax = 0;
             child->has_context = true;
 
             child->preferred_cpu = pick_child_cpu(proc);
-            child->state = process::State::Ready;
-            scheduler::enqueue(child);
-
             proc->waiting_on = child;
-            proc->state = process::State::Blocked;
+            process::store_state(*proc, process::State::Blocked);
             bool transferred = descriptor::transfer_console_owner(*proc, *child);
             proc->console_transferred = transferred;
+            process::store_state(*child, process::State::Ready);
+            scheduler::enqueue(child);
             frame.rax = 0;
             return Result::Reschedule;
         }
@@ -1025,29 +1162,18 @@ Result handle_syscall(SyscallFrame& frame) {
             bool has_stdio_config =
                 (flags & kProcessChildFlagStdioConfig) != 0;
             ProcessStdioConfig stdio{};
-            if (has_stdio_config) {
-                auto* config_user =
-                    reinterpret_cast<const ProcessSpawnConfig*>(frame.r10);
-                if (config_user == nullptr ||
-                    !vm::copy_from_user(proc->cr3,
-                                        &stdio,
-                                        reinterpret_cast<uint64_t>(
-                                            &config_user->stdio),
-                                        sizeof(stdio))) {
-                    frame.rax = static_cast<uint64_t>(-1);
-                    return Result::Continue;
-                }
-                uint64_t cwd_ptr = 0;
-                if (!vm::copy_from_user(proc->cr3,
-                                        &cwd_ptr,
-                                        reinterpret_cast<uint64_t>(
-                                            &config_user->cwd_ptr),
-                                        sizeof(cwd_ptr))) {
-                    frame.rax = static_cast<uint64_t>(-1);
-                    return Result::Continue;
-                }
-                cwd_user = reinterpret_cast<const char*>(cwd_ptr);
+            capabilities::Principal* child_principal = nullptr;
+            if (!prepare_spawn_config(*proc,
+                                      frame,
+                                      flags,
+                                      true,
+                                      cwd_user,
+                                      &stdio,
+                                      child_principal)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
             }
+            PrincipalRefGuard child_principal_ref(child_principal);
 
             if (path_user == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
@@ -1090,10 +1216,7 @@ Result handle_syscall(SyscallFrame& frame) {
             child->exit_code = 0;
             child->has_exited = false;
             child->vty_id = proc->vty_id;
-            child->principal = proc->principal;
-            if (child->principal != nullptr) {
-                capabilities::principal_add_ref(child->principal);
-            }
+            child->principal = child_principal_ref.release();
             char child_cwd_buffer[path_util::kMaxPathLength];
             bool child_cwd_valid = false;
             if (cwd_user != nullptr) {
@@ -1136,12 +1259,14 @@ Result handle_syscall(SyscallFrame& frame) {
             child->context.user_rflags = 0x202;
             child->context.r11 = 0x202;
             child->context.rdi = arg_ptr;
-            child->context.rsi = flags & ~kProcessChildFlagStdioConfig;
+            child->context.rsi =
+                flags & ~(kProcessChildFlagStdioConfig |
+                          kProcessSpawnFlagPrincipalConfig);
             child->context.rax = 0;
             child->has_context = true;
 
             child->preferred_cpu = pick_child_cpu(proc);
-            child->state = process::State::Ready;
+            process::store_state(*child, process::State::Ready);
             scheduler::enqueue(child);
 
             frame.rax = static_cast<uint64_t>(child->pid);
@@ -1346,6 +1471,46 @@ Result handle_syscall(SyscallFrame& frame) {
                             : static_cast<uint64_t>(-1);
             return Result::Continue;
         }
+        case SystemCall::FileGetAcl: {
+            process::Process* proc = process::current();
+            if (proc == nullptr ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::SecurityManage,
+                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = static_cast<uint64_t>(file_io::get_acl(
+                *proc,
+                reinterpret_cast<const char*>(frame.rdi),
+                frame.rsi,
+                frame.rdx));
+            return Result::Continue;
+        }
+        case SystemCall::FileSetAcl: {
+            process::Process* proc = process::current();
+            if (proc == nullptr ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::SecurityManage,
+                    frame) ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::FileSystemWrite,
+                    frame)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
+            frame.rax = file_io::set_acl(
+                            *proc,
+                            reinterpret_cast<const char*>(frame.rdi),
+                            frame.rsi,
+                            frame.rdx)
+                            ? 0
+                            : static_cast<uint64_t>(-1);
+            return Result::Continue;
+        }
         case SystemCall::DirectoryRemove: {
             process::Process* proc = process::current();
             if (proc == nullptr) {
@@ -1490,17 +1655,17 @@ Result handle_syscall(SyscallFrame& frame) {
         }
         case SystemCall::ChangeSlot: {
             process::Process* proc = process::current();
-            if (proc == nullptr) {
-                frame.rax = static_cast<uint64_t>(-1);
-                return Result::Continue;
-            }
-            if (descriptor::framebuffer_active_slot() != 0) {
+            if (proc == nullptr ||
+                !require_capability(
+                    *proc,
+                    capabilities::CapabilityKind::GraphicalSession,
+                    frame)) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
             uint32_t slot = static_cast<uint32_t>(frame.rdi);
-            descriptor::framebuffer_select(slot);
-            frame.rax = descriptor::framebuffer_is_active(slot)
+            frame.rax = descriptor::framebuffer_activate_for_process(*proc,
+                                                                      slot)
                             ? 0
                             : static_cast<uint64_t>(-1);
             return Result::Continue;
@@ -1534,12 +1699,12 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            auto* principal = capabilities::principal_from_handle(frame.rdi);
-            if (!capabilities::principal_is_valid(principal)) {
+            auto* principal =
+                capabilities::principal_acquire_from_handle(frame.rdi);
+            if (principal == nullptr) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
-            capabilities::principal_add_ref(principal);
             if (proc->principal != nullptr) {
                 capabilities::principal_release(proc->principal);
             }
@@ -1574,6 +1739,7 @@ Result handle_syscall(SyscallFrame& frame) {
                                                 capabilities::kMaxProcessCapabilities,
                                                 token,
                                                 handle)) {
+                capabilities::discard_unreferenced_token(token);
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
@@ -1730,19 +1896,24 @@ Result handle_syscall(SyscallFrame& frame) {
                 frame.rax = static_cast<uint64_t>(-1);
                 return Result::Continue;
             }
+            users::UserInfo snapshot{};
+            if (!users::snapshot_info(*user, snapshot)) {
+                frame.rax = static_cast<uint64_t>(-1);
+                return Result::Continue;
+            }
             syscall::UserInfo info{};
-            info.id_machine = user->id.machine;
-            info.id_local = user->id.local;
+            info.id_machine = snapshot.id_machine;
+            info.id_local = snapshot.id_local;
             for (size_t i = 0; i < sizeof(info.name); ++i) {
-                info.name[i] = user->name[i];
-                if (user->name[i] == '\0') {
+                info.name[i] = snapshot.name[i];
+                if (snapshot.name[i] == '\0') {
                     break;
                 }
             }
-            info.allowed_caps = user->allowed_caps;
-            info.generation = user->generation;
-            info.password_set = user->password_set ? 1u : 0u;
-            info.active = user->active ? 1u : 0u;
+            info.allowed_caps = snapshot.allowed_caps;
+            info.generation = snapshot.generation;
+            info.password_set = snapshot.password_set;
+            info.active = snapshot.active;
             if (!vm::copy_to_user(proc->cr3,
                                   reinterpret_cast<uint64_t>(user_info),
                                   &info,

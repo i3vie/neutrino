@@ -108,17 +108,17 @@ void pci_probe_worker(process::Process& proc) {
             log_message(LogLevel::Debug,
                         "DriverRegistry: no PCI match for %s",
                         entry.name);
-            proc.state = process::State::Ready;
+            process::store_state(proc, process::State::Ready);
             return;
         }
 
         log_message(LogLevel::Info, "Initializing %s", entry.name);
         entry.init();
-        proc.state = process::State::Ready;
+        process::store_state(proc, process::State::Ready);
         return;
     }
 
-    proc.state = process::State::Blocked;
+    process::store_state(proc, process::State::Blocked);
 }
 
 }  // namespace

@@ -25,6 +25,10 @@ namespace descriptor_keyboard {
 bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
 }
 
+namespace descriptor_mouse {
+bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
+}
+
 namespace descriptor_vty {
 bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents);
 }
@@ -33,6 +37,8 @@ namespace {
 
 process::Process g_kernel_process{};
 bool g_kernel_process_initialized = false;
+process::Process* g_waiter_worker = nullptr;
+uint32_t g_waiters_pending = 0;
 
 process::Process& kernel_process() {
     if (!g_kernel_process_initialized) {
@@ -137,6 +143,8 @@ bool query_entry_wait(DescriptorEntry& entry,
             return descriptor_net_device::query_wait(entry, events, revents);
         case kTypeKeyboard:
             return descriptor_keyboard::query_wait(entry, events, revents);
+        case kTypeMouse:
+            return descriptor_mouse::query_wait(entry, events, revents);
         case kTypeVty:
             return descriptor_vty::query_wait(entry, events, revents);
         case kTypeConsole:
@@ -290,7 +298,9 @@ uint32_t install_at(process::Process& proc,
         if (entry.close != nullptr) {
             entry.close(entry);
         }
-        reset_entry(entry, false);
+        // Replacing a live descriptor must invalidate every old handle for
+        // this slot before publishing the replacement.
+        reset_entry(entry, true);
     }
     uint16_t generation = entry.generation;
     if (generation == 0) {
@@ -531,21 +541,13 @@ bool get_flags(const Table& table,
     return true;
 }
 
-int get_property(process::Process& proc,
-                 Table& table,
-                 uint32_t handle,
-                 uint32_t property,
-                 uint64_t out_ptr,
-                 uint64_t size) {
-    (void)proc;
+int get_property_trusted(Table& table,
+                         uint32_t handle,
+                         uint32_t property,
+                         void* out,
+                         size_t out_size) {
     DescriptorEntry* entry = lookup_entry(table, handle);
     if (entry == nullptr) {
-        return -1;
-    }
-    void* out = reinterpret_cast<void*>(out_ptr);
-    size_t out_size = static_cast<size_t>(size);
-    if (!is_kernel_process(proc) &&
-        !vm::validate_user_buffer(proc.cr3, out_ptr, out_size, true)) {
         return -1;
     }
     if (property ==
@@ -570,6 +572,24 @@ int get_property(process::Process& proc,
         return -1;
     }
     return entry->ops->get_property(*entry, property, out, out_size);
+}
+
+int get_property(process::Process& proc,
+                 Table& table,
+                 uint32_t handle,
+                 uint32_t property,
+                 uint64_t out_ptr,
+                 uint64_t size) {
+    size_t out_size = static_cast<size_t>(size);
+    if (!is_kernel_process(proc) &&
+        !vm::validate_user_buffer(proc.cr3, out_ptr, out_size, true)) {
+        return -1;
+    }
+    return get_property_trusted(table,
+                                handle,
+                                property,
+                                reinterpret_cast<void*>(out_ptr),
+                                out_size);
 }
 
 int set_property(process::Process& proc,
@@ -635,15 +655,41 @@ int wait(process::Process& proc,
     proc.wait_descriptors_user = user_address;
     proc.wait_descriptor_count = static_cast<uint32_t>(count);
     proc.waiting_on = nullptr;
-    proc.state = process::State::Blocked;
+    process::store_state(proc, process::State::Blocked);
+
+    // Close the registration race with an IRQ or another producer.  An event
+    // can become ready after the first evaluation but before the process is
+    // visibly Blocked; a waiter-worker pass in that window cannot wake us.
+    // Once Blocked is published, rechecking either observes that event or
+    // leaves any later producer able to wake the registered waiter normally.
+    ready = evaluate_waits(table, proc.wait_descriptors, count);
+    if (ready != 0) {
+        process::State expected = process::State::Blocked;
+        if (!process::compare_exchange_state(proc,
+                                             expected,
+                                             process::State::Running)) {
+            return kWouldBlock;
+        }
+        int result = ready;
+        if (ready > 0 &&
+            !vm::copy_to_user(proc.cr3,
+                              user_address,
+                              proc.wait_descriptors,
+                              count * sizeof(proc.wait_descriptors[0]))) {
+            result = -1;
+        }
+        proc.wait_descriptors_user = 0;
+        proc.wait_descriptor_count = 0;
+        return result;
+    }
     return kWouldBlock;
 }
 
-void wake_waiters() {
+void service_waiters() {
     for (size_t i = 0; i < process::kMaxProcesses; ++i) {
         process::Process* proc = process::table_entry(i);
         if (proc == nullptr ||
-            proc->state != process::State::Blocked ||
+            process::load_state(*proc) != process::State::Blocked ||
             proc->wait_descriptor_count == 0) {
             continue;
         }
@@ -653,6 +699,9 @@ void wake_waiters() {
                                    proc->wait_descriptors,
                                    count);
         if (ready <= 0) {
+            continue;
+        }
+        if (!process::begin_wake(*proc)) {
             continue;
         }
 
@@ -667,11 +716,49 @@ void wake_waiters() {
         proc->wait_descriptors_user = 0;
         proc->wait_descriptor_count = 0;
         proc->waiting_on = nullptr;
-        proc->context.rax =
-            static_cast<uint64_t>(static_cast<int64_t>(result));
-        proc->state = process::State::Ready;
-        scheduler::enqueue(proc);
+        process::finish_wake_with_result(*proc, result);
     }
+}
+
+void waiter_worker(process::Process& worker) {
+    while (__atomic_exchange_n(&g_waiters_pending,
+                               static_cast<uint32_t>(0),
+                               __ATOMIC_ACQ_REL) != 0) {
+        service_waiters();
+    }
+
+    // Publish Blocked before the final pending check.  A concurrent IRQ either
+    // observes Blocked and enqueues us, or its pending bit makes us remain
+    // Ready when this callback returns.
+    worker.waiting_on = nullptr;
+    process::store_state(worker, process::State::Blocked);
+    if (__atomic_load_n(&g_waiters_pending, __ATOMIC_ACQUIRE) != 0) {
+        (void)process::wake(worker);
+    }
+}
+
+void wake_waiters() {
+    __atomic_store_n(&g_waiters_pending,
+                     static_cast<uint32_t>(1),
+                     __ATOMIC_RELEASE);
+    process::Process* worker =
+        __atomic_load_n(&g_waiter_worker, __ATOMIC_ACQUIRE);
+    if (worker != nullptr) {
+        (void)process::wake(*worker);
+    }
+}
+
+void start_waiter_worker() {
+    if (__atomic_load_n(&g_waiter_worker, __ATOMIC_ACQUIRE) != nullptr) {
+        return;
+    }
+    process::Process* worker = process::allocate_kernel_task(waiter_worker);
+    if (worker == nullptr) {
+        return;
+    }
+    worker->preferred_cpu = 0;
+    __atomic_store_n(&g_waiter_worker, worker, __ATOMIC_RELEASE);
+    scheduler::enqueue(worker);
 }
 
 uint32_t open_kernel(uint32_t type,

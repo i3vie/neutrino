@@ -7,9 +7,12 @@ constexpr uint64_t PAGE_FLAG_WRITE_THROUGH = 1ull << 3;
 constexpr uint64_t PAGE_FLAG_CACHE_DISABLE = 1ull << 4;
 constexpr uint64_t PAGE_FLAG_WRITE_COMBINING = 1ull << 7;
 constexpr uint64_t PAGE_FLAG_GLOBAL = 1ull << 8;
+// Software-owned bit: the kernel allocated this user page and may reclaim it.
+constexpr uint64_t PAGE_FLAG_MANAGED = 1ull << 9;
 constexpr uint64_t PAGE_FLAG_NO_EXECUTE = 1ull << 63;
 
 void paging_init();
+bool paging_finish_smp_bootstrap();
 bool paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 uint64_t paging_virt_to_phys(uint64_t virt);
 void* paging_alloc_page();

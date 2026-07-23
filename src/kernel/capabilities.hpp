@@ -19,11 +19,13 @@ enum class CapabilityKind : uint16_t {
     Monitor = 6,
     FileSystemWrite = 7,
     ModuleLoad = 8,
+    GraphicalSession = 9,
     Count,
 };
 
 struct Principal {
     void* backing_user;  // optional user pointer (users::User*), may be null
+    uint64_t backing_generation_snapshot;
     uint64_t generation;
     CapabilityMask allowed_caps;
     uint32_t refcount;
@@ -34,6 +36,7 @@ struct CapabilityToken {
     Principal* issuer;
     CapabilityKind kind;
     uint64_t generation_snapshot;
+    uint32_t refcount;
 };
 
 // Per-process handle table entry. Handles are process-local opaque 64-bit ids.
@@ -50,12 +53,17 @@ constexpr size_t kMaxProcessCapabilities = 32;
 void init();
 
 Principal* create_principal(void* backing_user, CapabilityMask allowed_caps);
-void principal_add_ref(Principal* principal);
+bool principal_add_ref(Principal* principal);
 void principal_release(Principal* principal);
 void principal_bump_generation(Principal& principal);
 bool principal_allows(const Principal& principal, CapabilityKind kind);
 bool principal_is_valid(const Principal* principal);
+bool principal_user_id(const Principal* principal,
+                       uint64_t& out_machine_id,
+                       uint64_t& out_local_id);
 Principal* principal_from_handle(uint64_t handle);
+// Resolve a handle and retain the principal as one atomic pool operation.
+Principal* principal_acquire_from_handle(uint64_t handle);
 uint64_t principal_handle(const Principal* principal);
 bool capability_from_value(uint64_t value, CapabilityKind& out_kind);
 inline uint64_t capability_bit(CapabilityKind kind) {
@@ -79,6 +87,7 @@ inline bool principal_allows_or_unconfined(const Principal* principal,
 }
 
 CapabilityToken* issue_token(Principal& issuer, CapabilityKind kind);
+void discard_unreferenced_token(CapabilityToken* token);
 bool token_valid(const CapabilityToken& token);
 
 bool cap_table_insert(CapHandleEntry* table,

@@ -25,6 +25,9 @@ struct SyscallFrame {
     uint64_t user_rflags;
 };
 
+bool valid_user_return_state(uint64_t rip, uint64_t rsp);
+uint64_t sanitize_user_rflags(uint64_t rflags);
+
 void init();
 enum class Result {
     Continue,

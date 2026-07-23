@@ -5,6 +5,7 @@
 
 #include "capabilities.hpp"
 #include "string_util.hpp"
+#include "sync.hpp"
 #include "time.hpp"
 #include "../fs/vfs.hpp"
 #include "../lib/mem.hpp"
@@ -17,15 +18,45 @@ users::User g_users[users::kMaxUsers];
 char g_storage_path[128];
 char g_storage_path_fallback[128];
 bool g_has_storage_path = false;
-bool g_loading_from_disk = false;
+bool g_user_database_loading = false;
 users::UserId g_machine_id = {0, 0};
 uint64_t g_next_user_id = 1;
+sync::SpinLock g_user_lock;
+sync::SpinLock g_persist_lock;
+
+class LockGuard {
+public:
+    explicit LockGuard(sync::SpinLock& lock) : lock_(lock) { lock_.lock(); }
+    ~LockGuard() { lock_.unlock(); }
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+
+private:
+    sync::SpinLock& lock_;
+};
+
+class UserLoadGuard {
+public:
+    UserLoadGuard() {
+        __atomic_store_n(&g_user_database_loading, true, __ATOMIC_RELEASE);
+    }
+    ~UserLoadGuard() {
+        __atomic_store_n(&g_user_database_loading, false, __ATOMIC_RELEASE);
+    }
+    UserLoadGuard(const UserLoadGuard&) = delete;
+    UserLoadGuard& operator=(const UserLoadGuard&) = delete;
+};
+
+bool user_database_loading() {
+    return __atomic_load_n(&g_user_database_loading, __ATOMIC_ACQUIRE);
+}
 
 constexpr uint32_t kMagic = 0x4E544455;  // 'NTDU'
 constexpr uint16_t kVersion = 3;
 constexpr uint16_t kLegacyVersion = 2;
 constexpr uint16_t kLegacyVersion1 = 1;
 constexpr uint64_t kLegacyAllCapabilities = (1ull << 3) - 1;
+constexpr uint32_t kMaxPasswordIterations = 1000000;
 
 struct PackedUserV1 {
     char name[32];
@@ -72,6 +103,85 @@ struct Header {
 };
 
 static_assert(sizeof(Header) == 32, "Header size changed");
+
+struct UserStore {
+    Header header;
+    PackedUser users[users::kMaxUsers];
+};
+
+constexpr size_t kUserStoreBufferSize =
+    sizeof(Header) + sizeof(PackedUser) * users::kMaxUsers;
+static_assert(sizeof(UserStore) == kUserStoreBufferSize,
+              "UserStore layout changed");
+
+bool valid_user_name(const char* name) {
+    if (name == nullptr) {
+        return false;
+    }
+    size_t length = 0;
+    while (length < sizeof(users::User::name) && name[length] != '\0') {
+        unsigned char ch = static_cast<unsigned char>(name[length]);
+        if (ch < 0x20 || ch == 0x7F || ch == '/' || ch == '\\') {
+            return false;
+        }
+        ++length;
+    }
+    if (length == 0 || length >= sizeof(users::User::name)) {
+        return false;
+    }
+    return !(length == 1 && name[0] == '.') &&
+           !(length == 2 && name[0] == '.' && name[1] == '.');
+}
+
+bool copy_packed_user_name(const char* source,
+                           size_t source_size,
+                           char (&out)[sizeof(users::User::name)]) {
+    if (source == nullptr || source_size == 0) {
+        return false;
+    }
+    size_t length = 0;
+    while (length < source_size && source[length] != '\0') {
+        ++length;
+    }
+    if (length == source_size || length >= sizeof(out)) {
+        return false;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        out[i] = source[i];
+    }
+    out[length] = '\0';
+    return valid_user_name(out);
+}
+
+bool user_index(const users::User* user, size_t& out_index) {
+    if (user == nullptr) {
+        return false;
+    }
+    uintptr_t address = reinterpret_cast<uintptr_t>(user);
+    uintptr_t begin = reinterpret_cast<uintptr_t>(&g_users[0]);
+    uintptr_t end =
+        reinterpret_cast<uintptr_t>(&g_users[users::kMaxUsers]);
+    if (address < begin || address >= end) {
+        return false;
+    }
+    uintptr_t offset = address - begin;
+    if ((offset % sizeof(users::User)) != 0) {
+        return false;
+    }
+    out_index = static_cast<size_t>(offset / sizeof(users::User));
+    return true;
+}
+
+users::User* find_name_locked(const char* name) {
+    for (size_t i = 0; i < users::kMaxUsers; ++i) {
+        users::User& user = g_users[i];
+        if (__atomic_load_n(&user.active, __ATOMIC_ACQUIRE) &&
+            string_util::equals(user.name, name)) {
+            return &user;
+        }
+    }
+    return nullptr;
+}
 
 static bool path_valid() {
     return g_has_storage_path && g_storage_path[0] != '\0';
@@ -256,11 +366,13 @@ void ensure_home_directory(const char* name) {
     ensure_directory(user_home);
 }
 
-uint64_t upgrade_legacy_caps(uint64_t stored_caps, bool& upgraded) {
+uint64_t normalize_stored_caps(uint64_t stored_caps,
+                               bool legacy_encoding,
+                               bool& upgraded) {
     if (stored_caps == capabilities::kFullPermissions) {
         return stored_caps;
     }
-    if (stored_caps == kLegacyAllCapabilities) {
+    if (legacy_encoding && stored_caps == kLegacyAllCapabilities) {
         upgraded = true;
         return capabilities::kFullPermissions;
     }
@@ -271,96 +383,108 @@ uint64_t upgrade_legacy_caps(uint64_t stored_caps, bool& upgraded) {
     return normalized;
 }
 
-}  // namespace
-
-namespace users {
-
-void init() {
-    for (size_t i = 0; i < kMaxUsers; ++i) {
-        g_users[i].active = false;
-        g_users[i].allowed_caps = 0;
-        g_users[i].generation = 0;
+void reset_user_pool() {
+    sync::IrqLockGuard guard(g_user_lock);
+    for (size_t i = 0; i < users::kMaxUsers; ++i) {
+        __atomic_store_n(&g_users[i].active, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_users[i].allowed_caps, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_users[i].generation, 0, __ATOMIC_RELAXED);
         g_users[i].password_iterations = 0;
         g_users[i].password_set = false;
-        memset(g_users[i].password_salt, 0, sizeof(g_users[i].password_salt));
-        memset(g_users[i].password_hash, 0, sizeof(g_users[i].password_hash));
+        memset(g_users[i].password_salt,
+               0,
+               sizeof(g_users[i].password_salt));
+        memset(g_users[i].password_hash,
+               0,
+               sizeof(g_users[i].password_hash));
         g_users[i].name[0] = '\0';
         g_users[i].id.machine = 0;
         g_users[i].id.local = 0;
-    }
-    if (g_machine_id.machine == 0 && path_valid()) {
-        load_machine_id();
     }
     if (g_next_user_id == 0) {
         g_next_user_id = 1;
     }
 }
 
-User* create(const char* name, uint64_t allowed_caps) {
-    if (name == nullptr) {
+users::User* create_in_memory(const char* name,
+                              uint64_t allowed_caps,
+                              uint64_t machine) {
+    sync::IrqLockGuard guard(g_user_lock);
+    if (find_name_locked(name) != nullptr) {
         return nullptr;
     }
-    size_t len = string_util::length(name);
-    if (len == 0 || len >= sizeof(g_users[0].name)) {
-        return nullptr;
+    for (size_t i = 0; i < users::kMaxUsers; ++i) {
+        users::User& user = g_users[i];
+        if (__atomic_load_n(&user.active, __ATOMIC_ACQUIRE)) {
+            continue;
+        }
+        string_util::copy(user.name, sizeof(user.name), name);
+        __atomic_store_n(&user.allowed_caps,
+                         allowed_caps,
+                         __ATOMIC_RELAXED);
+        __atomic_store_n(&user.generation, 1, __ATOMIC_RELAXED);
+        user.password_iterations = 0;
+        user.password_set = false;
+        memset(user.password_salt, 0, sizeof(user.password_salt));
+        memset(user.password_hash, 0, sizeof(user.password_hash));
+        user.id.machine = machine;
+        user.id.local = g_next_user_id++;
+        __atomic_store_n(&user.active, true, __ATOMIC_RELEASE);
+        return &user;
     }
-    allowed_caps = capabilities::normalize_mask(allowed_caps);
-    if (find(name) != nullptr) {
-        return nullptr;  // already exists
-    }
+    return nullptr;
+}
+
+}  // namespace
+
+namespace users {
+
+static bool persist_locked();
+
+void init() {
+    LockGuard persist_guard(g_persist_lock);
+    reset_user_pool();
     if (g_machine_id.machine == 0 && path_valid()) {
         load_machine_id();
     }
-    for (size_t i = 0; i < kMaxUsers; ++i) {
-        User& u = g_users[i];
-        if (u.active) {
-            continue;
-        }
-        string_util::copy(u.name, sizeof(u.name), name);
-        u.allowed_caps = allowed_caps;
-        u.generation = 1;
-        u.password_iterations = 0;
-        u.password_set = false;
-        memset(u.password_salt, 0, sizeof(u.password_salt));
-        memset(u.password_hash, 0, sizeof(u.password_hash));
-        u.id.machine = g_machine_id.machine;
-        u.id.local = g_next_user_id++;
-        u.active = true;
-        User* out = &u;
-        ensure_home_directory(u.name);
-        if (!g_loading_from_disk) {
-            if (!persist()) {
-                log_message(LogLevel::Warn, "Users: persist failed after create");
-            }
-        }
-        return out;
+}
+
+User* create(const char* name, uint64_t allowed_caps) {
+    if (!valid_user_name(name)) {
+        return nullptr;
     }
-    return nullptr;
+    allowed_caps = capabilities::normalize_mask(allowed_caps);
+    LockGuard persist_guard(g_persist_lock);
+    if (g_machine_id.machine == 0 && path_valid()) {
+        load_machine_id();
+    }
+    User* out = create_in_memory(name, allowed_caps, g_machine_id.machine);
+    if (out == nullptr) {
+        return nullptr;
+    }
+    ensure_home_directory(out->name);
+    if (!persist_locked()) {
+        log_message(LogLevel::Warn, "Users: persist failed after create");
+    }
+    return out;
 }
 
 User* find(const char* name) {
-    if (name == nullptr) {
+    if (name == nullptr || user_database_loading()) {
         return nullptr;
     }
-    for (size_t i = 0; i < kMaxUsers; ++i) {
-        User& u = g_users[i];
-        if (!u.active) {
-            continue;
-        }
-        if (string_util::equals(u.name, name)) {
-            return &u;
-        }
-    }
-    return nullptr;
+    sync::IrqLockGuard guard(g_user_lock);
+    return find_name_locked(name);
 }
 
 User* find(const UserId& id) {
-    if (id.local == 0) {
+    if (id.local == 0 || user_database_loading()) {
         return nullptr;
     }
+    sync::IrqLockGuard guard(g_user_lock);
     for (size_t i = 0; i < kMaxUsers; ++i) {
         User& u = g_users[i];
-        if (!u.active) {
+        if (!__atomic_load_n(&u.active, __ATOMIC_ACQUIRE)) {
             continue;
         }
         if (u.id.machine == id.machine && u.id.local == id.local) {
@@ -371,18 +495,28 @@ User* find(const UserId& id) {
 }
 
 uint64_t handle_for(const User* user) {
-    if (user == nullptr || !user->active || user->generation == 0) {
+    if (user_database_loading()) {
         return 0;
     }
-    ptrdiff_t index = user - &g_users[0];
-    if (index < 0 || static_cast<size_t>(index) >= kMaxUsers) {
+    sync::IrqLockGuard guard(g_user_lock);
+    size_t index = 0;
+    if (!user_index(user, index) ||
+        !__atomic_load_n(&user->active, __ATOMIC_ACQUIRE)) {
         return 0;
     }
-    return (user->generation << 32) |
+    uint64_t generation =
+        __atomic_load_n(&user->generation, __ATOMIC_ACQUIRE);
+    if (generation == 0) {
+        return 0;
+    }
+    return (generation << 32) |
            (static_cast<uint64_t>(index) + 1u);
 }
 
 User* from_handle(uint64_t handle) {
+    if (user_database_loading()) {
+        return nullptr;
+    }
     uint32_t encoded_index = static_cast<uint32_t>(handle);
     uint64_t generation = handle >> 32;
     if (encoded_index == 0 || generation == 0) {
@@ -392,50 +526,137 @@ User* from_handle(uint64_t handle) {
     if (index >= kMaxUsers) {
         return nullptr;
     }
+    sync::IrqLockGuard guard(g_user_lock);
     User& user = g_users[index];
-    if (!user.active || user.generation != generation) {
+    if (!__atomic_load_n(&user.active, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&user.generation, __ATOMIC_ACQUIRE) != generation) {
         return nullptr;
     }
     return &user;
 }
 
-const UserId& machine_id() {
+UserId machine_id() {
+    LockGuard persist_guard(g_persist_lock);
     return g_machine_id;
 }
 
 void bump_generation(User& user) {
-    if (!user.active) {
+    if (user_database_loading()) {
         return;
     }
-    ++user.generation;
-    if (user.generation == 0) {
-        user.generation = 1;
+    sync::IrqLockGuard guard(g_user_lock);
+    size_t index = 0;
+    if (!user_index(&user, index) ||
+        !__atomic_load_n(&g_users[index].active, __ATOMIC_ACQUIRE)) {
+        return;
     }
+    uint64_t next =
+        __atomic_load_n(&g_users[index].generation, __ATOMIC_RELAXED) + 1;
+    if (next == 0) {
+        next = 1;
+    }
+    __atomic_store_n(&g_users[index].generation, next, __ATOMIC_RELEASE);
     // No persistence required; tokens are ephemeral across restarts.
 }
 
 bool allows(const User& user, uint64_t cap_bitmask) {
-    if (!user.active) {
+    uint64_t generation = 0;
+    if (!active_generation(user, generation)) {
         return false;
     }
-    return capabilities::mask_allows(user.allowed_caps, cap_bitmask);
+    return generation_allows(user, generation, cap_bitmask);
+}
+
+bool active_generation(const User& user, uint64_t& out_generation) {
+    if (user_database_loading() ||
+        !__atomic_load_n(&user.active, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    uint64_t generation =
+        __atomic_load_n(&user.generation, __ATOMIC_ACQUIRE);
+    if (generation == 0 ||
+        !__atomic_load_n(&user.active, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    out_generation = generation;
+    return true;
+}
+
+bool generation_allows(const User& user,
+                       uint64_t expected_generation,
+                       uint64_t cap_bitmask) {
+    if (user_database_loading() || expected_generation == 0 ||
+        !__atomic_load_n(&user.active, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    uint64_t generation_before =
+        __atomic_load_n(&user.generation, __ATOMIC_ACQUIRE);
+    uint64_t allowed_caps =
+        __atomic_load_n(&user.allowed_caps, __ATOMIC_ACQUIRE);
+    uint64_t generation_after =
+        __atomic_load_n(&user.generation, __ATOMIC_ACQUIRE);
+    return generation_before == expected_generation &&
+           generation_after == expected_generation &&
+           __atomic_load_n(&user.active, __ATOMIC_ACQUIRE) &&
+           capabilities::mask_allows(allowed_caps, cap_bitmask);
+}
+
+bool snapshot_info(const User& user, UserInfo& out_info) {
+    if (user_database_loading()) {
+        return false;
+    }
+    sync::IrqLockGuard guard(g_user_lock);
+    size_t index = 0;
+    if (!user_index(&user, index)) {
+        return false;
+    }
+    const User& stored = g_users[index];
+    if (!__atomic_load_n(&stored.active, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    out_info.id_machine = stored.id.machine;
+    out_info.id_local = stored.id.local;
+    string_util::copy(out_info.name, sizeof(out_info.name), stored.name);
+    out_info.allowed_caps =
+        __atomic_load_n(&stored.allowed_caps, __ATOMIC_ACQUIRE);
+    out_info.generation =
+        __atomic_load_n(&stored.generation, __ATOMIC_ACQUIRE);
+    out_info.password_set = stored.password_set ? 1u : 0u;
+    out_info.active = 1;
+    return true;
 }
 
 bool set_password(User& user,
                   const uint8_t* salt,
                   const uint8_t* hash,
                   uint32_t iterations) {
-    if (!user.active || salt == nullptr || hash == nullptr || iterations == 0) {
+    if (user_database_loading() || salt == nullptr || hash == nullptr ||
+        iterations == 0 ||
+        iterations > kMaxPasswordIterations) {
         return false;
     }
-    memcpy(user.password_salt, salt, sizeof(user.password_salt));
-    memcpy(user.password_hash, hash, sizeof(user.password_hash));
-    user.password_iterations = iterations;
-    user.password_set = true;
-    return persist();
+    LockGuard persist_guard(g_persist_lock);
+    if (user_database_loading()) {
+        return false;
+    }
+    {
+        sync::IrqLockGuard guard(g_user_lock);
+        size_t index = 0;
+        if (!user_index(&user, index) ||
+            !__atomic_load_n(&g_users[index].active, __ATOMIC_ACQUIRE)) {
+            return false;
+        }
+        User& stored = g_users[index];
+        memcpy(stored.password_salt, salt, sizeof(stored.password_salt));
+        memcpy(stored.password_hash, hash, sizeof(stored.password_hash));
+        stored.password_iterations = iterations;
+        stored.password_set = true;
+    }
+    return persist_locked();
 }
 
 void set_storage_path(const char* path) {
+    LockGuard persist_guard(g_persist_lock);
     if (path == nullptr) {
         g_has_storage_path = false;
         g_storage_path[0] = '\0';
@@ -475,7 +696,32 @@ void set_storage_path(const char* path) {
     g_has_storage_path = (g_storage_path[0] != '\0');
 }
 
-bool persist() {
+static bool protect_store_acl_locked(const char* path) {
+    if (!vfs::acl_supported(path)) {
+        return true;
+    }
+    UserId root_id{};
+    {
+        sync::IrqLockGuard guard(g_user_lock);
+        User* root = find_name_locked("root");
+        if (root != nullptr) {
+            root_id = root->id;
+        }
+    }
+    if (root_id.local == 0) {
+        return false;
+    }
+    vfs::AclEntry acl{};
+    acl.machine_id = root_id.machine;
+    acl.local_id = root_id.local;
+    acl.write = vfs::AclValue::Allow;
+    acl.read = vfs::AclValue::Allow;
+    acl.delete_permission = vfs::AclValue::Allow;
+    acl.edit = vfs::AclValue::Allow;
+    return vfs::set_acl(path, &acl, 1);
+}
+
+static bool persist_locked() {
     if (!path_valid()) {
         return false;
     }
@@ -486,39 +732,46 @@ bool persist() {
     if (g_storage_path_fallback[0] != '\0') {
         ensure_parent_directories(g_storage_path_fallback);
     }
-    Header hdr{};
+    UserStore store{};
+    Header& hdr = store.header;
     hdr.magic = kMagic;
     hdr.version = kVersion;
     hdr.entry_size = static_cast<uint16_t>(sizeof(PackedUser));
     hdr.count = 0;
-    hdr.next_user_id = g_next_user_id;
-    hdr.machine_id = g_machine_id.machine;
 
-    PackedUser packed[kMaxUsers];
-    for (size_t i = 0; i < kMaxUsers; ++i) {
-        const User& u = g_users[i];
-        if (!u.active) continue;
-        PackedUser& p = packed[hdr.count++];
-        memset(&p, 0, sizeof(p));
-        string_util::copy(p.name, sizeof(p.name), u.name);
-        p.allowed_caps = u.allowed_caps;
-        p.generation = u.generation;
-        p.active = 1;
-        p.password_set = u.password_set ? 1 : 0;
-        p.password_algorithm = u.password_set ? 1 : 0;
-        p.password_iterations = u.password_iterations;
-        memcpy(p.password_salt, u.password_salt, sizeof(p.password_salt));
-        memcpy(p.password_hash, u.password_hash, sizeof(p.password_hash));
-        p.machine_id = u.id.machine;
-        p.local_id = u.id.local;
+    {
+        sync::IrqLockGuard guard(g_user_lock);
+        hdr.next_user_id = g_next_user_id;
+        hdr.machine_id = g_machine_id.machine;
+        for (size_t i = 0; i < kMaxUsers; ++i) {
+            const User& user = g_users[i];
+            if (!__atomic_load_n(&user.active, __ATOMIC_ACQUIRE)) {
+                continue;
+            }
+            PackedUser& packed_user = store.users[hdr.count++];
+            string_util::copy(packed_user.name,
+                              sizeof(packed_user.name),
+                              user.name);
+            packed_user.allowed_caps =
+                __atomic_load_n(&user.allowed_caps, __ATOMIC_ACQUIRE);
+            packed_user.generation =
+                __atomic_load_n(&user.generation, __ATOMIC_ACQUIRE);
+            packed_user.active = 1;
+            packed_user.password_set = user.password_set ? 1 : 0;
+            packed_user.password_algorithm = user.password_set ? 1 : 0;
+            packed_user.password_iterations = user.password_iterations;
+            memcpy(packed_user.password_salt,
+                   user.password_salt,
+                   sizeof(packed_user.password_salt));
+            memcpy(packed_user.password_hash,
+                   user.password_hash,
+                   sizeof(packed_user.password_hash));
+            packed_user.machine_id = user.id.machine;
+            packed_user.local_id = user.id.local;
+        }
     }
 
-    uint8_t buffer[sizeof(Header) + sizeof(PackedUser) * kMaxUsers];
     size_t total = sizeof(Header) + hdr.count * sizeof(PackedUser);
-    memcpy(buffer, &hdr, sizeof(Header));
-    if (hdr.count > 0) {
-        memcpy(buffer + sizeof(Header), packed, hdr.count * sizeof(PackedUser));
-    }
 
     auto write_path = [&](const char* p) -> bool {
         vfs::FileHandle handle{};
@@ -528,9 +781,17 @@ bool persist() {
             }
         }
         size_t written = 0;
-        bool ok = vfs::write_file(handle, 0, buffer, total, written);
+        bool ok = vfs::write_file(
+            handle,
+            0,
+            reinterpret_cast<const uint8_t*>(&store),
+            total,
+            written);
         vfs::close_file(handle);
-        return ok && written == total;
+        if (!ok || written != total) {
+            return false;
+        }
+        return protect_store_acl_locked(p);
     };
 
     if (write_path(g_storage_path)) {
@@ -552,14 +813,20 @@ bool persist() {
     return false;
 }
 
+bool persist() {
+    LockGuard persist_guard(g_persist_lock);
+    return persist_locked();
+}
+
 bool load_from_disk() {
+    LockGuard persist_guard(g_persist_lock);
     if (!path_valid()) {
         return false;
     }
-    g_loading_from_disk = true;
+    UserLoadGuard load_guard;
     load_machine_id();
 
-    uint8_t buffer[4096];
+    uint8_t buffer[kUserStoreBufferSize];
     size_t read_size = 0;
     const char* loaded_path = nullptr;
     auto try_load = [&](const char* p) -> bool {
@@ -590,6 +857,9 @@ bool load_from_disk() {
         if (!current && !legacy && !legacy_v1) {
             return false;
         }
+        if (raw_hdr.count > kMaxUsers) {
+            return false;
+        }
         size_t expected = sizeof(LegacyHeader) +
                           static_cast<size_t>(raw_hdr.count) * raw_hdr.entry_size;
         if (current) {
@@ -614,14 +884,12 @@ bool load_from_disk() {
         }
     }
     if (!loaded) {
-        g_loading_from_disk = false;
         // Missing and malformed credential stores must remain distinguishable
         // from an explicitly provisioned empty store.  In particular, do not
         // overwrite corruption with a passwordless bootstrap database.
         return false;
     }
     if (read_size < sizeof(LegacyHeader)) {
-        g_loading_from_disk = false;
         return false;
     }
 
@@ -630,7 +898,6 @@ bool load_from_disk() {
     Header hdr{};
     if (raw_hdr.version == kVersion) {
         if (read_size < sizeof(Header)) {
-            g_loading_from_disk = false;
             return false;
         }
         memcpy(&hdr, buffer, sizeof(Header));
@@ -646,24 +913,72 @@ bool load_from_disk() {
         hdr.machine_id = g_machine_id.machine;
     }
 
-    init();
+    size_t entries_offset = (hdr.version == kVersion)
+                                ? sizeof(Header)
+                                : sizeof(LegacyHeader);
+    for (size_t i = 0; i < hdr.count; ++i) {
+        char name[sizeof(User::name)];
+        const char* packed_name = nullptr;
+        const PackedUser* packed_user = nullptr;
+        if (hdr.version == kLegacyVersion1) {
+            const auto* entries = reinterpret_cast<const PackedUserV1*>(
+                buffer + entries_offset);
+            packed_name = entries[i].name;
+        } else {
+            const auto* entries = reinterpret_cast<const PackedUser*>(
+                buffer + entries_offset);
+            packed_user = &entries[i];
+            packed_name = packed_user->name;
+        }
+        if (!copy_packed_user_name(
+                packed_name, sizeof(PackedUser::name), name)) {
+            return false;
+        }
+        if (packed_user != nullptr && packed_user->password_set != 0 &&
+            (packed_user->password_algorithm != 1 ||
+             packed_user->password_iterations == 0 ||
+             packed_user->password_iterations > kMaxPasswordIterations)) {
+            return false;
+        }
+    }
+
+    reset_user_pool();
+    {
+        sync::IrqLockGuard guard(g_user_lock);
+        g_next_user_id = (hdr.next_user_id == 0) ? 1 : hdr.next_user_id;
+    }
     bool upgraded_legacy_entries = false;
     if (hdr.version == kLegacyVersion1) {
         const PackedUserV1* entries =
             reinterpret_cast<const PackedUserV1*>(buffer + sizeof(LegacyHeader));
         for (size_t i = 0; i < hdr.count && i < kMaxUsers; ++i) {
             const PackedUserV1& p = entries[i];
-            uint64_t allowed_caps = upgrade_legacy_caps(p.allowed_caps,
-                                                        upgraded_legacy_entries);
-            User* u = create(p.name, allowed_caps);
+            char name[sizeof(User::name)];
+            if (!copy_packed_user_name(p.name, sizeof(p.name), name)) {
+                continue;
+            }
+            uint64_t allowed_caps =
+                normalize_stored_caps(p.allowed_caps,
+                                      true,
+                                      upgraded_legacy_entries);
+            User* u =
+                create_in_memory(name, allowed_caps, g_machine_id.machine);
             if (u != nullptr) {
-                u->generation = p.generation;
-                u->active = p.active != 0;
-                if (u->id.local == 0) {
-                    u->id.local = g_next_user_id++;
-                }
-                if (u->id.machine == 0) {
-                    u->id.machine = hdr.machine_id;
+                {
+                    sync::IrqLockGuard guard(g_user_lock);
+                    __atomic_store_n(&u->active, false, __ATOMIC_RELEASE);
+                    __atomic_store_n(&u->generation,
+                                     p.generation,
+                                     __ATOMIC_RELAXED);
+                    if (u->id.local == 0) {
+                        u->id.local = g_next_user_id++;
+                    }
+                    if (u->id.machine == 0) {
+                        u->id.machine = hdr.machine_id;
+                    }
+                    __atomic_store_n(&u->active,
+                                     p.active != 0,
+                                     __ATOMIC_RELEASE);
                 }
                 ensure_home_directory(u->name);
             }
@@ -676,33 +991,49 @@ bool load_from_disk() {
                                                     : sizeof(LegacyHeader)));
         for (size_t i = 0; i < hdr.count && i < kMaxUsers; ++i) {
             const PackedUser& p = entries[i];
-            uint64_t allowed_caps = upgrade_legacy_caps(p.allowed_caps,
-                                                        upgraded_legacy_entries);
-            User* u = create(p.name, allowed_caps);
+            char name[sizeof(User::name)];
+            if (!copy_packed_user_name(p.name, sizeof(p.name), name)) {
+                continue;
+            }
+            uint64_t allowed_caps =
+                normalize_stored_caps(p.allowed_caps,
+                                      hdr.version != kVersion,
+                                      upgraded_legacy_entries);
+            User* u =
+                create_in_memory(name, allowed_caps, g_machine_id.machine);
             if (u != nullptr) {
-                u->generation = p.generation;
-                u->active = p.active != 0;
-                if (p.password_set != 0 && p.password_algorithm == 1 &&
-                    p.password_iterations != 0) {
-                    u->password_set = true;
-                    u->password_iterations = p.password_iterations;
-                    memcpy(u->password_salt,
-                           p.password_salt,
-                           sizeof(u->password_salt));
-                    memcpy(u->password_hash,
-                           p.password_hash,
-                           sizeof(u->password_hash));
-                }
-                u->id.machine = (p.machine_id != 0) ? p.machine_id : hdr.machine_id;
-                u->id.local = p.local_id;
-                if (u->id.local == 0) {
-                    u->id.local = g_next_user_id++;
-                }
-                if (u->id.machine == 0) {
-                    u->id.machine = hdr.machine_id;
-                }
-                if (u->id.local >= g_next_user_id) {
-                    g_next_user_id = u->id.local + 1;
+                {
+                    sync::IrqLockGuard guard(g_user_lock);
+                    __atomic_store_n(&u->active, false, __ATOMIC_RELEASE);
+                    __atomic_store_n(&u->generation,
+                                     p.generation,
+                                     __ATOMIC_RELAXED);
+                    if (p.password_set != 0 && p.password_algorithm == 1 &&
+                        p.password_iterations != 0) {
+                        u->password_set = true;
+                        u->password_iterations = p.password_iterations;
+                        memcpy(u->password_salt,
+                               p.password_salt,
+                               sizeof(u->password_salt));
+                        memcpy(u->password_hash,
+                               p.password_hash,
+                               sizeof(u->password_hash));
+                    }
+                    u->id.machine =
+                        (p.machine_id != 0) ? p.machine_id : hdr.machine_id;
+                    u->id.local = p.local_id;
+                    if (u->id.local == 0) {
+                        u->id.local = g_next_user_id++;
+                    }
+                    if (u->id.machine == 0) {
+                        u->id.machine = hdr.machine_id;
+                    }
+                    if (u->id.local >= g_next_user_id) {
+                        g_next_user_id = u->id.local + 1;
+                    }
+                    __atomic_store_n(&u->active,
+                                     p.active != 0,
+                                     __ATOMIC_RELEASE);
                 }
                 ensure_home_directory(u->name);
             }
@@ -718,9 +1049,14 @@ bool load_from_disk() {
         log_message(LogLevel::Info,
                     "Users: upgraded legacy user store to current format");
     }
-    g_loading_from_disk = false;
     if (upgraded_legacy_entries || hdr.version != kVersion) {
-        persist();
+        persist_locked();
+    }
+    if (!protect_store_acl_locked(loaded_path)) {
+        log_message(LogLevel::Error,
+                    "Users: failed to protect store ACL for '%s'",
+                    (loaded_path != nullptr) ? loaded_path : "(unknown)");
+        return false;
     }
     return true;
 }

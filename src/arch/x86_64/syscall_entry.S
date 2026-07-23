@@ -31,6 +31,7 @@ extern syscall_dispatch
 
 syscall_entry:
     swapgs
+    cld
     mov [gs:CPU_SYSCALL_USER_RSP], rsp
     mov rsp, [gs:CPU_TSS_RSP0]
     sub rsp, FRAME_SIZE

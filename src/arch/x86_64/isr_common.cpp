@@ -17,6 +17,7 @@
 #include "percpu.hpp"
 #include "lapic.hpp"
 #include "isr.hpp"
+#include "syscall.hpp"
 
 // Interrupt number to name mapping
 constexpr const char* exception_names[32] = {
@@ -63,31 +64,21 @@ uint16_t exit_code_from_exception(uint64_t vector) {
                                  static_cast<uint16_t>(vector & 0x7FFFu));
 }
 
-void terminate_current_process(uint16_t exit_code) {
-    process::Process* proc = process::current();
-    if (proc == nullptr) {
+}  // namespace
+
+extern "C" void isr_validate_return(InterruptFrame* regs) {
+    if (regs == nullptr || (regs->cs & 0x3) == 0) {
         return;
     }
-
-    proc->state = process::State::Terminated;
-    proc->has_exited = true;
-    proc->exit_code = exit_code;
-
-    process::Process* parent = proc->parent;
-    if (parent != nullptr && parent->waiting_on == proc) {
-        parent->waiting_on = nullptr;
-        parent->context.rax = proc->exit_code;
-        parent->state = process::State::Ready;
-        if (parent->console_transferred) {
-            descriptor::restore_console_owner(*parent);
-            parent->console_transferred = false;
+    if (!syscall::valid_user_return_state(regs->rip, regs->rsp)) {
+        process::Process* proc = process::current();
+        if (proc != nullptr) {
+            process::terminate(*proc, exit_code_from_exception(13));
+            scheduler::reschedule_from_interrupt(*regs);
         }
-        scheduler::enqueue(parent);
     }
-    proc->parent = nullptr;
+    regs->rflags = syscall::sanitize_user_rflags(regs->rflags);
 }
-
-}  // namespace
 
 extern "C" void isr_handler(InterruptFrame* regs) {
     if (regs == nullptr) {
@@ -317,7 +308,9 @@ extern "C" void isr_handler(InterruptFrame* regs) {
                     static_cast<unsigned int>(regs->int_no),
                     static_cast<unsigned long long>(regs->rip),
                     static_cast<unsigned int>(exit_code));
-        terminate_current_process(exit_code);
+        if (process::Process* proc = process::current()) {
+            process::terminate(*proc, exit_code);
+        }
         scheduler::reschedule_from_interrupt(*regs);
         return;
     }

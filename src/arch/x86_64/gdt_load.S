@@ -1,4 +1,4 @@
-.code64
+bits 64
 global load_gdt_ptr
 section .text
 load_gdt_ptr:

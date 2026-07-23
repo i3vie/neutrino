@@ -4,6 +4,7 @@
 #include "../process.hpp"
 #include "../random.hpp"
 #include "../scheduler.hpp"
+#include "../sync.hpp"
 #include "../vm.hpp"
 
 namespace descriptor {
@@ -62,26 +63,53 @@ struct EndpointHandle {
 NetEndpoint g_endpoints[kMaxEndpoints]{};
 EndpointHandle g_handles[kMaxEndpointHandles]{};
 EndpointWaiter g_waiters[kMaxEndpointWaiters]{};
+sync::SpinLock g_endpoint_pool_lock;
 
 inline size_t min_size(size_t a, size_t b) {
     return (a < b) ? a : b;
 }
 
-void lock_endpoint(NetEndpoint& endpoint) {
+uint64_t lock_endpoint(NetEndpoint& endpoint) {
+    uint64_t flags = sync::disable_interrupts();
     while (__atomic_test_and_set(&endpoint.lock, __ATOMIC_ACQUIRE)) {
         asm volatile("pause");
     }
+    return flags;
 }
 
-void unlock_endpoint(NetEndpoint& endpoint) {
+void unlock_endpoint(NetEndpoint& endpoint, uint64_t flags) {
     __atomic_clear(&endpoint.lock, __ATOMIC_RELEASE);
+    sync::restore_interrupts(flags);
+}
+
+bool lock_handle_endpoint(EndpointHandle* handle,
+                          NetEndpoint*& out_endpoint,
+                          uint64_t& out_irq_flags) {
+    out_endpoint = nullptr;
+    out_irq_flags = sync::disable_interrupts();
+    g_endpoint_pool_lock.lock();
+    if (handle == nullptr ||
+        !__atomic_load_n(&handle->in_use, __ATOMIC_ACQUIRE) ||
+        handle->endpoint == nullptr ||
+        !__atomic_load_n(&handle->endpoint->in_use, __ATOMIC_ACQUIRE)) {
+        g_endpoint_pool_lock.unlock();
+        sync::restore_interrupts(out_irq_flags);
+        return false;
+    }
+
+    NetEndpoint* endpoint = handle->endpoint;
+    while (__atomic_test_and_set(&endpoint->lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+    g_endpoint_pool_lock.unlock();
+    out_endpoint = endpoint;
+    return true;
 }
 
 void reset_ring(Ring& ring) {
     ring.head = 0;
     ring.tail = 0;
     ring.count = 0;
-    memset(ring.buffer, 0, sizeof(ring.buffer));
 }
 
 Ring& incoming_ring(NetEndpoint& endpoint, Role role) {
@@ -109,14 +137,13 @@ EndpointWaiter*& write_waiters(NetEndpoint& endpoint, Role role) {
                              : endpoint.service_write_waiters;
 }
 
-NetEndpoint* find_endpoint(uint32_t id);
+NetEndpoint* find_endpoint_locked(uint32_t id);
 
-NetEndpoint* allocate_endpoint() {
+NetEndpoint* allocate_endpoint_locked() {
     for (auto& endpoint : g_endpoints) {
-        if (endpoint.in_use) {
+        if (__atomic_load_n(&endpoint.in_use, __ATOMIC_ACQUIRE)) {
             continue;
         }
-        endpoint.in_use = true;
         reset_ring(endpoint.app_to_service);
         reset_ring(endpoint.service_to_app);
         endpoint.app_handles = 0;
@@ -131,57 +158,64 @@ NetEndpoint* allocate_endpoint() {
         uint32_t candidate = 0;
         do {
             candidate = kernel_random::opaque_id();
-        } while (find_endpoint(candidate) != nullptr);
+        } while (candidate == 0 || find_endpoint_locked(candidate) != nullptr);
         endpoint.id = candidate;
+        __atomic_store_n(&endpoint.in_use, true, __ATOMIC_RELEASE);
         return &endpoint;
     }
     return nullptr;
 }
 
-NetEndpoint* find_endpoint(uint32_t id) {
+NetEndpoint* find_endpoint_locked(uint32_t id) {
     if (id == 0) {
         return nullptr;
     }
     for (auto& endpoint : g_endpoints) {
-        if (endpoint.in_use && endpoint.id == id) {
+        if (__atomic_load_n(&endpoint.in_use, __ATOMIC_ACQUIRE) &&
+            endpoint.id == id) {
             return &endpoint;
         }
     }
     return nullptr;
 }
 
-EndpointHandle* allocate_handle(NetEndpoint* endpoint,
-                                process::Process* owner,
-                                Role role) {
+EndpointHandle* allocate_handle_locked(NetEndpoint* endpoint,
+                                       process::Process* owner,
+                                       Role role) {
     for (auto& handle : g_handles) {
-        if (handle.in_use) {
+        if (__atomic_load_n(&handle.in_use, __ATOMIC_ACQUIRE)) {
             continue;
         }
-        handle.in_use = true;
         handle.endpoint = endpoint;
         handle.owner = owner;
         handle.role = role;
+        __atomic_store_n(&handle.in_use, true, __ATOMIC_RELEASE);
         return &handle;
     }
     return nullptr;
 }
 
-void release_handle(EndpointHandle* handle) {
+void release_handle_locked(EndpointHandle* handle) {
     if (handle == nullptr) {
         return;
     }
     handle->endpoint = nullptr;
     handle->owner = nullptr;
     handle->role = Role::App;
-    handle->in_use = false;
+    __atomic_store_n(&handle->in_use, false, __ATOMIC_RELEASE);
 }
 
 EndpointWaiter* allocate_waiter() {
     for (auto& waiter : g_waiters) {
-        if (waiter.in_use) {
+        bool expected = false;
+        if (!__atomic_compare_exchange_n(&waiter.in_use,
+                                         &expected,
+                                         true,
+                                         false,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
             continue;
         }
-        waiter.in_use = true;
         waiter.proc = nullptr;
         waiter.user_address = 0;
         waiter.length = 0;
@@ -197,13 +231,13 @@ void release_waiter(EndpointWaiter* waiter) {
     if (waiter == nullptr) {
         return;
     }
-    waiter->in_use = false;
     waiter->proc = nullptr;
     waiter->user_address = 0;
     waiter->length = 0;
     waiter->is_read = false;
     waiter->role = Role::App;
     waiter->next = nullptr;
+    __atomic_store_n(&waiter->in_use, false, __ATOMIC_RELEASE);
 }
 
 void push_waiter(EndpointWaiter*& head, EndpointWaiter* waiter) {
@@ -223,10 +257,7 @@ void complete_waiter(EndpointWaiter* waiter, int64_t result) {
         release_waiter(waiter);
         return;
     }
-    waiter->proc->context.rax = static_cast<uint64_t>(result);
-    waiter->proc->state = process::State::Ready;
-    waiter->proc->waiting_on = nullptr;
-    scheduler::enqueue(waiter->proc);
+    (void)process::wake_with_result(*waiter->proc, result);
     release_waiter(waiter);
 }
 
@@ -281,18 +312,17 @@ int64_t ring_copy_in_from_user(Ring& ring,
     return static_cast<int64_t>(copied);
 }
 
-void wake_read_waiters_locked(NetEndpoint& endpoint, Role role);
-void wake_write_waiters_locked(NetEndpoint& endpoint, Role role);
-
-void wake_read_waiters_locked(NetEndpoint& endpoint, Role role) {
+bool service_read_waiters_locked(NetEndpoint& endpoint, Role role) {
     EndpointWaiter*& waiters = read_waiters(endpoint, role);
     Ring& ring = incoming_ring(endpoint, role);
+    bool progressed = false;
     while (waiters != nullptr) {
         EndpointWaiter* waiter = waiters;
         if (ring.count == 0 && peer_handles(endpoint, role) == 0) {
             waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, 0);
+            progressed = true;
             continue;
         }
         if (ring.count == 0) {
@@ -302,6 +332,7 @@ void wake_read_waiters_locked(NetEndpoint& endpoint, Role role) {
             waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, -1);
+            progressed = true;
             continue;
         }
         int64_t copied =
@@ -312,21 +343,22 @@ void wake_read_waiters_locked(NetEndpoint& endpoint, Role role) {
         waiters = waiter->next;
         waiter->next = nullptr;
         complete_waiter(waiter, copied);
-        wake_write_waiters_locked(endpoint,
-                                  role == Role::App ? Role::Service
-                                                    : Role::App);
+        progressed = true;
     }
+    return progressed;
 }
 
-void wake_write_waiters_locked(NetEndpoint& endpoint, Role role) {
+bool service_write_waiters_locked(NetEndpoint& endpoint, Role role) {
     EndpointWaiter*& waiters = write_waiters(endpoint, role);
     Ring& ring = outgoing_ring(endpoint, role);
+    bool progressed = false;
     while (waiters != nullptr) {
         EndpointWaiter* waiter = waiters;
         if (peer_handles(endpoint, role) == 0) {
             waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, -1);
+            progressed = true;
             continue;
         }
         if (ring.count >= kEndpointBufferSize) {
@@ -336,6 +368,7 @@ void wake_write_waiters_locked(NetEndpoint& endpoint, Role role) {
             waiters = waiter->next;
             waiter->next = nullptr;
             complete_waiter(waiter, -1);
+            progressed = true;
             continue;
         }
         int64_t copied =
@@ -346,13 +379,28 @@ void wake_write_waiters_locked(NetEndpoint& endpoint, Role role) {
         waiters = waiter->next;
         waiter->next = nullptr;
         complete_waiter(waiter, copied);
-        wake_read_waiters_locked(endpoint,
-                                 role == Role::App ? Role::Service
-                                                   : Role::App);
+        progressed = true;
         if (ring.count >= kEndpointBufferSize) {
             break;
         }
     }
+    return progressed;
+}
+
+void pump_waiters_locked(NetEndpoint& endpoint) {
+    // Reads make room for peer writers and writes feed peer readers. Iterate
+    // until no waiter can advance; every successful pass removes at least one
+    // waiter, so this is bounded by the fixed waiter pool without recursion.
+    bool progressed = false;
+    do {
+        progressed = service_read_waiters_locked(endpoint, Role::App);
+        progressed = service_write_waiters_locked(endpoint, Role::App) ||
+                     progressed;
+        progressed = service_read_waiters_locked(endpoint, Role::Service) ||
+                     progressed;
+        progressed = service_write_waiters_locked(endpoint, Role::Service) ||
+                     progressed;
+    } while (progressed);
 }
 
 int64_t endpoint_read(process::Process& proc,
@@ -367,39 +415,38 @@ int64_t endpoint_read(process::Process& proc,
         return 0;
     }
     auto* handle = static_cast<EndpointHandle*>(entry.subsystem_data);
-    if (handle == nullptr || !handle->in_use || handle->endpoint == nullptr) {
-        return -1;
-    }
-    NetEndpoint& endpoint = *handle->endpoint;
-    if (!endpoint.in_use || user_address == 0) {
+    if (user_address == 0) {
         return -1;
     }
     bool async = has_flag(entry.flags, Flag::Async);
     size_t requested = static_cast<size_t>(length);
 
-    lock_endpoint(endpoint);
+    NetEndpoint* endpoint_ptr = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_handle_endpoint(handle, endpoint_ptr, irq_flags)) {
+        return -1;
+    }
+    NetEndpoint& endpoint = *endpoint_ptr;
     Ring& ring = incoming_ring(endpoint, handle->role);
     if (ring.count > 0) {
         int64_t copied = ring_copy_out_to_user(ring, proc, user_address, requested);
-        wake_write_waiters_locked(endpoint,
-                                  handle->role == Role::App ? Role::Service
-                                                            : Role::App);
-        unlock_endpoint(endpoint);
+        pump_waiters_locked(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         descriptor::wake_waiters();
         return copied;
     }
     if (peer_handles(endpoint, handle->role) == 0) {
-        unlock_endpoint(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         return 0;
     }
     if (async) {
-        unlock_endpoint(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         return kWouldBlock;
     }
 
     EndpointWaiter* waiter = allocate_waiter();
     if (waiter == nullptr) {
-        unlock_endpoint(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         return -1;
     }
     waiter->proc = &proc;
@@ -409,9 +456,9 @@ int64_t endpoint_read(process::Process& proc,
     waiter->role = handle->role;
     waiter->next = nullptr;
     push_waiter(read_waiters(endpoint, handle->role), waiter);
-    proc.state = process::State::Blocked;
     proc.waiting_on = &endpoint;
-    unlock_endpoint(endpoint);
+    process::store_state(proc, process::State::Blocked);
+    unlock_endpoint(endpoint, irq_flags);
     return kWouldBlock;
 }
 
@@ -427,39 +474,38 @@ int64_t endpoint_write(process::Process& proc,
         return 0;
     }
     auto* handle = static_cast<EndpointHandle*>(entry.subsystem_data);
-    if (handle == nullptr || !handle->in_use || handle->endpoint == nullptr) {
-        return -1;
-    }
-    NetEndpoint& endpoint = *handle->endpoint;
-    if (!endpoint.in_use || user_address == 0) {
+    if (user_address == 0) {
         return -1;
     }
     bool async = has_flag(entry.flags, Flag::Async);
     size_t requested = static_cast<size_t>(length);
 
-    lock_endpoint(endpoint);
+    NetEndpoint* endpoint_ptr = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_handle_endpoint(handle, endpoint_ptr, irq_flags)) {
+        return -1;
+    }
+    NetEndpoint& endpoint = *endpoint_ptr;
     if (peer_handles(endpoint, handle->role) == 0) {
-        unlock_endpoint(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         return -1;
     }
     Ring& ring = outgoing_ring(endpoint, handle->role);
     if (ring.count < kEndpointBufferSize) {
         int64_t copied = ring_copy_in_from_user(ring, proc, user_address, requested);
-        wake_read_waiters_locked(endpoint,
-                                 handle->role == Role::App ? Role::Service
-                                                           : Role::App);
-        unlock_endpoint(endpoint);
+        pump_waiters_locked(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         descriptor::wake_waiters();
         return copied;
     }
     if (async) {
-        unlock_endpoint(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         return kWouldBlock;
     }
 
     EndpointWaiter* waiter = allocate_waiter();
     if (waiter == nullptr) {
-        unlock_endpoint(endpoint);
+        unlock_endpoint(endpoint, irq_flags);
         return -1;
     }
     waiter->proc = &proc;
@@ -469,9 +515,9 @@ int64_t endpoint_write(process::Process& proc,
     waiter->role = handle->role;
     waiter->next = nullptr;
     push_waiter(write_waiters(endpoint, handle->role), waiter);
-    proc.state = process::State::Blocked;
     proc.waiting_on = &endpoint;
-    unlock_endpoint(endpoint);
+    process::store_state(proc, process::State::Blocked);
+    unlock_endpoint(endpoint, irq_flags);
     return kWouldBlock;
 }
 
@@ -487,15 +533,17 @@ int endpoint_get_property(DescriptorEntry& entry,
         return -1;
     }
     auto* handle = static_cast<EndpointHandle*>(entry.subsystem_data);
-    if (handle == nullptr || !handle->in_use || handle->endpoint == nullptr ||
-        !handle->endpoint->in_use) {
+    NetEndpoint* endpoint = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_handle_endpoint(handle, endpoint, irq_flags)) {
         return -1;
     }
     auto* info = reinterpret_cast<descriptor_defs::NetEndpointInfo*>(out);
-    info->id = handle->endpoint->id;
+    info->id = endpoint->id;
     info->flags = static_cast<uint32_t>(entry.flags & 0xFFFFFFFFu);
     info->role = static_cast<uint32_t>(handle->role);
     info->reserved = 0;
+    unlock_endpoint(*endpoint, irq_flags);
     return 0;
 }
 
@@ -529,44 +577,70 @@ void drop_waiters_for_owner_locked(NetEndpoint& endpoint, process::Process* owne
 
 void close_endpoint(DescriptorEntry& entry) {
     auto* handle = static_cast<EndpointHandle*>(entry.subsystem_data);
-    if (handle == nullptr || !handle->in_use || handle->endpoint == nullptr) {
+    if (handle == nullptr) {
         return;
     }
-    NetEndpoint& endpoint = *handle->endpoint;
     bool notify_waiters = false;
-    lock_endpoint(endpoint);
-    if (endpoint.refcount > 0) {
-        --endpoint.refcount;
-    }
-    if (handle->role == Role::App && endpoint.app_handles > 0) {
-        --endpoint.app_handles;
-    }
-    if (handle->role == Role::Service && endpoint.service_handles > 0) {
-        --endpoint.service_handles;
-    }
+    {
+        sync::IrqLockGuard pool_guard(g_endpoint_pool_lock);
+        if (!__atomic_load_n(&handle->in_use, __ATOMIC_ACQUIRE)) {
+            return;
+        }
+        NetEndpoint* endpoint = handle->endpoint;
+        if (endpoint == nullptr ||
+            !__atomic_load_n(&endpoint->in_use, __ATOMIC_ACQUIRE)) {
+            release_handle_locked(handle);
+            return;
+        }
 
-    wake_read_waiters_locked(endpoint, Role::App);
-    wake_write_waiters_locked(endpoint, Role::App);
-    wake_read_waiters_locked(endpoint, Role::Service);
-    wake_write_waiters_locked(endpoint, Role::Service);
-    notify_waiters = true;
-    drop_waiters_for_owner_locked(endpoint, handle->owner);
+        uint64_t irq_flags = lock_endpoint(*endpoint);
+        if (!__atomic_load_n(&handle->in_use, __ATOMIC_ACQUIRE) ||
+            handle->endpoint != endpoint ||
+            !__atomic_load_n(&endpoint->in_use, __ATOMIC_ACQUIRE)) {
+            unlock_endpoint(*endpoint, irq_flags);
+            return;
+        }
 
-    bool empty = endpoint.refcount == 0;
-    if (empty) {
-        endpoint.in_use = false;
-        reset_ring(endpoint.app_to_service);
-        reset_ring(endpoint.service_to_app);
-        endpoint.app_handles = 0;
-        endpoint.service_handles = 0;
-        endpoint.app_read_waiters = nullptr;
-        endpoint.app_write_waiters = nullptr;
-        endpoint.service_read_waiters = nullptr;
-        endpoint.service_write_waiters = nullptr;
-        endpoint.lock = 0;
+        if (endpoint->refcount > 0) {
+            --endpoint->refcount;
+        }
+        if (handle->role == Role::App && endpoint->app_handles > 0) {
+            --endpoint->app_handles;
+        }
+        if (handle->role == Role::Service && endpoint->service_handles > 0) {
+            --endpoint->service_handles;
+        }
+
+        pump_waiters_locked(*endpoint);
+        notify_waiters = true;
+        drop_waiters_for_owner_locked(*endpoint, handle->owner);
+
+        if (endpoint->refcount == 0) {
+            EndpointWaiter** lists[] = {
+                &endpoint->app_read_waiters,
+                &endpoint->app_write_waiters,
+                &endpoint->service_read_waiters,
+                &endpoint->service_write_waiters,
+            };
+            for (auto** list : lists) {
+                while (*list != nullptr) {
+                    EndpointWaiter* waiter = *list;
+                    *list = waiter->next;
+                    waiter->next = nullptr;
+                    complete_waiter(waiter, -1);
+                }
+            }
+            reset_ring(endpoint->app_to_service);
+            reset_ring(endpoint->service_to_app);
+            endpoint->app_handles = 0;
+            endpoint->service_handles = 0;
+            endpoint->id = 0;
+            __atomic_store_n(&endpoint->in_use, false, __ATOMIC_RELEASE);
+        }
+
+        release_handle_locked(handle);
+        unlock_endpoint(*endpoint, irq_flags);
     }
-    unlock_endpoint(endpoint);
-    release_handle(handle);
     if (notify_waiters) {
         descriptor::wake_waiters();
     }
@@ -575,18 +649,14 @@ void close_endpoint(DescriptorEntry& entry) {
 bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
     revents = 0;
     auto* handle = static_cast<EndpointHandle*>(entry.subsystem_data);
-    if (handle == nullptr || !handle->in_use || handle->endpoint == nullptr) {
+    NetEndpoint* endpoint = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_handle_endpoint(handle, endpoint, irq_flags)) {
         return false;
     }
-    NetEndpoint& endpoint = *handle->endpoint;
-    if (!endpoint.in_use) {
-        return false;
-    }
-
-    lock_endpoint(endpoint);
-    Ring& incoming = incoming_ring(endpoint, handle->role);
-    Ring& outgoing = outgoing_ring(endpoint, handle->role);
-    size_t peers = peer_handles(endpoint, handle->role);
+    Ring& incoming = incoming_ring(*endpoint, handle->role);
+    Ring& outgoing = outgoing_ring(*endpoint, handle->role);
+    size_t peers = peer_handles(*endpoint, handle->role);
     if ((events & descriptor_defs::kWaitRead) != 0 &&
         (incoming.count > 0 || peers == 0)) {
         revents |= descriptor_defs::kWaitRead;
@@ -596,7 +666,7 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
         outgoing.count < kEndpointBufferSize) {
         revents |= descriptor_defs::kWaitWrite;
     }
-    unlock_endpoint(endpoint);
+    unlock_endpoint(*endpoint, irq_flags);
     return true;
 }
 
@@ -617,28 +687,39 @@ bool open_endpoint(process::Process& proc,
     Role role = want_service ? Role::Service : Role::App;
     bool async = (flags & static_cast<uint64_t>(Flag::Async)) != 0;
     bool created = existing_id == 0;
-    NetEndpoint* endpoint =
-        created ? allocate_endpoint()
-                : find_endpoint(static_cast<uint32_t>(existing_id));
-    if (endpoint == nullptr || !endpoint->in_use) {
-        return false;
-    }
-    EndpointHandle* handle = allocate_handle(endpoint, &proc, role);
-    if (handle == nullptr) {
-        if (created) {
-            endpoint->in_use = false;
+    NetEndpoint* endpoint = nullptr;
+    EndpointHandle* handle = nullptr;
+    {
+        sync::IrqLockGuard pool_guard(g_endpoint_pool_lock);
+        endpoint = created
+                       ? allocate_endpoint_locked()
+                       : find_endpoint_locked(
+                             static_cast<uint32_t>(existing_id));
+        if (endpoint == nullptr ||
+            !__atomic_load_n(&endpoint->in_use, __ATOMIC_ACQUIRE)) {
+            return false;
         }
-        return false;
-    }
 
-    lock_endpoint(*endpoint);
-    ++endpoint->refcount;
-    if (role == Role::App) {
-        ++endpoint->app_handles;
-    } else {
-        ++endpoint->service_handles;
+        handle = allocate_handle_locked(endpoint, &proc, role);
+        if (handle == nullptr) {
+            if (created) {
+                endpoint->id = 0;
+                __atomic_store_n(&endpoint->in_use,
+                                 false,
+                                 __ATOMIC_RELEASE);
+            }
+            return false;
+        }
+
+        uint64_t irq_flags = lock_endpoint(*endpoint);
+        ++endpoint->refcount;
+        if (role == Role::App) {
+            ++endpoint->app_handles;
+        } else {
+            ++endpoint->service_handles;
+        }
+        unlock_endpoint(*endpoint, irq_flags);
     }
-    unlock_endpoint(*endpoint);
     descriptor::wake_waiters();
 
     uint64_t descriptor_flags =

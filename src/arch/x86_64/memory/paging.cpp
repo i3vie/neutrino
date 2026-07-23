@@ -41,6 +41,7 @@ constexpr uint64_t PTE_PCD = 1ull << 4;
 constexpr uint64_t PTE_PAT = 1ull << 7;
 constexpr uint64_t PTE_LARGE = 1ull << 7;
 constexpr uint64_t PTE_GLOBAL = 1ull << 8;
+constexpr uint64_t PTE_MANAGED = PAGE_FLAG_MANAGED;
 constexpr uint64_t PTE_NX = 1ull << 63;
 constexpr uint64_t CR0_WRITE_PROTECT = 1ull << 16;
 constexpr uint32_t MSR_EFER = 0xC0000080;
@@ -53,6 +54,9 @@ constexpr size_t BOOT_POOL_PAGES = 4096;
 constexpr size_t BOOT_POOL_SIZE = BOOT_POOL_PAGES * PAGE_SIZE;
 
 constexpr uint64_t LAPIC_BASE = 0xFEE00000;
+// x86 AP startup begins below 1 MiB. Limine keeps its APs in a trampoline in
+// bootloader-reclaimable low memory until the kernel fills in goto_address.
+constexpr uint64_t SMP_TRAMPOLINE_PHYS_LIMIT = 0x100000;
 
 alignas(PAGE_SIZE) uint8_t boot_pool[BOOT_POOL_SIZE];
 size_t boot_pool_off = 0;
@@ -63,12 +67,12 @@ uint64_t g_kernel_phys_base = 0;
 uint64_t g_kernel_virt_base = 0;
 uint64_t g_kernel_size = 0;
 uint64_t g_hhdm_offset = 0;
-uint64_t g_cr3_value = 0;
 uint64_t g_kernel_cr3 = 0;
 
 uint64_t* pml4_table = nullptr;
 uint64_t* g_address_space_roots[MAX_ADDRESS_SPACES];
 size_t g_address_space_count = 0;
+sync::SpinLock g_address_space_registry_lock;
 
 sync::SpinLock g_tlb_shootdown_lock;
 uint8_t g_tlb_shootdown_vector = 0;
@@ -104,13 +108,6 @@ void write_msr(uint32_t msr, uint64_t value) {
                  : "c"(msr),
                    "a"(static_cast<uint32_t>(value)),
                    "d"(static_cast<uint32_t>(value >> 32)));
-}
-
-[[noreturn]] void halt_system() {
-    asm volatile("cli; hlt");
-    for (;;) {
-        asm volatile("hlt");
-    }
 }
 
 void* alloc_boot_page() {
@@ -253,6 +250,7 @@ void sync_kernel_pml4_entry(size_t pml4_index) {
     if (pml4_index < PAGE_TABLE_ENTRIES / 2) {
         return;
     }
+    sync::IrqLockGuard guard(g_address_space_registry_lock);
     for (size_t i = 0; i < g_address_space_count; ++i) {
         uint64_t* root = g_address_space_roots[i];
         if (root == nullptr || root == pml4_table) {
@@ -274,7 +272,14 @@ void destroy_table_level(uint64_t table_phys, int level) {
     }
 
     if (level == 1) {
-        memset(table, 0, PAGE_SIZE);
+        for (size_t i = 0; i < PAGE_TABLE_ENTRIES; ++i) {
+            uint64_t entry = table[i];
+            if ((entry & (PTE_PRESENT | PTE_MANAGED)) ==
+                (PTE_PRESENT | PTE_MANAGED)) {
+                memory::free_user_page(entry & PHYSICAL_ADDRESS_MASK);
+            }
+            table[i] = 0;
+        }
         return;
     }
 
@@ -444,6 +449,30 @@ void paging_init() {
                                 entry->base,
                                 entry->length,
                                 map_flags);
+
+            // The APs can still be executing Limine's low-memory trampoline
+            // after the BSP installs this CR3. Keep only the low portion of
+            // bootloader-reclaimable memory executable, and make that alias
+            // read-only to preserve W^X. It is returned to NX once every AP
+            // has entered the kernel.
+            if (entry->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE &&
+                entry->base < SMP_TRAMPOLINE_PHYS_LIMIT) {
+                uint64_t executable_end = entry->base + entry->length;
+                if (executable_end < entry->base ||
+                    executable_end > SMP_TRAMPOLINE_PHYS_LIMIT) {
+                    executable_end = SMP_TRAMPOLINE_PHYS_LIMIT;
+                }
+                map_range_with_root(pml4_table,
+                                    entry->base + g_hhdm_offset,
+                                    entry->base,
+                                    executable_end - entry->base,
+                                    PTE_GLOBAL);
+                map_range_with_root(pml4_table,
+                                    entry->base,
+                                    entry->base,
+                                    executable_end - entry->base,
+                                    PTE_GLOBAL | PTE_NX);
+            }
         }
     }
 
@@ -517,13 +546,49 @@ void paging_init() {
 
     uint64_t new_cr3 = virt_to_phys(reinterpret_cast<uint64_t>(pml4_table));
     asm volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
-    g_cr3_value = new_cr3;
     g_kernel_cr3 = new_cr3;
 
     uint64_t cr0 = 0;
     asm volatile("mov %%cr0, %0" : "=r"(cr0));
     cr0 |= CR0_WRITE_PROTECT;
     asm volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+}
+
+bool paging_finish_smp_bootstrap() {
+    if (g_hhdm_offset == 0 || memmap_request.response == nullptr) {
+        return true;
+    }
+
+    auto* memmap = memmap_request.response;
+    bool ok = true;
+    for (uint64_t i = 0; i < memmap->entry_count; ++i) {
+        auto* entry = memmap->entries[i];
+        if (entry == nullptr || entry->length == 0 ||
+            entry->type != LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE ||
+            entry->base >= SMP_TRAMPOLINE_PHYS_LIMIT) {
+            continue;
+        }
+
+        uint64_t end = entry->base + entry->length;
+        if (end < entry->base || end > SMP_TRAMPOLINE_PHYS_LIMIT) {
+            end = SMP_TRAMPOLINE_PHYS_LIMIT;
+        }
+        uint64_t start = align_down(entry->base, PAGE_SIZE);
+        end = align_up(end, PAGE_SIZE);
+        for (uint64_t phys = start; phys < end; phys += PAGE_SIZE) {
+            ok = paging_set_executable_cr3(g_kernel_cr3,
+                                            phys + g_hhdm_offset,
+                                            false) && ok;
+            ok = paging_set_writable_cr3(g_kernel_cr3,
+                                         phys + g_hhdm_offset,
+                                         true) && ok;
+            ok = paging_set_writable_cr3(g_kernel_cr3,
+                                         phys,
+                                         true) && ok;
+        }
+    }
+
+    return paging_flush_tlb_all_cpus() && ok;
 }
 
 bool paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
@@ -618,7 +683,9 @@ bool paging_mark_wc(uint64_t virt, uint64_t length) {
 }
 
 uint64_t paging_cr3() {
-    return g_cr3_value;
+    // AP bootstrap callers need the kernel address space, not a process CR3
+    // that happened to be active on another CPU.
+    return g_kernel_cr3;
 }
 
 uint64_t paging_kernel_cr3() {
@@ -638,18 +705,20 @@ uint64_t paging_kernel_phys_size() {
 }
 
 void paging_switch_cr3(uint64_t new_cr3) {
-    if (new_cr3 == 0 || new_cr3 == g_cr3_value) {
+    if (new_cr3 == 0) {
+        return;
+    }
+    uint64_t current_cr3 = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(current_cr3));
+    if ((current_cr3 & PHYSICAL_ADDRESS_MASK) ==
+        (new_cr3 & PHYSICAL_ADDRESS_MASK)) {
         return;
     }
     asm volatile("mov %0, %%cr3" : : "r"(new_cr3) : "memory");
-    g_cr3_value = new_cr3;
 }
 
 uint64_t paging_create_address_space() {
     if (pml4_table == nullptr) {
-        return 0;
-    }
-    if (g_address_space_count >= MAX_ADDRESS_SPACES) {
         return 0;
     }
     PagingStructurePage root_page = alloc_paging_structure_page();
@@ -658,11 +727,26 @@ uint64_t paging_create_address_space() {
         return 0;
     }
     memset(new_root, 0, PAGE_SIZE);
+    sync::IrqLockGuard guard(g_address_space_registry_lock);
     constexpr size_t kKernelStart = PAGE_TABLE_ENTRIES / 2;
     for (size_t i = kKernelStart; i < PAGE_TABLE_ENTRIES; ++i) {
         new_root[i] = pml4_table[i];
     }
-    g_address_space_roots[g_address_space_count++] = new_root;
+    size_t registry_slot = MAX_ADDRESS_SPACES;
+    for (size_t i = 0; i < g_address_space_count; ++i) {
+        if (g_address_space_roots[i] == nullptr) {
+            registry_slot = i;
+            break;
+        }
+    }
+    if (registry_slot == MAX_ADDRESS_SPACES) {
+        if (g_address_space_count >= MAX_ADDRESS_SPACES) {
+            memory::free_kernel_page(root_page.phys);
+            return 0;
+        }
+        registry_slot = g_address_space_count++;
+    }
+    g_address_space_roots[registry_slot] = new_root;
     return root_page.phys;
 }
 
@@ -675,6 +759,18 @@ void paging_destroy_address_space(uint64_t cr3) {
     auto* root = reinterpret_cast<uint64_t*>(table_phys_to_virt(root_phys));
     if (root == nullptr) {
         return;
+    }
+
+    // Stop publishing the root before freeing any of its tables, so a
+    // concurrent kernel-mapping update cannot write through a stale pointer.
+    {
+        sync::IrqLockGuard guard(g_address_space_registry_lock);
+        for (size_t i = 0; i < g_address_space_count; ++i) {
+            if (g_address_space_roots[i] == root) {
+                g_address_space_roots[i] = nullptr;
+                break;
+            }
+        }
     }
 
     constexpr size_t kUserPml4Entries = PAGE_TABLE_ENTRIES / 2;
@@ -692,13 +788,6 @@ void paging_destroy_address_space(uint64_t cr3) {
         destroy_table_level(child_phys, 3);
         memory::free_kernel_page(child_phys);
         root[i] = 0;
-    }
-
-    for (size_t i = 0; i < g_address_space_count; ++i) {
-        if (g_address_space_roots[i] == root) {
-            g_address_space_roots[i] = nullptr;
-            break;
-        }
     }
 
     memory::free_kernel_page(root_phys);
@@ -871,7 +960,10 @@ bool paging_flags_cr3(uint64_t cr3, uint64_t virt, uint64_t& flags_out) {
         return false;
     }
     effective &= pt_entry;
-    flags_out = (effective & PAGE_MASK) | (pt_entry & PTE_NX);
+    // Effective hardware permissions are the intersection of all levels,
+    // while software ownership is stored only on the leaf entry.
+    flags_out = (effective & PAGE_MASK) |
+                (pt_entry & (PTE_NX | PTE_MANAGED));
     return true;
 }
 

@@ -11,6 +11,7 @@ using PollFn = void (*)();
 
 void init();
 void enqueue(process::Process* proc);
+void remove(process::Process* proc);
 [[noreturn]] void run();
 [[noreturn]] void run_cpu();
 void reschedule(syscall::SyscallFrame& frame);

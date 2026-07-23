@@ -6,7 +6,7 @@ namespace descriptor {
 
 namespace descriptor_keyboard {
 
-int64_t keyboard_read(process::Process&,
+int64_t keyboard_read(process::Process& proc,
                       DescriptorEntry& entry,
                       uint64_t user_address,
                       uint64_t length,
@@ -27,6 +27,11 @@ int64_t keyboard_read(process::Process&,
         return -1;
     }
     uint32_t slot = static_cast<uint32_t>(slot_raw - 1);
+    if (!is_kernel_process(proc) &&
+        ((slot == 0 && !console_is_owner(proc)) ||
+         (slot != 0 && !framebuffer_process_owns_slot(proc, slot)))) {
+        return -1;
+    }
     size_t max_events =
         static_cast<size_t>(length) / sizeof(descriptor_defs::KeyboardEvent);
     if (max_events == 0) {
@@ -69,7 +74,9 @@ bool open_keyboard(process::Process& proc,
         }
     }
     alloc.type = kTypeKeyboard;
-    alloc.flags = static_cast<uint64_t>(Flag::Readable);
+    alloc.flags = static_cast<uint64_t>(Flag::Readable) |
+                  static_cast<uint64_t>(Flag::EventSource) |
+                  static_cast<uint64_t>(Flag::Device);
     alloc.extended_flags = 0;
     alloc.has_extended_flags = false;
     alloc.object = nullptr;

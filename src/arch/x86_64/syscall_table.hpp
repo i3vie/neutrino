@@ -64,6 +64,8 @@ enum class SystemCall : uint64_t {
     ModuleCount          = 54,
     ModuleInfo           = 55,
     RandomGet            = 56,
+    FileGetAcl           = 57,
+    FileSetAcl           = 58,
 };
 
 Result handle_syscall(SyscallFrame& frame);

@@ -10,6 +10,7 @@ bool register_keyboard_descriptor();
 bool register_mouse_descriptor();
 bool register_pipe_descriptor();
 bool register_framebuffer_descriptor();
+bool register_graphical_session_descriptor();
 bool register_block_device_descriptor();
 bool register_shared_memory_descriptor();
 bool register_vty_descriptor();
@@ -20,6 +21,7 @@ bool register_net_device_descriptor();
 bool register_net_endpoint_descriptor();
 bool register_pci_descriptor();
 bool register_audio_output_descriptor();
+bool register_sensor_descriptor();
 
 void register_builtin_types() {
     reset_block_device_registry();
@@ -47,6 +49,10 @@ void register_builtin_types() {
     if (!register_framebuffer_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register framebuffer descriptor type");
+    }
+    if (!register_graphical_session_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register graphical session descriptor type");
     }
     if (!register_block_device_descriptor()) {
         log_message(LogLevel::Warn,
@@ -87,6 +93,10 @@ void register_builtin_types() {
     if (!register_audio_output_descriptor()) {
         log_message(LogLevel::Warn,
                     "Descriptor: failed to register audio output descriptor type");
+    }
+    if (!register_sensor_descriptor()) {
+        log_message(LogLevel::Warn,
+                    "Descriptor: failed to register sensor descriptor type");
     }
 }
 

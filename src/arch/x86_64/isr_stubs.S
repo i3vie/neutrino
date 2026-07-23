@@ -1,4 +1,4 @@
-.code64
+bits 64
 section .text
 global isr_stub_table
 
@@ -31,6 +31,7 @@ isr_stub_%1:
 
 isr_common_stub:
     cli
+    cld
     push rax
     push rbx
     push rcx
@@ -50,6 +51,9 @@ isr_common_stub:
     mov rdi, rsp
     extern isr_handler
     call isr_handler
+    mov rdi, rsp
+    extern isr_validate_return
+    call isr_validate_return
 
     pop r15
     pop r14

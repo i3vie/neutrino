@@ -5,6 +5,7 @@
 #include "../process.hpp"
 #include "../random.hpp"
 #include "../scheduler.hpp"
+#include "../sync.hpp"
 #include "../vm.hpp"
 
 namespace descriptor {
@@ -50,29 +51,61 @@ struct PipeEndpoint {
 Pipe g_pipes[kMaxPipes]{};
 PipeEndpoint g_pipe_endpoints[kMaxPipes * 2]{};
 PipeWaiter g_pipe_waiters[kMaxPipeWaiters]{};
+sync::SpinLock g_pipe_pool_lock;
 
 inline size_t min_size(size_t a, size_t b) {
     return (a < b) ? a : b;
 }
 
-void lock_pipe(Pipe& pipe) {
+uint64_t lock_pipe(Pipe& pipe) {
+    uint64_t flags = sync::disable_interrupts();
     while (__atomic_test_and_set(&pipe.lock, __ATOMIC_ACQUIRE)) {
         asm volatile("pause");
     }
+    return flags;
 }
 
-void unlock_pipe(Pipe& pipe) {
+void unlock_pipe(Pipe& pipe, uint64_t flags) {
     __atomic_clear(&pipe.lock, __ATOMIC_RELEASE);
+    sync::restore_interrupts(flags);
 }
 
-Pipe* find_pipe_by_id(uint32_t id);
+bool lock_endpoint_pipe(PipeEndpoint* endpoint,
+                        bool require_read,
+                        bool require_write,
+                        Pipe*& out_pipe,
+                        uint64_t& out_irq_flags) {
+    out_pipe = nullptr;
+    out_irq_flags = sync::disable_interrupts();
+    g_pipe_pool_lock.lock();
+    if (endpoint == nullptr ||
+        !__atomic_load_n(&endpoint->in_use, __ATOMIC_ACQUIRE) ||
+        endpoint->pipe == nullptr ||
+        !__atomic_load_n(&endpoint->pipe->in_use, __ATOMIC_ACQUIRE) ||
+        (require_read && !endpoint->can_read) ||
+        (require_write && !endpoint->can_write)) {
+        g_pipe_pool_lock.unlock();
+        sync::restore_interrupts(out_irq_flags);
+        return false;
+    }
 
-Pipe* allocate_pipe() {
+    Pipe* pipe = endpoint->pipe;
+    while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+    // Lifecycle is pinned by the pipe lock before the pool lock is released.
+    g_pipe_pool_lock.unlock();
+    out_pipe = pipe;
+    return true;
+}
+
+Pipe* find_pipe_by_id_locked(uint32_t id);
+
+Pipe* allocate_pipe_locked() {
     for (auto& pipe : g_pipes) {
-        if (pipe.in_use) {
+        if (__atomic_load_n(&pipe.in_use, __ATOMIC_ACQUIRE)) {
             continue;
         }
-        pipe.in_use = true;
         pipe.head = 0;
         pipe.tail = 0;
         pipe.count = 0;
@@ -81,43 +114,44 @@ Pipe* allocate_pipe() {
         pipe.refcount = 0;
         pipe.read_waiters = nullptr;
         pipe.write_waiters = nullptr;
-        pipe.lock = 0;
         pipe.id = 0;
         uint32_t candidate = 0;
         do {
             candidate = kernel_random::opaque_id();
-        } while (find_pipe_by_id(candidate) != nullptr);
+        } while (candidate == 0 || find_pipe_by_id_locked(candidate) != nullptr);
         pipe.id = candidate;
-        memset(pipe.buffer, 0, sizeof(pipe.buffer));
+        // count is zero, so stale buffer bytes are unreachable. Publish only
+        // after the complete pipe identity and counters are initialized.
+        __atomic_store_n(&pipe.in_use, true, __ATOMIC_RELEASE);
         return &pipe;
     }
     return nullptr;
 }
 
-PipeEndpoint* allocate_pipe_endpoint(Pipe* pipe,
-                                     process::Process* owner,
-                                     bool can_read,
-                                     bool can_write) {
+PipeEndpoint* allocate_pipe_endpoint_locked(Pipe* pipe,
+                                            process::Process* owner,
+                                            bool can_read,
+                                            bool can_write) {
     for (auto& endpoint : g_pipe_endpoints) {
-        if (endpoint.in_use) {
+        if (__atomic_load_n(&endpoint.in_use, __ATOMIC_ACQUIRE)) {
             continue;
         }
-        endpoint.in_use = true;
         endpoint.pipe = pipe;
         endpoint.owner = owner;
         endpoint.can_read = can_read;
         endpoint.can_write = can_write;
+        __atomic_store_n(&endpoint.in_use, true, __ATOMIC_RELEASE);
         return &endpoint;
     }
     return nullptr;
 }
 
-Pipe* find_pipe_by_id(uint32_t id) {
+Pipe* find_pipe_by_id_locked(uint32_t id) {
     if (id == 0) {
         return nullptr;
     }
     for (auto& pipe : g_pipes) {
-        if (!pipe.in_use) {
+        if (!__atomic_load_n(&pipe.in_use, __ATOMIC_ACQUIRE)) {
             continue;
         }
         if (pipe.id == id) {
@@ -127,7 +161,7 @@ Pipe* find_pipe_by_id(uint32_t id) {
     return nullptr;
 }
 
-void release_pipe_endpoint(PipeEndpoint* endpoint) {
+void release_pipe_endpoint_locked(PipeEndpoint* endpoint) {
     if (endpoint == nullptr) {
         return;
     }
@@ -135,15 +169,20 @@ void release_pipe_endpoint(PipeEndpoint* endpoint) {
     endpoint->owner = nullptr;
     endpoint->can_read = false;
     endpoint->can_write = false;
-    endpoint->in_use = false;
+    __atomic_store_n(&endpoint->in_use, false, __ATOMIC_RELEASE);
 }
 
 PipeWaiter* allocate_pipe_waiter() {
     for (auto& waiter : g_pipe_waiters) {
-        if (waiter.in_use) {
+        bool expected = false;
+        if (!__atomic_compare_exchange_n(&waiter.in_use,
+                                         &expected,
+                                         true,
+                                         false,
+                                         __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
             continue;
         }
-        waiter.in_use = true;
         waiter.proc = nullptr;
         waiter.user_address = 0;
         waiter.length = 0;
@@ -158,12 +197,12 @@ void release_pipe_waiter(PipeWaiter* waiter) {
     if (waiter == nullptr) {
         return;
     }
-    waiter->in_use = false;
     waiter->proc = nullptr;
     waiter->user_address = 0;
     waiter->length = 0;
     waiter->is_read = false;
     waiter->next = nullptr;
+    __atomic_store_n(&waiter->in_use, false, __ATOMIC_RELEASE);
 }
 
 void push_waiter(PipeWaiter*& head, PipeWaiter* waiter) {
@@ -183,10 +222,7 @@ void complete_waiter(PipeWaiter* waiter, int64_t result) {
         release_pipe_waiter(waiter);
         return;
     }
-    waiter->proc->context.rax = static_cast<uint64_t>(result);
-    waiter->proc->state = process::State::Ready;
-    waiter->proc->waiting_on = nullptr;
-    scheduler::enqueue(waiter->proc);
+    (void)process::wake_with_result(*waiter->proc, result);
     release_pipe_waiter(waiter);
 }
 
@@ -385,13 +421,6 @@ int64_t pipe_read(process::Process& proc,
         return 0;
     }
     auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
-    if (endpoint == nullptr || !endpoint->in_use) {
-        return -1;
-    }
-    auto* pipe = endpoint->pipe;
-    if (pipe == nullptr || !pipe->in_use || !endpoint->can_read) {
-        return -1;
-    }
     if (user_address == 0 && length != 0) {
         return -1;
     }
@@ -400,13 +429,17 @@ int64_t pipe_read(process::Process& proc,
     size_t read_count = 0;
     bool async = has_flag(entry.flags, Flag::Async);
 
-    lock_pipe(*pipe);
+    Pipe* pipe = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_endpoint_pipe(endpoint, true, false, pipe, irq_flags)) {
+        return -1;
+    }
 
     if (pipe->count > 0) {
         int64_t copied =
             pipe_copy_out_to_user(*pipe, proc, user_address, requested);
         if (copied < 0) {
-            unlock_pipe(*pipe);
+            unlock_pipe(*pipe, irq_flags);
             return -1;
         }
         read_count = static_cast<size_t>(copied);
@@ -414,20 +447,26 @@ int64_t pipe_read(process::Process& proc,
 
     if (read_count > 0) {
         wake_write_waiters_locked(*pipe);
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         descriptor::wake_waiters();
         return static_cast<int64_t>(read_count);
     }
 
+    if (pipe->writer_count == 0) {
+        wake_write_waiters_locked(*pipe);
+        unlock_pipe(*pipe, irq_flags);
+        return 0;
+    }
+
     if (async) {
         wake_write_waiters_locked(*pipe);
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         return kWouldBlock;
     }
 
     PipeWaiter* waiter = allocate_pipe_waiter();
     if (waiter == nullptr) {
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         return -1;
     }
     waiter->proc = &proc;
@@ -438,10 +477,10 @@ int64_t pipe_read(process::Process& proc,
 
     push_waiter(pipe->read_waiters, waiter);
 
-    proc.state = process::State::Blocked;
     proc.waiting_on = pipe;
+    process::store_state(proc, process::State::Blocked);
 
-    unlock_pipe(*pipe);
+    unlock_pipe(*pipe, irq_flags);
     return kWouldBlock;
 }
 
@@ -457,13 +496,6 @@ int64_t pipe_write(process::Process& proc,
         return 0;
     }
     auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
-    if (endpoint == nullptr || !endpoint->in_use) {
-        return -1;
-    }
-    auto* pipe = endpoint->pipe;
-    if (pipe == nullptr || !pipe->in_use || !endpoint->can_write) {
-        return -1;
-    }
     if (user_address == 0 && length != 0) {
         return -1;
     }
@@ -472,10 +504,14 @@ int64_t pipe_write(process::Process& proc,
     size_t written = 0;
     bool async = has_flag(entry.flags, Flag::Async);
 
-    lock_pipe(*pipe);
+    Pipe* pipe = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_endpoint_pipe(endpoint, false, true, pipe, irq_flags)) {
+        return -1;
+    }
 
     if (pipe->reader_count == 0) {
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         return -1;
     }
 
@@ -483,7 +519,7 @@ int64_t pipe_write(process::Process& proc,
         int64_t copied =
             pipe_copy_in_from_user(*pipe, proc, user_address, requested);
         if (copied < 0) {
-            unlock_pipe(*pipe);
+            unlock_pipe(*pipe, irq_flags);
             return -1;
         }
         written = static_cast<size_t>(copied);
@@ -491,20 +527,20 @@ int64_t pipe_write(process::Process& proc,
 
     if (written > 0) {
         wake_read_waiters_locked(*pipe);
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         descriptor::wake_waiters();
         return static_cast<int64_t>(written);
     }
 
     if (async) {
         wake_read_waiters_locked(*pipe);
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         return kWouldBlock;
     }
 
     PipeWaiter* waiter = allocate_pipe_waiter();
     if (waiter == nullptr) {
-        unlock_pipe(*pipe);
+        unlock_pipe(*pipe, irq_flags);
         return -1;
     }
     waiter->proc = &proc;
@@ -515,10 +551,10 @@ int64_t pipe_write(process::Process& proc,
 
     push_waiter(pipe->write_waiters, waiter);
 
-    proc.state = process::State::Blocked;
     proc.waiting_on = pipe;
+    process::store_state(proc, process::State::Blocked);
 
-    unlock_pipe(*pipe);
+    unlock_pipe(*pipe, irq_flags);
     return kWouldBlock;
 }
 
@@ -531,84 +567,96 @@ int pipe_get_property(DescriptorEntry& entry,
         return -1;
     }
     auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
-    if (endpoint == nullptr || !endpoint->in_use) {
-        return -1;
-    }
-    Pipe* pipe = endpoint->pipe;
-    if (pipe == nullptr || !pipe->in_use) {
-        return -1;
-    }
     if (out == nullptr || size < sizeof(descriptor_defs::PipeInfo)) {
+        return -1;
+    }
+    Pipe* pipe = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_endpoint_pipe(endpoint, false, false, pipe, irq_flags)) {
         return -1;
     }
     auto* info = reinterpret_cast<descriptor_defs::PipeInfo*>(out);
     info->id = pipe->id;
     info->flags = static_cast<uint32_t>(entry.flags & 0xFFFFFFFFu);
+    unlock_pipe(*pipe, irq_flags);
     return 0;
 }
 
 void close_pipe(DescriptorEntry& entry) {
     auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
-    if (endpoint == nullptr || !endpoint->in_use) {
-        return;
-    }
-    Pipe* pipe = endpoint->pipe;
-    if (pipe == nullptr || !pipe->in_use) {
-        release_pipe_endpoint(endpoint);
+    if (endpoint == nullptr) {
         return;
     }
     bool notify_waiters = false;
-
-    lock_pipe(*pipe);
-
-    if (pipe->refcount > 0) {
-        --pipe->refcount;
-    }
-    if (endpoint->can_read && pipe->reader_count > 0) {
-        --pipe->reader_count;
-    }
-    if (endpoint->can_write && pipe->writer_count > 0) {
-        --pipe->writer_count;
-    }
-
-    if (pipe->writer_count == 0) {
-        wake_read_waiters_locked(*pipe);
-        notify_waiters = true;
-    }
-    if (pipe->reader_count == 0) {
-        wake_write_waiters_locked(*pipe);
-        notify_waiters = true;
-    }
-
-    drop_waiters_for_owner_locked(*pipe, endpoint->owner);
-
-    bool empty = pipe->refcount == 0;
-    if (empty) {
-        while (pipe->read_waiters != nullptr) {
-            PipeWaiter* w = pipe->read_waiters;
-            pipe->read_waiters = w->next;
-            w->next = nullptr;
-            complete_waiter(w, -1);
+    {
+        sync::IrqLockGuard pool_guard(g_pipe_pool_lock);
+        if (!__atomic_load_n(&endpoint->in_use, __ATOMIC_ACQUIRE)) {
+            return;
         }
-        while (pipe->write_waiters != nullptr) {
-            PipeWaiter* w = pipe->write_waiters;
-            pipe->write_waiters = w->next;
-            w->next = nullptr;
-            complete_waiter(w, -1);
+        Pipe* pipe = endpoint->pipe;
+        if (pipe == nullptr ||
+            !__atomic_load_n(&pipe->in_use, __ATOMIC_ACQUIRE)) {
+            release_pipe_endpoint_locked(endpoint);
+            return;
         }
-        pipe->in_use = false;
-        pipe->head = 0;
-        pipe->tail = 0;
-        pipe->count = 0;
-        pipe->reader_count = 0;
-        pipe->writer_count = 0;
-        pipe->read_waiters = nullptr;
-        pipe->write_waiters = nullptr;
-        pipe->lock = 0;
-    }
-    unlock_pipe(*pipe);
 
-    release_pipe_endpoint(endpoint);
+        uint64_t irq_flags = lock_pipe(*pipe);
+        if (!__atomic_load_n(&endpoint->in_use, __ATOMIC_ACQUIRE) ||
+            endpoint->pipe != pipe ||
+            !__atomic_load_n(&pipe->in_use, __ATOMIC_ACQUIRE)) {
+            unlock_pipe(*pipe, irq_flags);
+            return;
+        }
+
+        if (pipe->refcount > 0) {
+            --pipe->refcount;
+        }
+        if (endpoint->can_read && pipe->reader_count > 0) {
+            --pipe->reader_count;
+        }
+        if (endpoint->can_write && pipe->writer_count > 0) {
+            --pipe->writer_count;
+        }
+
+        if (pipe->writer_count == 0) {
+            wake_read_waiters_locked(*pipe);
+            notify_waiters = true;
+        }
+        if (pipe->reader_count == 0) {
+            wake_write_waiters_locked(*pipe);
+            notify_waiters = true;
+        }
+
+        drop_waiters_for_owner_locked(*pipe, endpoint->owner);
+
+        if (pipe->refcount == 0) {
+            while (pipe->read_waiters != nullptr) {
+                PipeWaiter* w = pipe->read_waiters;
+                pipe->read_waiters = w->next;
+                w->next = nullptr;
+                complete_waiter(w, -1);
+            }
+            while (pipe->write_waiters != nullptr) {
+                PipeWaiter* w = pipe->write_waiters;
+                pipe->write_waiters = w->next;
+                w->next = nullptr;
+                complete_waiter(w, -1);
+            }
+            pipe->head = 0;
+            pipe->tail = 0;
+            pipe->count = 0;
+            pipe->reader_count = 0;
+            pipe->writer_count = 0;
+            pipe->read_waiters = nullptr;
+            pipe->write_waiters = nullptr;
+            pipe->id = 0;
+            // Unpublish while lookup and ref acquisition are still excluded.
+            __atomic_store_n(&pipe->in_use, false, __ATOMIC_RELEASE);
+        }
+
+        release_pipe_endpoint_locked(endpoint);
+        unlock_pipe(*pipe, irq_flags);
+    }
     if (notify_waiters) {
         descriptor::wake_waiters();
     }
@@ -617,18 +665,14 @@ void close_pipe(DescriptorEntry& entry) {
 bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
     revents = 0;
     auto* endpoint = static_cast<PipeEndpoint*>(entry.subsystem_data);
-    if (endpoint == nullptr || !endpoint->in_use) {
+    Pipe* pipe = nullptr;
+    uint64_t irq_flags = 0;
+    if (!lock_endpoint_pipe(endpoint, false, false, pipe, irq_flags)) {
         return false;
     }
-    Pipe* pipe = endpoint->pipe;
-    if (pipe == nullptr || !pipe->in_use) {
-        return false;
-    }
-
-    lock_pipe(*pipe);
     if ((events & descriptor_defs::kWaitRead) != 0 &&
         endpoint->can_read &&
-        pipe->count > 0) {
+        (pipe->count > 0 || pipe->writer_count == 0)) {
         revents |= descriptor_defs::kWaitRead;
     }
     if ((events & descriptor_defs::kWaitWrite) != 0 &&
@@ -637,7 +681,7 @@ bool query_wait(DescriptorEntry& entry, uint32_t events, uint32_t& revents) {
         pipe->count < kPipeBufferSize) {
         revents |= descriptor_defs::kWaitWrite;
     }
-    unlock_pipe(*pipe);
+    unlock_pipe(*pipe, irq_flags);
     return true;
 }
 
@@ -661,30 +705,38 @@ bool open_pipe(process::Process& proc,
     }
 
     bool created_pipe = (existing_id == 0);
-    Pipe* pipe = created_pipe ? allocate_pipe()
-                              : find_pipe_by_id(static_cast<uint32_t>(existing_id));
-    if (pipe == nullptr || !pipe->in_use) {
-        return false;
-    }
-
-    PipeEndpoint* endpoint =
-        allocate_pipe_endpoint(pipe, &proc, want_read, want_write);
-    if (endpoint == nullptr) {
-        if (created_pipe) {
-            pipe->in_use = false;
+    Pipe* pipe = nullptr;
+    PipeEndpoint* endpoint = nullptr;
+    {
+        sync::IrqLockGuard pool_guard(g_pipe_pool_lock);
+        pipe = created_pipe
+                   ? allocate_pipe_locked()
+                   : find_pipe_by_id_locked(static_cast<uint32_t>(existing_id));
+        if (pipe == nullptr ||
+            !__atomic_load_n(&pipe->in_use, __ATOMIC_ACQUIRE)) {
+            return false;
         }
-        return false;
-    }
 
-    lock_pipe(*pipe);
-    pipe->refcount++;
-    if (want_read) {
-        pipe->reader_count++;
+        endpoint = allocate_pipe_endpoint_locked(
+            pipe, &proc, want_read, want_write);
+        if (endpoint == nullptr) {
+            if (created_pipe) {
+                pipe->id = 0;
+                __atomic_store_n(&pipe->in_use, false, __ATOMIC_RELEASE);
+            }
+            return false;
+        }
+
+        uint64_t irq_flags = lock_pipe(*pipe);
+        pipe->refcount++;
+        if (want_read) {
+            pipe->reader_count++;
+        }
+        if (want_write) {
+            pipe->writer_count++;
+        }
+        unlock_pipe(*pipe, irq_flags);
     }
-    if (want_write) {
-        pipe->writer_count++;
-    }
-    unlock_pipe(*pipe);
     descriptor::wake_waiters();
 
     uint64_t descriptor_flags = 0;

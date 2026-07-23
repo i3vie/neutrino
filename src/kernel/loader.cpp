@@ -212,6 +212,16 @@ bool build_library_path(const char* name, char* out, size_t out_size) {
     }
     size_t prefix_len = cstring_length(prefix);
     size_t name_len = cstring_length(name);
+    if ((name_len == 1 && name[0] == '.') ||
+        (name_len == 2 && name[0] == '.' && name[1] == '.')) {
+        return false;
+    }
+    for (size_t i = 0; i < name_len; ++i) {
+        unsigned char ch = static_cast<unsigned char>(name[i]);
+        if (ch < 0x20 || ch == 0x7F || ch == '/' || ch == '\\') {
+            return false;
+        }
+    }
     if (prefix_len + name_len + 1 > out_size) {
         return false;
     }
@@ -523,39 +533,49 @@ bool image_has_needed_dependencies(const loader::ProgramImage& image) {
     return info.needed_count != 0;
 }
 
-bool needed_name_at(const LoadedObject& object,
-                    uint64_t needed_offset,
-                    char* out,
-                    size_t out_size) {
+const char* dynamic_string_at(const LoadedObject& object,
+                              uint64_t string_offset,
+                              size_t& out_length) {
+    out_length = 0;
     if (object.dynamic.strtab_addr == 0 ||
-        needed_offset >= object.dynamic.strsz) {
-        return false;
+        string_offset >= object.dynamic.strsz ||
+        object.dynamic.strtab_addr > UINT64_MAX - string_offset) {
+        return nullptr;
     }
+    uint64_t remaining64 = object.dynamic.strsz - string_offset;
+    if (remaining64 > static_cast<uint64_t>(SIZE_MAX)) {
+        return nullptr;
+    }
+    size_t remaining = static_cast<size_t>(remaining64);
     loader::ProgramImage image{object.data, object.size, 0};
     const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
     const uint8_t* ptr =
         image_ptr_at_vaddr(image,
                            *header,
-                           object.dynamic.strtab_addr + needed_offset,
-                           1);
+                           object.dynamic.strtab_addr + string_offset,
+                           remaining);
     if (ptr == nullptr) {
-        return false;
+        return nullptr;
     }
-
-    size_t max_len =
-        static_cast<size_t>(object.dynamic.strsz - needed_offset);
-    size_t i = 0;
-    while (i < max_len && ptr[i] != '\0') {
-        if (i + 1 >= out_size) {
-            return false;
+    while (out_length < remaining) {
+        if (ptr[out_length] == '\0') {
+            return reinterpret_cast<const char*>(ptr);
         }
-        out[i] = static_cast<char>(ptr[i]);
-        ++i;
+        ++out_length;
     }
-    if (i >= max_len) {
+    return nullptr;
+}
+
+bool needed_name_at(const LoadedObject& object,
+                    uint64_t needed_offset,
+                    char* out,
+                    size_t out_size) {
+    size_t length = 0;
+    const char* value = dynamic_string_at(object, needed_offset, length);
+    if (value == nullptr || length + 1 > out_size) {
         return false;
     }
-    out[i] = '\0';
+    memcpy(out, value, length + 1);
     return true;
 }
 
@@ -563,22 +583,9 @@ bool symbol_name_at(const LoadedObject& object,
                     const Elf64Sym& sym,
                     const char*& out_name) {
     out_name = nullptr;
-    if (object.dynamic.strtab_addr == 0 ||
-        sym.name >= object.dynamic.strsz) {
-        return false;
-    }
-    loader::ProgramImage image{object.data, object.size, 0};
-    const auto* header = reinterpret_cast<const Elf64Ehdr*>(object.data);
-    const uint8_t* ptr =
-        image_ptr_at_vaddr(image,
-                           *header,
-                           object.dynamic.strtab_addr + sym.name,
-                           1);
-    if (ptr == nullptr) {
-        return false;
-    }
-    out_name = reinterpret_cast<const char*>(ptr);
-    return true;
+    size_t ignored_length = 0;
+    out_name = dynamic_string_at(object, sym.name, ignored_length);
+    return out_name != nullptr;
 }
 
 const Elf64Sym* dynsym_at(const LoadedObject& object, size_t index) {
@@ -1435,7 +1442,7 @@ bool load_into_process(const ProgramImage& image, process::Process& proc) {
     }
 
     proc.has_context = false;
-    proc.state = process::State::Ready;
+    process::store_state(proc, process::State::Ready);
     return true;
 }
 

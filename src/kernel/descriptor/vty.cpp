@@ -2,6 +2,7 @@
 
 #include "../../drivers/console/console.hpp"
 #include "../process.hpp"
+#include "../sync.hpp"
 #include "../vm.hpp"
 #include "../../lib/mem.hpp"
 
@@ -18,6 +19,7 @@ constexpr size_t kInputBufferSize = 256;
 
 struct Vty {
     bool in_use;
+    bool allocating;
     uint32_t id;
     uint32_t cols;
     uint32_t rows;
@@ -36,6 +38,7 @@ struct Vty {
 
 Vty g_vtys[kMaxVtys]{};
 uint32_t g_next_vty_id = 1;
+sync::SpinLock g_vty_pool_lock;
 
 inline void lock_vty(Vty& vty) {
     while (__atomic_test_and_set(&vty.lock, __ATOMIC_ACQUIRE)) {
@@ -194,7 +197,17 @@ bool dequeue_input(Vty& vty, uint8_t& out) {
     return true;
 }
 
-Vty* find_vty(uint32_t id) {
+void copy_info(const Vty& vty, descriptor_defs::VtyInfo& info) {
+    info.id = vty.id;
+    info.cols = vty.cols;
+    info.rows = vty.rows;
+    info.cursor_x = vty.cursor_x;
+    info.cursor_y = vty.cursor_y;
+    info.flags = vty.flags;
+    info.cell_bytes = sizeof(descriptor_defs::VtyCell);
+}
+
+Vty* find_vty_locked(uint32_t id) {
     if (id == 0) {
         return nullptr;
     }
@@ -206,36 +219,57 @@ Vty* find_vty(uint32_t id) {
     return nullptr;
 }
 
+Vty* find_vty(uint32_t id) {
+    sync::IrqLockGuard guard(g_vty_pool_lock);
+    return find_vty_locked(id);
+}
+
 Vty* allocate_vty() {
-    for (auto& vty : g_vtys) {
-        if (!vty.in_use) {
-            vty.in_use = true;
+    Vty* selected = nullptr;
+    {
+        sync::IrqLockGuard guard(g_vty_pool_lock);
+        for (auto& vty : g_vtys) {
+            if (vty.in_use || vty.allocating) {
+                continue;
+            }
+            vty.allocating = true;
             vty.id = g_next_vty_id++;
             if (vty.id == 0) {
                 vty.id = g_next_vty_id++;
             }
-            vty.cols = kDefaultCols;
-            vty.rows = kDefaultRows;
-            if (vty.cols > kMaxCols) {
-                vty.cols = kMaxCols;
-            }
-            if (vty.rows > kMaxRows) {
-                vty.rows = kMaxRows;
-            }
-            vty.cursor_x = 0;
-            vty.cursor_y = 0;
-            vty.flags = 0;
-            vty.fg = 0xFFFFFFFF;   // white
-            vty.bg = 0x00000000;   // black
-            vty.text_flags = 0;
-            vty.input_head = 0;
-            vty.input_tail = 0;
-            vty.lock = 0;
-            clear_all(vty);
-            return &vty;
+            selected = &vty;
+            break;
         }
     }
-    return nullptr;
+    if (selected == nullptr) {
+        return nullptr;
+    }
+
+    selected->cols = kDefaultCols;
+    selected->rows = kDefaultRows;
+    if (selected->cols > kMaxCols) {
+        selected->cols = kMaxCols;
+    }
+    if (selected->rows > kMaxRows) {
+        selected->rows = kMaxRows;
+    }
+    selected->cursor_x = 0;
+    selected->cursor_y = 0;
+    selected->flags = 0;
+    selected->fg = 0xFFFFFFFF;   // white
+    selected->bg = 0x00000000;   // black
+    selected->text_flags = 0;
+    selected->input_head = 0;
+    selected->input_tail = 0;
+    selected->lock = 0;
+    clear_all(*selected);
+
+    {
+        sync::IrqLockGuard guard(g_vty_pool_lock);
+        selected->in_use = true;
+        selected->allocating = false;
+    }
+    return selected;
 }
 
 int64_t vty_read(process::Process& proc,
@@ -335,13 +369,9 @@ int vty_get_property(DescriptorEntry& entry,
             return -1;
         }
         auto* info = reinterpret_cast<descriptor_defs::VtyInfo*>(out);
-        info->id = vty->id;
-        info->cols = vty->cols;
-        info->rows = vty->rows;
-        info->cursor_x = vty->cursor_x;
-        info->cursor_y = vty->cursor_y;
-        info->flags = vty->flags;
-        info->cell_bytes = sizeof(descriptor_defs::VtyCell);
+        lock_vty(*vty);
+        copy_info(*vty, *info);
+        unlock_vty(*vty);
         return 0;
     }
     if (property ==
@@ -479,6 +509,11 @@ bool open_vty(process::Process& proc,
         vty = allocate_vty();
     } else {
         vty = find_vty(static_cast<uint32_t>(resource_selector));
+        // Existing IDs locate a VTY but do not grant access to it. Only a
+        // process that inherited or explicitly attached this VTY may reopen.
+        if (vty != nullptr && proc.vty_id != vty->id) {
+            return false;
+        }
     }
     if (vty == nullptr) {
         return false;
@@ -563,13 +598,9 @@ int vty_get_property(uint32_t id,
             return -1;
         }
         auto* info = reinterpret_cast<descriptor_defs::VtyInfo*>(out);
-        info->id = vty->id;
-        info->cols = vty->cols;
-        info->rows = vty->rows;
-        info->cursor_x = vty->cursor_x;
-        info->cursor_y = vty->cursor_y;
-        info->flags = vty->flags;
-        info->cell_bytes = sizeof(descriptor_defs::VtyCell);
+        lock_vty(*vty);
+        copy_info(*vty, *info);
+        unlock_vty(*vty);
         return 0;
     }
     return -1;

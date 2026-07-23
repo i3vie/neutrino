@@ -81,8 +81,8 @@ uint32_t g_lapic_id = 0;
 
 volatile uint32_t* map_mmio(uint32_t phys_addr, uint64_t hhdm_offset) {
     uint64_t virt_addr = static_cast<uint64_t>(phys_addr) + hhdm_offset;
-    uint64_t flags =
-        PAGE_FLAG_WRITE | PAGE_FLAG_CACHE_DISABLE | PAGE_FLAG_WRITE_THROUGH;
+    uint64_t flags = PAGE_FLAG_WRITE | PAGE_FLAG_CACHE_DISABLE |
+                     PAGE_FLAG_WRITE_THROUGH | PAGE_FLAG_NO_EXECUTE;
     (void)paging_map_page(static_cast<uint64_t>(phys_addr),
                           static_cast<uint64_t>(phys_addr),
                           flags);

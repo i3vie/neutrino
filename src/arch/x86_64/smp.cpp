@@ -8,6 +8,7 @@
 #include "arch/x86_64/percpu.hpp"
 #include "arch/x86_64/memory/paging.hpp"
 #include "arch/x86_64/lapic.hpp"
+#include "arch/x86_64/syscall.hpp"
 #include "kernel/scheduler.hpp"
 #include "drivers/limine/limine_requests.hpp"
 #include "drivers/log/logging.hpp"
@@ -17,44 +18,70 @@ namespace {
 
 static size_t g_online_cpus = 1;
 static size_t g_cpu_count = 1;
+static bool g_aps_released = false;
 
 }  // namespace
 
-extern "C" void smp_ap_entry(struct LIMINE_MP(info)* info) {
-    auto* cpu = reinterpret_cast<percpu::Cpu*>(info->extra_argument);
-    if (cpu != nullptr) {
-        uint8_t* stack_top = cpu->bootstrap_stack + percpu::kBootstrapStackSize;
-        asm volatile("mov %0, %%rsp\n"
-                     "xor %%rbp, %%rbp\n"
-                     :
-                     : "r"(stack_top)
-                     : "memory");
-        // Ensure APs use the kernel page tables.
-        uint64_t cr3 = paging_cr3();
-        if (cr3 != 0) {
-            asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
-        }
-        percpu::set_current_cpu(cpu);
-        percpu::setup_cpu_tss(*cpu);
-        percpu::setup_cpu_gdt(*cpu);
+extern "C" [[noreturn]] void smp_ap_run(struct LIMINE_MP(info)* info,
+                                         percpu::Cpu* cpu) {
+    // Limine may enter an AP with interrupts enabled and without an IDT that
+    // remains valid in the kernel page tables. smp_ap_entry disables them
+    // before changing either the stack or CR3.
+    uint64_t cr3 = paging_cr3();
+    if (cr3 != 0) {
+        asm volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
     }
+    percpu::set_current_cpu(cpu);
+    percpu::setup_cpu_tss(*cpu);
+    percpu::setup_cpu_gdt(*cpu);
 
     cpu::init_current_cpu_features();
 
     idt_install();
+    syscall::init();
 
     // The APIC enable bit is local to each processor.  Initializing it only on
     // the BSP leaves APs unable to receive fixed IPIs such as TLB shootdowns.
     lapic::init(paging_hhdm_offset());
-    lapic::setup_timer(0x40, 10'000'000);
-
     __atomic_fetch_add(&g_online_cpus, 1, __ATOMIC_SEQ_CST);
     log_message(LogLevel::Info,
                 "SMP: AP online (processor_id=%u lapic_id=%u)",
                 info->processor_id,
                 info->lapic_id);
 
+    // The BSP starts APs before the physical allocator so Limine's low-memory
+    // trampoline can be reclaimed safely.  At this point process and scheduler
+    // globals do not exist yet.  Keep interrupts enabled so this CPU can still
+    // acknowledge TLB-shootdown IPIs, but do not start its timer or scheduler
+    // until the BSP explicitly releases it at the end of boot setup.
+    asm volatile("sti" ::: "memory");
+    while (!__atomic_load_n(&g_aps_released, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+    asm volatile("cli" ::: "memory");
+    lapic::setup_timer(0x40, 10'000'000);
     scheduler::run_cpu();
+}
+
+extern "C" [[noreturn]] void smp_ap_switch_stack(
+    uint8_t* stack_top,
+    struct LIMINE_MP(info)* info,
+    percpu::Cpu* cpu);
+
+extern "C" [[noreturn]] void smp_ap_entry(struct LIMINE_MP(info)* info) {
+    asm volatile("cli" ::: "memory");
+
+    auto* cpu = info == nullptr
+                    ? nullptr
+                    : reinterpret_cast<percpu::Cpu*>(info->extra_argument);
+    if (cpu == nullptr) {
+        for (;;) {
+            asm volatile("hlt");
+        }
+    }
+
+    uint8_t* stack_top = cpu->bootstrap_stack + percpu::kBootstrapStackSize;
+    smp_ap_switch_stack(stack_top, info, cpu);
 }
 
 void init() {
@@ -64,6 +91,10 @@ void init() {
         log_message(LogLevel::Warn,
                     "SMP: Limine SMP/MP request not satisfied, continuing "
                     "single-core");
+        if (!paging_finish_smp_bootstrap()) {
+            log_message(LogLevel::Warn,
+                        "SMP: failed to restore NX on the boot trampoline");
+        }
         return;
     }
 
@@ -120,11 +151,26 @@ void init() {
 
     if (ap_slots == 0) {
         log_message(LogLevel::Info, "SMP: no APs to boot");
+    } else {
+        const size_t expected_online = ap_slots + 1;
+        while (__atomic_load_n(&g_online_cpus, __ATOMIC_ACQUIRE) <
+               expected_online) {
+            asm volatile("pause");
+        }
+    }
+
+    if (!paging_finish_smp_bootstrap()) {
+        log_message(LogLevel::Warn,
+                    "SMP: failed to restore NX on the boot trampoline");
     }
 
     log_message(LogLevel::Info,
                 "SMP: scheduler sees %u CPU(s)",
                 static_cast<unsigned int>(scheduler::cpu_total()));
+}
+
+void release_aps() {
+    __atomic_store_n(&g_aps_released, true, __ATOMIC_RELEASE);
 }
 
 size_t cpu_count() {

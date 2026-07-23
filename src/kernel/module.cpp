@@ -31,6 +31,31 @@ const Descriptor* g_initialized[kMaxInitializedModules]{};
 size_t g_initialized_count = 0;
 alignas(16) uint8_t g_module_image[kMaxModuleImageSize];
 uint64_t g_next_module_virt = kModuleVirtBase;
+bool g_module_load_active = false;
+
+class ModuleLoadGuard {
+public:
+    ModuleLoadGuard() {
+        bool expected = false;
+        acquired_ = __atomic_compare_exchange_n(&g_module_load_active,
+                                                &expected,
+                                                true,
+                                                false,
+                                                __ATOMIC_ACQUIRE,
+                                                __ATOMIC_RELAXED);
+    }
+
+    ~ModuleLoadGuard() {
+        if (acquired_) {
+            __atomic_store_n(&g_module_load_active, false, __ATOMIC_RELEASE);
+        }
+    }
+
+    explicit operator bool() const { return acquired_; }
+
+private:
+    bool acquired_ = false;
+};
 
 enum class ElfIdent : size_t {
     Class = 4,
@@ -127,6 +152,7 @@ struct Elf64Rela {
 
 struct LoadedDiskModule {
     bool used;
+    bool initialized;
     char path[128];
     uint64_t phys;
     uint8_t* image;
@@ -135,11 +161,26 @@ struct LoadedDiskModule {
 
 LoadedDiskModule g_loaded_modules[kMaxLoadedModules]{};
 
-constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
-    if (alignment <= 1) {
-        return value;
+bool module_slot_used(const LoadedDiskModule& module) {
+    return __atomic_load_n(&module.used, __ATOMIC_ACQUIRE);
+}
+
+constexpr bool is_power_of_two(uint64_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+bool align_up_checked(uint64_t value,
+                      uint64_t alignment,
+                      uint64_t& out_value) {
+    if (!is_power_of_two(alignment)) {
+        return false;
     }
-    return (value + alignment - 1) & ~(alignment - 1);
+    uint64_t mask = alignment - 1;
+    if (value > UINT64_MAX - mask) {
+        return false;
+    }
+    out_value = (value + mask) & ~mask;
+    return true;
 }
 
 uint32_t elf_relocation_type(const Elf64Rela& rela) {
@@ -178,6 +219,14 @@ void copy_string(char* dest, size_t dest_size, const char* src) {
         ++i;
     }
     dest[i] = '\0';
+}
+
+void publish_loaded_module(LoadedDiskModule& module,
+                           const char* path,
+                           bool initialized) {
+    copy_string(module.path, sizeof(module.path), path);
+    module.initialized = initialized;
+    __atomic_store_n(&module.used, true, __ATOMIC_RELEASE);
 }
 
 void api_log(uint8_t level, const char* message) {
@@ -371,7 +420,15 @@ const char* string_at(const uint8_t* data,
         strings.offset + strings.size < strings.offset) {
         return nullptr;
     }
-    return reinterpret_cast<const char*>(data + strings.offset + offset);
+    const char* value =
+        reinterpret_cast<const char*>(data + strings.offset + offset);
+    size_t remaining = static_cast<size_t>(strings.size - offset);
+    for (size_t i = 0; i < remaining; ++i) {
+        if (value[i] == '\0') {
+            return value;
+        }
+    }
+    return nullptr;
 }
 
 bool section_data_valid(const Elf64Shdr& section, size_t image_size) {
@@ -400,42 +457,73 @@ bool allocate_module_sections(const uint8_t* data,
             log_message(LogLevel::Warn, "Module: section exceeds image");
             return false;
         }
+        if (section->addralign != 0 &&
+            !is_power_of_two(section->addralign)) {
+            log_message(LogLevel::Warn,
+                        "Module: section has invalid alignment");
+            return false;
+        }
+        if (section->addralign > kPageSize) {
+            log_message(LogLevel::Warn,
+                        "Module: section alignment exceeds loader support");
+            return false;
+        }
         uint64_t alignment = section->addralign == 0 ? 1 : section->addralign;
         if (alignment < kPageSize) {
             alignment = kPageSize;
         }
-        required = align_up(required, alignment);
-        section_addrs[i] = required;
-        required += section->size;
-        if (required < section->size) {
+        if (!align_up_checked(required, alignment, required)) {
             return false;
         }
+        section_addrs[i] = required;
+        if (section->size > UINT64_MAX - required) {
+            return false;
+        }
+        required += section->size;
     }
     if (required == 0) {
         log_message(LogLevel::Warn, "Module: no allocatable sections");
         return false;
     }
 
-    size_t pages = static_cast<size_t>(align_up(required, kPageSize) / kPageSize);
+    uint64_t rounded_required = 0;
+    if (!align_up_checked(required, kPageSize, rounded_required)) {
+        return false;
+    }
+    if (rounded_required > kModuleVirtLimit - kModuleVirtBase) {
+        log_message(LogLevel::Warn, "Module: allocatable image is too large");
+        return false;
+    }
+    size_t pages = static_cast<size_t>(rounded_required / kPageSize);
     uint64_t phys = memory::alloc_kernel_block_pages(pages);
     if (phys == 0) {
         log_message(LogLevel::Warn, "Module: failed to allocate memory");
         return false;
     }
 
-    uint64_t virt = align_up(g_next_module_virt, kPageSize);
-    uint64_t bytes = pages * kPageSize;
+    uint64_t virt = 0;
+    if (!align_up_checked(g_next_module_virt, kPageSize, virt)) {
+        memory::free_kernel_block(phys);
+        return false;
+    }
+    uint64_t bytes = rounded_required;
     if (virt + bytes > kModuleVirtLimit || virt + bytes < virt) {
         log_message(LogLevel::Warn, "Module: virtual module window is full");
         memory::free_kernel_block(phys);
         return false;
     }
-    for (size_t page = 0; page < pages; ++page) {
+    size_t mapped_pages = 0;
+    for (; mapped_pages < pages; ++mapped_pages) {
+        size_t page = mapped_pages;
         if (!paging_map_page(virt + page * kPageSize,
                              phys + page * kPageSize,
                              PAGE_FLAG_WRITE | PAGE_FLAG_GLOBAL |
                                  PAGE_FLAG_NO_EXECUTE)) {
             log_message(LogLevel::Warn, "Module: failed to map module page");
+            for (size_t mapped = 0; mapped < mapped_pages; ++mapped) {
+                uint64_t ignored = 0;
+                paging_unmap_page(virt + mapped * kPageSize, ignored);
+            }
             memory::free_kernel_block(phys);
             return false;
         }
@@ -466,6 +554,27 @@ bool allocate_module_sections(const uint8_t* data,
     return true;
 }
 
+void release_module_image(LoadedDiskModule& loaded) {
+    if (loaded.image != nullptr) {
+        uint64_t base = reinterpret_cast<uint64_t>(loaded.image);
+        for (size_t offset = 0; offset < loaded.image_size;
+             offset += kPageSize) {
+            uint64_t ignored = 0;
+            paging_unmap_page(base + offset, ignored);
+        }
+        if (loaded.image_size <= UINT64_MAX - base &&
+            g_next_module_virt == base + loaded.image_size) {
+            g_next_module_virt = base;
+        }
+    }
+    if (loaded.phys != 0) {
+        memory::free_kernel_block(loaded.phys);
+    }
+    loaded.phys = 0;
+    loaded.image = nullptr;
+    loaded.image_size = 0;
+}
+
 bool protect_module_sections(const uint8_t* data,
                              const Elf64Ehdr& header,
                              const uint64_t (&section_addrs)[kMaxSections]) {
@@ -484,8 +593,16 @@ bool protect_module_sections(const uint8_t* data,
                         "Module: refusing writable executable section");
             return false;
         }
+        if (section->size > UINT64_MAX - section_addrs[i]) {
+            return false;
+        }
         uint64_t start = section_addrs[i] & ~(kPageSize - 1);
-        uint64_t end = align_up(section_addrs[i] + section->size, kPageSize);
+        uint64_t end = 0;
+        if (!align_up_checked(section_addrs[i] + section->size,
+                              kPageSize,
+                              end)) {
+            return false;
+        }
         for (uint64_t page = start; page < end; page += kPageSize) {
             if (!paging_set_writable_cr3(cr3, page, writable) ||
                 !paging_set_executable_cr3(cr3, page, executable)) {
@@ -532,6 +649,8 @@ bool resolve_external_symbol(const char* name, uint64_t& out_value) {
          reinterpret_cast<uint64_t>(
              static_cast<uint32_t (*)(const pci::PciDevice&, uint8_t)>(
                  &pci::read_config32))},
+        {"_ZN3pci15find_capabilityERKNS_9PciDeviceEh",
+         reinterpret_cast<uint64_t>(&pci::find_capability)},
         {"_ZN3pci14write_config16ERKNS_9PciDeviceEht",
          reinterpret_cast<uint64_t>(
              static_cast<void (*)(const pci::PciDevice&, uint8_t, uint16_t)>(
@@ -598,6 +717,12 @@ bool resolve_symbol_value(const uint8_t* data,
         return true;
     }
     if (sym.shndx >= header.shnum || section_addrs[sym.shndx] == 0) {
+        return false;
+    }
+    const Elf64Shdr* section = section_at(data, header, sym.shndx);
+    if (section == nullptr || sym.value > section->size ||
+        sym.size > section->size - sym.value ||
+        sym.value > UINT64_MAX - section_addrs[sym.shndx]) {
         return false;
     }
     out_value = section_addrs[sym.shndx] + sym.value;
@@ -675,7 +800,8 @@ bool apply_module_relocations(const uint8_t* data,
         if (rela_section->info >= header.shnum ||
             rela_section->link >= header.shnum ||
             rela_section->entsize < sizeof(Elf64Rela) ||
-            rela_section->offset + rela_section->size > image_size) {
+            !section_data_valid(*rela_section, image_size) ||
+            rela_section->size % rela_section->entsize != 0) {
             return false;
         }
         uint64_t target_base = section_addrs[rela_section->info];
@@ -686,7 +812,8 @@ bool apply_module_relocations(const uint8_t* data,
         if (symtab == nullptr || symtab->type != SHT_SYMTAB ||
             symtab->link >= header.shnum ||
             symtab->entsize < sizeof(Elf64Sym) ||
-            symtab->offset + symtab->size > image_size) {
+            !section_data_valid(*symtab, image_size) ||
+            symtab->size % symtab->entsize != 0) {
             return false;
         }
         const Elf64Shdr* string_table = section_at(data, header, symtab->link);
@@ -748,7 +875,8 @@ bool find_symbol(const uint8_t* data,
         if (symtab == nullptr || symtab->type != SHT_SYMTAB ||
             symtab->link >= header.shnum ||
             symtab->entsize < sizeof(Elf64Sym) ||
-            symtab->offset + symtab->size > image_size) {
+            !section_data_valid(*symtab, image_size) ||
+            symtab->size % symtab->entsize != 0) {
             continue;
         }
         const Elf64Shdr* string_table = section_at(data, header, symtab->link);
@@ -767,6 +895,16 @@ bool find_symbol(const uint8_t* data,
             if (!strings_equal(candidate, name)) {
                 continue;
             }
+            if (sym->shndx >= header.shnum) {
+                return false;
+            }
+            const Elf64Shdr* target = section_at(data, header, sym->shndx);
+            if (target == nullptr ||
+                (target->flags & (SHF_ALLOC | SHF_EXECINSTR)) !=
+                    (SHF_ALLOC | SHF_EXECINSTR) ||
+                sym->value >= target->size) {
+                return false;
+            }
             return resolve_symbol_value(data,
                                         image_size,
                                         header,
@@ -781,21 +919,21 @@ bool find_symbol(const uint8_t* data,
 
 LoadedDiskModule* allocate_loaded_module_slot() {
     for (size_t i = 0; i < kMaxLoadedModules; ++i) {
-        if (!g_loaded_modules[i].used) {
+        if (!module_slot_used(g_loaded_modules[i])) {
             return &g_loaded_modules[i];
         }
     }
     return nullptr;
 }
 
-bool loaded_module_path_exists(const char* path) {
+LoadedDiskModule* find_loaded_module(const char* path) {
     for (size_t i = 0; i < kMaxLoadedModules; ++i) {
-        if (g_loaded_modules[i].used &&
+        if (module_slot_used(g_loaded_modules[i]) &&
             strings_equal(g_loaded_modules[i].path, path)) {
-            return true;
+            return &g_loaded_modules[i];
         }
     }
-    return false;
+    return nullptr;
 }
 
 }  // namespace
@@ -852,7 +990,7 @@ bool initialize_phase(Phase phase) {
 size_t loaded_count() {
     size_t total = g_initialized_count;
     for (size_t i = 0; i < kMaxLoadedModules; ++i) {
-        if (g_loaded_modules[i].used) {
+        if (module_slot_used(g_loaded_modules[i])) {
             ++total;
         }
     }
@@ -875,7 +1013,7 @@ bool info_at(size_t index, ModuleInfo& out_info) {
     index -= g_initialized_count;
     for (size_t i = 0; i < kMaxLoadedModules; ++i) {
         const LoadedDiskModule& module = g_loaded_modules[i];
-        if (!module.used) {
+        if (!module_slot_used(module)) {
             continue;
         }
         if (index != 0) {
@@ -899,9 +1037,19 @@ bool info_at(size_t index, ModuleInfo& out_info) {
 }
 
 bool load_from_file(const char* path) {
-    if (loaded_module_path_exists(path)) {
-        log_message(LogLevel::Info, "Module: %s already loaded", path);
-        return true;
+    ModuleLoadGuard load_guard;
+    if (!load_guard) {
+        log_message(LogLevel::Warn, "Module: another load is in progress");
+        return false;
+    }
+
+    if (LoadedDiskModule* existing = find_loaded_module(path);
+        existing != nullptr) {
+        log_message(LogLevel::Info,
+                    "Module: %s is already resident%s",
+                    path,
+                    existing->initialized ? "" : " after a failed init");
+        return existing->initialized;
     }
 
     uint8_t* data = nullptr;
@@ -931,17 +1079,11 @@ bool load_from_file(const char* path) {
     }
     if (!apply_module_relocations(data, image_size, *header, section_addrs)) {
         log_message(LogLevel::Warn, "Module: failed to relocate %s", path);
-        memory::free_kernel_block(loaded->phys);
-        loaded->phys = 0;
-        loaded->image = nullptr;
-        loaded->image_size = 0;
+        release_module_image(*loaded);
         return false;
     }
     if (!protect_module_sections(data, *header, section_addrs)) {
-        memory::free_kernel_block(loaded->phys);
-        loaded->phys = 0;
-        loaded->image = nullptr;
-        loaded->image_size = 0;
+        release_module_image(*loaded);
         return false;
     }
 
@@ -955,10 +1097,7 @@ bool load_from_file(const char* path) {
         log_message(LogLevel::Warn,
                     "Module: %s does not export neutrino_module_init",
                     path);
-        memory::free_kernel_block(loaded->phys);
-        loaded->phys = 0;
-        loaded->image = nullptr;
-        loaded->image_size = 0;
+        release_module_image(*loaded);
         return false;
     }
 
@@ -967,17 +1106,14 @@ bool load_from_file(const char* path) {
     log_message(LogLevel::Info, "Module: loading %s", path);
     if (!init(&g_disk_module_api)) {
         log_message(LogLevel::Warn,
-                    "Module: %s initialization failed",
+                    "Module: %s initialization failed; keeping its image "
+                    "resident because callbacks may have escaped",
                     path);
-        memory::free_kernel_block(loaded->phys);
-        loaded->phys = 0;
-        loaded->image = nullptr;
-        loaded->image_size = 0;
+        publish_loaded_module(*loaded, path, false);
         return false;
     }
 
-    loaded->used = true;
-    copy_string(loaded->path, sizeof(loaded->path), path);
+    publish_loaded_module(*loaded, path, true);
     log_message(LogLevel::Info, "Module: loaded %s", path);
     return true;
 }
