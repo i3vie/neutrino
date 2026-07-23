@@ -794,6 +794,14 @@ bool zero_range(Fat32Volume& volume,
 bool resolve_entry(Fat32Volume& volume,
                    const char* path,
                    Fat32DirEntry& out_entry);
+bool read_directory_raw_entry(Fat32Volume& volume,
+                              uint32_t directory_cluster,
+                              uint32_t raw_index,
+                              uint8_t (&out)[32]);
+bool write_directory_raw_entry(Fat32Volume& volume,
+                               uint32_t directory_cluster,
+                               uint32_t raw_index,
+                               const uint8_t (&entry)[32]);
 
 bool update_directory_entry(Fat32Volume& volume,
                             const Fat32DirEntry& entry) {
@@ -850,55 +858,46 @@ bool update_directory_entry(Fat32Volume& volume,
     return write_sector(volume.device, lba + sector_offset, sector_buffer);
 }
 
-bool with_directory_entry_sector(Fat32Volume& volume,
-                                 const Fat32DirEntry& entry,
-                                 uint8_t*& out_raw,
-                                 uint32_t& out_lba) {
-    uint32_t entries_per_cluster32 =
-        static_cast<uint32_t>(entries_per_cluster(volume));
-    if (entries_per_cluster32 == 0) {
-        return false;
-    }
-
-    uint32_t raw_index = entry.raw_entry_index;
-    uint32_t cluster_offset = raw_index / entries_per_cluster32;
-    uint32_t index_in_cluster = raw_index % entries_per_cluster32;
-
-    uint32_t cluster = entry.directory_cluster;
-    if (cluster < 2) {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < cluster_offset; ++i) {
-        uint32_t next = read_fat_entry(volume, cluster);
-        if (next == kFatBadCluster || next >= kFatEoc) {
-            return false;
-        }
-        cluster = next;
-    }
-
-    uint32_t lba = cluster_to_lba(volume, cluster);
-    uint32_t entry_byte = index_in_cluster * 32;
-    uint32_t sector_offset = entry_byte / 512;
-    uint32_t byte_offset = entry_byte % 512;
-
-    out_lba = lba + sector_offset;
-    if (!read_sector(volume.device, out_lba, sector_buffer)) {
-        return false;
-    }
-    out_raw = sector_buffer + byte_offset;
-    return true;
-}
-
 bool mark_directory_entry_deleted(Fat32Volume& volume,
                                   const Fat32DirEntry& entry) {
-    uint8_t* raw = nullptr;
-    uint32_t lba = 0;
-    if (!with_directory_entry_sector(volume, entry, raw, lba)) {
+    uint8_t short_entry[32];
+    if (!read_directory_raw_entry(volume,
+                                  entry.directory_cluster,
+                                  entry.raw_entry_index,
+                                  short_entry)) {
         return false;
     }
-    raw[0] = 0xE5;
-    return write_sector(volume.device, lba, sector_buffer);
+
+    uint8_t checksum = lfn_checksum(short_entry);
+    uint32_t index = entry.raw_entry_index;
+    for (uint32_t count = 0; count < kLfnMaxEntries && index != 0; ++count) {
+        --index;
+        uint8_t raw[32];
+        if (!read_directory_raw_entry(volume,
+                                      entry.directory_cluster,
+                                      index,
+                                      raw) ||
+            raw[11] != ATTR_LONG_NAME || raw[13] != checksum) {
+            break;
+        }
+        bool last = (raw[0] & kLfnLastFlag) != 0;
+        raw[0] = 0xE5;
+        if (!write_directory_raw_entry(volume,
+                                       entry.directory_cluster,
+                                       index,
+                                       raw)) {
+            return false;
+        }
+        if (last) {
+            break;
+        }
+    }
+
+    short_entry[0] = 0xE5;
+    return write_directory_raw_entry(volume,
+                                     entry.directory_cluster,
+                                     entry.raw_entry_index,
+                                     short_entry);
 }
 
 bool free_cluster_chain(Fat32Volume& volume, uint32_t first_cluster) {
@@ -1097,10 +1096,8 @@ bool resolve_entry(Fat32Volume& volume,
 }
 
 struct DirectorySlot {
-    uint32_t cluster;
-    uint32_t entry_index;
-    uint32_t raw_index;
-    bool was_end_marker;
+    uint32_t start_raw_index;
+    uint32_t short_raw_index;
 };
 
 bool split_parent_and_name(Fat32Volume& volume,
@@ -1145,25 +1142,118 @@ bool split_parent_and_name(Fat32Volume& volume,
     return false;
 }
 
-bool find_directory_slot(Fat32Volume& volume,
-                         uint32_t directory_cluster,
-                         DirectorySlot& out_slot) {
+bool ensure_directory_capacity(Fat32Volume& volume,
+                               uint32_t directory_cluster,
+                               uint32_t required_entries) {
     const size_t cluster_entries = entries_per_cluster(volume);
-    if (cluster_entries == 0) {
+    if (cluster_entries == 0 || directory_cluster < 2 || required_entries == 0) {
         return false;
     }
 
-    size_t cluster_size =
-        static_cast<size_t>(volume.sectors_per_cluster) * 512u;
-    if (cluster_size > sizeof(cluster_buffer)) {
-        log_message(LogLevel::Warn,
-                    "FAT32: cluster size %zu exceeds buffer capacity",
-                    cluster_size);
+    uint32_t required_clusters = static_cast<uint32_t>(
+        (required_entries + cluster_entries - 1) / cluster_entries);
+    uint32_t length = 0;
+    uint32_t tail = 0;
+    if (!get_chain_info(volume, directory_cluster, length, tail) || length == 0) {
+        return false;
+    }
+    while (length < required_clusters) {
+        uint32_t new_cluster = 0;
+        if (!allocate_cluster(volume, new_cluster)) {
+            return false;
+        }
+        if (!write_fat_entry(volume, tail, new_cluster)) {
+            (void)write_fat_entry(volume, new_cluster, kFatFreeCluster);
+            return false;
+        }
+        tail = new_cluster;
+        ++length;
+    }
+    return true;
+}
+
+bool directory_cluster_for_raw_index(Fat32Volume& volume,
+                                     uint32_t directory_cluster,
+                                     uint32_t raw_index,
+                                     uint32_t& out_cluster,
+                                     uint32_t& out_index_in_cluster) {
+    uint32_t cluster_entries =
+        static_cast<uint32_t>(entries_per_cluster(volume));
+    if (cluster_entries == 0 || directory_cluster < 2) {
+        return false;
+    }
+    uint32_t cluster_offset = raw_index / cluster_entries;
+    uint32_t cluster = directory_cluster;
+    for (uint32_t i = 0; i < cluster_offset; ++i) {
+        uint32_t next = read_fat_entry(volume, cluster);
+        if (next == kFatBadCluster || next >= kFatEoc) {
+            return false;
+        }
+        cluster = next;
+    }
+    out_cluster = cluster;
+    out_index_in_cluster = raw_index % cluster_entries;
+    return true;
+}
+
+bool read_directory_raw_entry(Fat32Volume& volume,
+                              uint32_t directory_cluster,
+                              uint32_t raw_index,
+                              uint8_t (&out)[32]) {
+    uint32_t cluster = 0;
+    uint32_t index = 0;
+    if (!directory_cluster_for_raw_index(volume,
+                                         directory_cluster,
+                                         raw_index,
+                                         cluster,
+                                         index)) {
+        return false;
+    }
+    uint32_t entry_byte = index * 32;
+    uint32_t lba = cluster_to_lba(volume, cluster) + entry_byte / 512;
+    if (!read_sector(volume.device, lba, sector_buffer)) {
+        return false;
+    }
+    memcpy(out, sector_buffer + entry_byte % 512, 32);
+    return true;
+}
+
+bool write_directory_raw_entry(Fat32Volume& volume,
+                               uint32_t directory_cluster,
+                               uint32_t raw_index,
+                               const uint8_t (&entry)[32]) {
+    uint32_t cluster = 0;
+    uint32_t index = 0;
+    if (!directory_cluster_for_raw_index(volume,
+                                         directory_cluster,
+                                         raw_index,
+                                         cluster,
+                                         index)) {
+        return false;
+    }
+    uint32_t entry_byte = index * 32;
+    uint32_t lba = cluster_to_lba(volume, cluster) + entry_byte / 512;
+    if (!read_sector(volume.device, lba, sector_buffer)) {
+        return false;
+    }
+    memcpy(sector_buffer + entry_byte % 512, entry, 32);
+    return write_sector(volume.device, lba, sector_buffer);
+}
+
+bool find_directory_slots(Fat32Volume& volume,
+                          uint32_t directory_cluster,
+                          uint32_t needed,
+                          DirectorySlot& out_slot) {
+    const uint32_t cluster_entries =
+        static_cast<uint32_t>(entries_per_cluster(volume));
+    if (cluster_entries == 0 || needed == 0 || directory_cluster < 2) {
         return false;
     }
 
     uint32_t current_cluster = directory_cluster;
     uint32_t raw_index = 0;
+    uint32_t run_start = 0;
+    uint32_t run_length = 0;
 
     while (true) {
         if (!read_sectors(volume.device,
@@ -1173,16 +1263,36 @@ bool find_directory_slot(Fat32Volume& volume,
             return false;
         }
 
-        for (size_t i = 0; i < cluster_entries; ++i, ++raw_index) {
+        for (uint32_t i = 0; i < cluster_entries; ++i, ++raw_index) {
             uint8_t* entry =
                 reinterpret_cast<uint8_t*>(cluster_buffer + i * 32);
             uint8_t first = entry[0];
-            if (first == 0x00 || first == 0xE5) {
-                out_slot.cluster = current_cluster;
-                out_slot.entry_index = static_cast<uint32_t>(i);
-                out_slot.raw_index = raw_index;
-                out_slot.was_end_marker = (first == 0x00);
+            if (first == 0x00) {
+                if (run_length == 0) {
+                    run_start = raw_index;
+                }
+                uint32_t required_entries = run_start + needed;
+                if (!ensure_directory_capacity(volume,
+                                               directory_cluster,
+                                               required_entries)) {
+                    return false;
+                }
+                out_slot.start_raw_index = run_start;
+                out_slot.short_raw_index = required_entries - 1;
                 return true;
+            }
+            if (first == 0xE5) {
+                if (run_length == 0) {
+                    run_start = raw_index;
+                }
+                ++run_length;
+                if (run_length == needed) {
+                    out_slot.start_raw_index = run_start;
+                    out_slot.short_raw_index = raw_index;
+                    return true;
+                }
+            } else {
+                run_length = 0;
             }
         }
 
@@ -1193,23 +1303,206 @@ bool find_directory_slot(Fat32Volume& volume,
             return false;
         }
         if (next >= kFatEoc) {
-            uint32_t new_cluster = 0;
-            if (!allocate_cluster(volume, new_cluster)) {
+            if (run_length == 0) {
+                run_start = raw_index;
+            }
+            uint32_t required_entries = run_start + needed;
+            if (!ensure_directory_capacity(volume,
+                                           directory_cluster,
+                                           required_entries)) {
                 return false;
             }
-            if (!write_fat_entry(volume, current_cluster, new_cluster)) {
-                return false;
-            }
-            current_cluster = new_cluster;
-            memset(cluster_buffer, 0, cluster_size);
-            out_slot.cluster = current_cluster;
-            out_slot.entry_index = 0;
-            out_slot.raw_index = raw_index;
-            out_slot.was_end_marker = true;
+            out_slot.start_raw_index = run_start;
+            out_slot.short_raw_index = required_entries - 1;
             return true;
         }
         current_cluster = next;
     }
+}
+
+bool valid_long_name(const char* name, size_t& out_length) {
+    out_length = 0;
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    for (; name[out_length] != '\0'; ++out_length) {
+        unsigned char ch = static_cast<unsigned char>(name[out_length]);
+        if (out_length + 1 >= sizeof(Fat32DirEntry::name) || ch < 0x20 ||
+            ch > 0x7E || ch == '"' || ch == '*' || ch == '/' || ch == ':' ||
+            ch == '<' || ch == '>' || ch == '?' || ch == '\\' || ch == '|') {
+            return false;
+        }
+    }
+    return name[out_length - 1] != ' ' && name[out_length - 1] != '.';
+}
+
+bool short_name_available(Fat32Volume& volume,
+                          uint32_t directory_cluster,
+                          const uint8_t (&candidate)[11]) {
+    bool found = false;
+    bool ok = iterate_directory(
+        volume,
+        directory_cluster,
+        [&](const uint8_t* raw, uint32_t, uint32_t, uint32_t,
+            const char*) -> IterationResult {
+            if (memcmp(raw, candidate, 11) == 0) {
+                found = true;
+                return IterationResult::StopSuccess;
+            }
+            return IterationResult::Continue;
+        });
+    return ok && !found;
+}
+
+bool build_unique_short_alias(Fat32Volume& volume,
+                              uint32_t directory_cluster,
+                              const char* name,
+                              uint8_t (&out)[11]) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; name[i] != '\0'; ++i) {
+        hash ^= static_cast<uint8_t>(name[i]);
+        hash *= 16777619u;
+    }
+
+    const char* extension = nullptr;
+    for (const char* cursor = name; *cursor != '\0'; ++cursor) {
+        if (*cursor == '.') {
+            extension = cursor + 1;
+        }
+    }
+    constexpr char kHex[] = "0123456789ABCDEF";
+    for (uint32_t attempt = 0; attempt < 256; ++attempt) {
+        memset(out, ' ', 11);
+        uint32_t value = hash ^ (attempt * 0x9E3779B9u);
+        out[0] = '~';
+        for (size_t i = 0; i < 7; ++i) {
+            out[7 - i] = static_cast<uint8_t>(kHex[value & 0x0Fu]);
+            value = (value >> 4) ^ (value << 28);
+        }
+        if (extension != nullptr) {
+            for (size_t i = 0; i < 3 && extension[i] != '\0'; ++i) {
+                char ch = extension[i];
+                if (ch >= 'a' && ch <= 'z') {
+                    ch = static_cast<char>(ch - ('a' - 'A'));
+                }
+                if (!((ch >= 'A' && ch <= 'Z') ||
+                      (ch >= '0' && ch <= '9'))) {
+                    ch = '_';
+                }
+                out[8 + i] = static_cast<uint8_t>(ch);
+            }
+        }
+        if (short_name_available(volume, directory_cluster, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void store_utf16(uint8_t* entry, size_t offset, uint16_t value) {
+    entry[offset] = static_cast<uint8_t>(value & 0xFFu);
+    entry[offset + 1] = static_cast<uint8_t>(value >> 8);
+}
+
+void build_lfn_entry(const char* name,
+                     size_t name_length,
+                     uint8_t sequence,
+                     uint8_t sequence_count,
+                     uint8_t checksum,
+                     uint8_t (&out)[32]) {
+    memset(out, 0, 32);
+    out[0] = static_cast<uint8_t>(sequence |
+                                  (sequence == sequence_count
+                                       ? kLfnLastFlag
+                                       : 0));
+    out[11] = ATTR_LONG_NAME;
+    out[12] = kLfnType;
+    out[13] = checksum;
+    static constexpr uint8_t kOffsets[kLfnCharsPerEntry] = {
+        1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30,
+    };
+    size_t base = (static_cast<size_t>(sequence) - 1u) * kLfnCharsPerEntry;
+    for (size_t i = 0; i < kLfnCharsPerEntry; ++i) {
+        size_t index = base + i;
+        uint16_t value = 0xFFFFu;
+        if (index < name_length) {
+            value = static_cast<uint8_t>(name[index]);
+        } else if (index == name_length) {
+            value = 0x0000u;
+        }
+        store_utf16(out, kOffsets[i], value);
+    }
+}
+
+bool create_named_entry(Fat32Volume& volume,
+                        uint32_t parent_cluster,
+                        const char* name,
+                        uint8_t attributes,
+                        uint32_t first_cluster,
+                        Fat32DirEntry& out_entry) {
+    uint8_t short_name[11];
+    bool needs_lfn = !build_short_name(name, short_name);
+    size_t name_length = 0;
+    if (needs_lfn &&
+        (!valid_long_name(name, name_length) ||
+         !build_unique_short_alias(volume, parent_cluster, name, short_name))) {
+        return false;
+    }
+
+    uint32_t lfn_count = needs_lfn
+                             ? static_cast<uint32_t>(
+                                   (name_length + kLfnCharsPerEntry - 1) /
+                                   kLfnCharsPerEntry)
+                             : 0;
+    if (lfn_count > kLfnMaxEntries) {
+        return false;
+    }
+    DirectorySlot slot{};
+    if (!find_directory_slots(volume,
+                              parent_cluster,
+                              lfn_count + 1,
+                              slot)) {
+        return false;
+    }
+
+    uint8_t checksum = lfn_checksum(short_name);
+    for (uint32_t disk_index = 0; disk_index < lfn_count; ++disk_index) {
+        uint8_t sequence = static_cast<uint8_t>(lfn_count - disk_index);
+        uint8_t raw_lfn[32];
+        build_lfn_entry(name,
+                        name_length,
+                        sequence,
+                        static_cast<uint8_t>(lfn_count),
+                        checksum,
+                        raw_lfn);
+        if (!write_directory_raw_entry(volume,
+                                       parent_cluster,
+                                       slot.start_raw_index + disk_index,
+                                       raw_lfn)) {
+            return false;
+        }
+    }
+
+    uint8_t raw[32]{};
+    memcpy(raw, short_name, 11);
+    raw[11] = attributes;
+    raw[20] = static_cast<uint8_t>((first_cluster >> 16) & 0xFFu);
+    raw[21] = static_cast<uint8_t>((first_cluster >> 24) & 0xFFu);
+    raw[26] = static_cast<uint8_t>(first_cluster & 0xFFu);
+    raw[27] = static_cast<uint8_t>((first_cluster >> 8) & 0xFFu);
+    if (!write_directory_raw_entry(volume,
+                                   parent_cluster,
+                                   slot.short_raw_index,
+                                   raw)) {
+        return false;
+    }
+
+    copy_entry(raw,
+               parent_cluster,
+               slot.short_raw_index,
+               needs_lfn ? name : nullptr,
+               out_entry);
+    return true;
 }
 
 bool fat32_create_file(Fat32Volume& volume,
@@ -1230,53 +1523,12 @@ bool fat32_create_file(Fat32Volume& volume,
         return false;
     }
 
-    uint8_t short_name[11];
-    if (!build_short_name(name, short_name)) {
-        return false;
-    }
-
-    DirectorySlot slot{};
-    if (!find_directory_slot(volume, parent_cluster, slot)) {
-        return false;
-    }
-
-    const size_t cluster_entries = entries_per_cluster(volume);
-    size_t cluster_size =
-        static_cast<size_t>(volume.sectors_per_cluster) * 512u;
-    if (cluster_size > sizeof(cluster_buffer)) {
-        log_message(LogLevel::Warn,
-                    "FAT32: cluster size %zu exceeds buffer capacity",
-                    cluster_size);
-        return false;
-    }
-
-    uint8_t* raw =
-        reinterpret_cast<uint8_t*>(cluster_buffer + slot.entry_index * 32);
-    memset(raw, 0, 32);
-    for (size_t i = 0; i < 11; ++i) {
-        raw[i] = short_name[i];
-    }
-    raw[11] = 0x00;  // regular file attributes
-    *reinterpret_cast<uint32_t*>(raw + 28) = 0;
-
-    if (slot.was_end_marker) {
-        size_t next_index = slot.entry_index + 1;
-        if (next_index < cluster_entries) {
-            uint8_t* next_entry =
-                reinterpret_cast<uint8_t*>(cluster_buffer + next_index * 32);
-            next_entry[0] = 0x00;
-        }
-    }
-
-    if (!write_sectors(volume.device,
-                       cluster_to_lba(volume, slot.cluster),
-                       volume.sectors_per_cluster,
-                       cluster_buffer)) {
-        return false;
-    }
-
-    copy_entry(raw, parent_cluster, slot.raw_index, nullptr, out_entry);
-    return true;
+    return create_named_entry(volume,
+                              parent_cluster,
+                              name,
+                              0x00,
+                              0,
+                              out_entry);
 }
 
 bool fat32_create_directory(Fat32Volume& volume,
@@ -1294,11 +1546,6 @@ bool fat32_create_directory(Fat32Volume& volume,
 
     Fat32DirEntry existing{};
     if (fat32_find_entry(volume, parent_cluster, name, existing)) {
-        return false;
-    }
-
-    uint8_t short_name[11];
-    if (!build_short_name(name, short_name)) {
         return false;
     }
 
@@ -1347,42 +1594,18 @@ bool fat32_create_directory(Fat32Volume& volume,
         return false;
     }
 
-    DirectorySlot slot{};
-    if (!find_directory_slot(volume, parent_cluster, slot)) {
-        return false;
-    }
-
-    uint8_t* raw =
-        reinterpret_cast<uint8_t*>(cluster_buffer + slot.entry_index * 32);
-    memset(raw, 0, 32);
-    for (size_t i = 0; i < 11; ++i) {
-        raw[i] = short_name[i];
-    }
-    raw[11] = ATTR_DIRECTORY;
-    *reinterpret_cast<uint16_t*>(raw + 20) =
-        static_cast<uint16_t>(new_cluster >> 16);
-    *reinterpret_cast<uint16_t*>(raw + 26) =
-        static_cast<uint16_t>(new_cluster & 0xFFFF);
-    *reinterpret_cast<uint32_t*>(raw + 28) = 0;
-
-    if (slot.was_end_marker) {
-        size_t next_index = slot.entry_index + 1;
-        const size_t cluster_entries = entries_per_cluster(volume);
-        if (next_index < cluster_entries) {
-            uint8_t* next_entry =
-                reinterpret_cast<uint8_t*>(cluster_buffer + next_index * 32);
-            next_entry[0] = 0x00;
+    if (!create_named_entry(volume,
+                            parent_cluster,
+                            name,
+                            ATTR_DIRECTORY,
+                            new_cluster,
+                            out_entry)) {
+        (void)write_fat_entry(volume, new_cluster, kFatFreeCluster);
+        if (new_cluster < volume.next_free_cluster) {
+            volume.next_free_cluster = new_cluster;
         }
-    }
-
-    if (!write_sectors(volume.device,
-                       cluster_to_lba(volume, slot.cluster),
-                       volume.sectors_per_cluster,
-                       cluster_buffer)) {
         return false;
     }
-
-    copy_entry(raw, parent_cluster, slot.raw_index, nullptr, out_entry);
     return true;
 }
 
@@ -2206,6 +2429,10 @@ const vfs::FilesystemOps kFat32FilesystemOps{
     &fat32_vfs_open_directory,
     &fat32_vfs_directory_next,
     &fat32_vfs_close_directory,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 }  // namespace

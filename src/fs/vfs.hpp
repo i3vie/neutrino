@@ -9,6 +9,39 @@ enum : uint32_t {
     kDirEntryFlagDirectory = 1u << 0,
 };
 
+constexpr size_t kMaxAclEntries = 32;
+
+enum class AclValue : uint8_t {
+    Deny = 0,
+    Allow = 1,
+    Default = 2,
+};
+
+enum class AclPermission : uint8_t {
+    Read,
+    Write,
+    Delete,
+    Edit,
+};
+
+struct AclEntry {
+    uint64_t machine_id;
+    uint64_t local_id;
+    AclValue write;
+    AclValue read;
+    AclValue delete_permission;
+    AclValue edit;
+    uint8_t reserved[4];
+};
+
+static_assert(sizeof(AclEntry) == 24, "VFS ACL entry size mismatch");
+
+struct AclSnapshot {
+    AclEntry entries[kMaxAclEntries];
+    size_t count;
+    bool supported;
+};
+
 struct DirEntry {
     char name[64];
     uint32_t flags;
@@ -65,6 +98,23 @@ struct FilesystemOps {
                            void*& out_dir_context);
     bool (*directory_next)(void* dir_context, DirEntry& out_entry);
     void (*close_directory)(void* dir_context);
+    bool (*get_acl)(void* fs_context,
+                    const char* path,
+                    AclEntry* entries,
+                    size_t max_entries,
+                    size_t& out_count);
+    bool (*set_acl)(void* fs_context,
+                    const char* path,
+                    const AclEntry* entries,
+                    size_t entry_count);
+    bool (*get_open_file_acl)(void* file_context,
+                              AclEntry* entries,
+                              size_t max_entries,
+                              size_t& out_count);
+    bool (*get_open_directory_acl)(void* dir_context,
+                                   AclEntry* entries,
+                                   size_t max_entries,
+                                   size_t& out_count);
 };
 
 void init();
@@ -86,6 +136,9 @@ bool read_file(const char* path,
                size_t& out_size);
 
 bool open_file(const char* path, FileHandle& out_handle);
+bool open_file(const char* path,
+               FileHandle& out_handle,
+               AclSnapshot* out_acl);
 bool create_file(const char* path, FileHandle& out_handle);
 bool create_directory(const char* path);
 bool remove_file(const char* path);
@@ -103,7 +156,19 @@ bool write_file(FileHandle& handle,
                 size_t& out_size);
 
 bool open_directory(const char* path, DirectoryHandle& out_handle);
+bool open_directory(const char* path,
+                    DirectoryHandle& out_handle,
+                    AclSnapshot* out_acl);
 bool read_directory(DirectoryHandle& handle, DirEntry& out_entry);
 void close_directory(DirectoryHandle& handle);
+
+bool acl_supported(const char* path);
+bool get_acl(const char* path,
+             AclEntry* entries,
+             size_t max_entries,
+             size_t& out_count);
+bool set_acl(const char* path,
+             const AclEntry* entries,
+             size_t entry_count);
 
 }  // namespace vfs

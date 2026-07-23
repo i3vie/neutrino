@@ -19,6 +19,8 @@ constexpr uint16_t kSequentialWriteThroughSectors = 4;
 
 struct CachedDevice {
     BlockDevice backing;
+    volatile int io_lock;
+    uint64_t write_sequence;
     bool in_use;
     bool have_last_write;
     uint16_t sequential_write_sectors;
@@ -45,6 +47,12 @@ volatile int g_cache_lock = 0;
 uint64_t g_clock = 0;
 size_t g_victim_cursor = 0;
 bool g_enabled = true;
+size_t g_active_cached_ops = 0;
+volatile int g_mode_lock = 0;
+
+bool cache_enabled() {
+    return __atomic_load_n(&g_enabled, __ATOMIC_ACQUIRE);
+}
 
 void lock() {
     while (__atomic_test_and_set(&g_cache_lock, __ATOMIC_ACQUIRE)) {
@@ -62,22 +70,79 @@ public:
     ~LockGuard() { unlock(); }
 };
 
+class CacheOperation {
+public:
+    CacheOperation() {
+        lock();
+        cached_ = cache_enabled();
+        if (cached_) {
+            ++g_active_cached_ops;
+        }
+        unlock();
+    }
+
+    ~CacheOperation() {
+        if (!cached_) {
+            return;
+        }
+        lock();
+        --g_active_cached_ops;
+        unlock();
+    }
+
+    bool uses_cache() const { return cached_; }
+
+    CacheOperation(const CacheOperation&) = delete;
+    CacheOperation& operator=(const CacheOperation&) = delete;
+
+private:
+    bool cached_{false};
+};
+
+void lock_mode() {
+    while (__atomic_test_and_set(&g_mode_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_mode() {
+    __atomic_clear(&g_mode_lock, __ATOMIC_RELEASE);
+}
+
 void* byte_offset(void* ptr, size_t offset) {
     return static_cast<void*>(static_cast<uint8_t*>(ptr) + offset);
+}
+
+void lock_io(CachedDevice& cached) {
+    while (__atomic_test_and_set(&cached.io_lock, __ATOMIC_ACQUIRE)) {
+        asm volatile("pause");
+    }
+}
+
+void unlock_io(CachedDevice& cached) {
+    __atomic_clear(&cached.io_lock, __ATOMIC_RELEASE);
 }
 
 BlockIoStatus read_uncached(CachedDevice& cached,
                             uint32_t lba,
                             uint8_t sector_count,
                             void* buffer) {
-    return block_read(cached.backing, lba, sector_count, buffer);
+    lock_io(cached);
+    BlockIoStatus status =
+        block_read(cached.backing, lba, sector_count, buffer);
+    unlock_io(cached);
+    return status;
 }
 
 BlockIoStatus write_uncached(CachedDevice& cached,
                              uint32_t lba,
                              uint8_t sector_count,
                              const void* buffer) {
-    return block_write(cached.backing, lba, sector_count, buffer);
+    lock_io(cached);
+    BlockIoStatus status =
+        block_write(cached.backing, lba, sector_count, buffer);
+    unlock_io(cached);
+    return status;
 }
 
 size_t cache_hash(const CachedDevice& cached, uint32_t lba) {
@@ -169,17 +234,23 @@ bool flush_dirty_entry(CacheEntry* target) {
     lba = target->lba;
     generation = target->generation;
     sector_size = target->sector_size;
+    // Claim the backing device while the cache identity is still protected.
+    // A write-through invalidation cannot overtake this older snapshot and be
+    // overwritten by it later.
+    lock_io(*owner);
     target->flushing = true;
     memcpy(sector_buffer, target->data, sector_size);
     unlock();
 
-    BlockIoStatus status = write_uncached(*owner, lba, 1, sector_buffer);
+    BlockIoStatus status =
+        block_write(owner->backing, lba, 1, sector_buffer);
+    unlock_io(*owner);
 
     lock();
-    if (target->valid && target->owner == owner && target->lba == lba &&
-        target->generation == generation) {
+    if (target->valid && target->owner == owner && target->lba == lba) {
         target->flushing = false;
-        if (status == BlockIoStatus::Ok) {
+        if (target->generation == generation &&
+            status == BlockIoStatus::Ok) {
             target->dirty = false;
         }
     }
@@ -230,10 +301,9 @@ CacheEntry* find_or_prepare_entry_locked(CachedDevice& cached,
     return entry;
 }
 
-void invalidate_write_range(CachedDevice& cached,
-                            uint32_t lba,
-                            uint8_t sector_count) {
-    LockGuard guard;
+void invalidate_write_range_locked(CachedDevice& cached,
+                                   uint32_t lba,
+                                   uint8_t sector_count) {
     for (uint16_t i = 0; i < sector_count; ++i) {
         CacheEntry* entry = find_entry(cached,
                                        lba + static_cast<uint32_t>(i),
@@ -247,6 +317,25 @@ void invalidate_write_range(CachedDevice& cached,
         entry->dirty = false;
         entry->flushing = false;
     }
+}
+
+BlockIoStatus write_through(CachedDevice& cached,
+                            uint32_t lba,
+                            uint8_t sector_count,
+                            const void* buffer) {
+    // Establish cache invalidation and backing-I/O order as one operation.
+    // Readers snapshot write_sequence under the same cache lock, so they
+    // cannot install a backing read that this write has made stale.
+    lock();
+    lock_io(cached);
+    ++cached.write_sequence;
+    invalidate_write_range_locked(cached, lba, sector_count);
+    unlock();
+
+    BlockIoStatus status =
+        block_write(cached.backing, lba, sector_count, buffer);
+    unlock_io(cached);
+    return status;
 }
 
 bool should_write_through(CachedDevice& cached,
@@ -279,8 +368,11 @@ BlockIoStatus cached_read(void* context,
         return BlockIoStatus::Ok;
     }
     if (cached->backing.sector_size == 0 ||
-        cached->backing.sector_size != kCacheSectorSize ||
-        !g_enabled) {
+        cached->backing.sector_size != kCacheSectorSize) {
+        return read_uncached(*cached, lba, sector_count, buffer);
+    }
+    CacheOperation operation;
+    if (!operation.uses_cache()) {
         return read_uncached(*cached, lba, sector_count, buffer);
     }
 
@@ -288,44 +380,67 @@ BlockIoStatus cached_read(void* context,
     for (uint8_t i = 0; i < sector_count; ++i) {
         uint32_t sector_lba = lba + i;
         void* out = byte_offset(buffer, static_cast<size_t>(i) * sector_size);
-
-        lock();
-        CacheEntry* entry = find_entry(*cached, sector_lba, sector_size);
-        if (entry != nullptr) {
-            ++g_clock;
-            entry->age = g_clock;
-            memcpy(out, entry->data, sector_size);
-            unlock();
-            continue;
-        }
-        unlock();
-
-        alignas(512) uint8_t sector_buffer[kCacheSectorSize];
-        BlockIoStatus status =
-            read_uncached(*cached, sector_lba, 1, sector_buffer);
-        if (status != BlockIoStatus::Ok) {
-            return status;
-        }
-
         for (;;) {
             lock();
-            entry = find_or_prepare_entry_locked(*cached,
-                                                 sector_lba,
-                                                 sector_size);
+            CacheEntry* entry = find_entry(*cached, sector_lba, sector_size);
             if (entry != nullptr) {
-                memcpy(entry->data, sector_buffer, sector_size);
                 ++g_clock;
-                ++entry->generation;
                 entry->age = g_clock;
+                memcpy(out, entry->data, sector_size);
                 unlock();
                 break;
             }
+            uint64_t observed_write_sequence = cached->write_sequence;
             unlock();
-            if (!flush_one_dirty()) {
-                break;
+
+            alignas(512) uint8_t sector_buffer[kCacheSectorSize];
+            BlockIoStatus status =
+                read_uncached(*cached, sector_lba, 1, sector_buffer);
+            if (status != BlockIoStatus::Ok) {
+                return status;
             }
+
+            bool retry_read = false;
+            for (;;) {
+                lock();
+                // Prefer a cache write that completed while the backing read
+                // was in flight. If a write left no entry (write-through),
+                // repeat the read after that ordered backing write.
+                entry = find_entry(*cached, sector_lba, sector_size);
+                if (entry != nullptr) {
+                    memcpy(sector_buffer, entry->data, sector_size);
+                    ++g_clock;
+                    entry->age = g_clock;
+                    unlock();
+                    break;
+                }
+                if (cached->write_sequence != observed_write_sequence) {
+                    unlock();
+                    retry_read = true;
+                    break;
+                }
+                entry = find_or_prepare_entry_locked(*cached,
+                                                      sector_lba,
+                                                      sector_size);
+                if (entry != nullptr) {
+                    memcpy(entry->data, sector_buffer, sector_size);
+                    ++g_clock;
+                    ++entry->generation;
+                    entry->age = g_clock;
+                    unlock();
+                    break;
+                }
+                unlock();
+                if (!flush_one_dirty()) {
+                    break;
+                }
+            }
+            if (retry_read) {
+                continue;
+            }
+            memcpy(out, sector_buffer, sector_size);
+            break;
         }
-        memcpy(out, sector_buffer, sector_size);
     }
     return BlockIoStatus::Ok;
 }
@@ -343,9 +458,12 @@ BlockIoStatus cached_write(void* context,
     }
 
     if (cached->backing.sector_size == 0 ||
-        cached->backing.sector_size != kCacheSectorSize ||
-        !g_enabled) {
+        cached->backing.sector_size != kCacheSectorSize) {
         return write_uncached(*cached, lba, sector_count, buffer);
+    }
+    CacheOperation operation;
+    if (!operation.uses_cache()) {
+        return write_through(*cached, lba, sector_count, buffer);
     }
 
     // Full-cluster and sustained sequential writes are streaming I/O, even on
@@ -353,8 +471,7 @@ BlockIoStatus cached_write(void* context,
     // transfer into a 32 MiB burst followed by one-sector writeback once the
     // cache is full.
     if (should_write_through(*cached, lba, sector_count)) {
-        invalidate_write_range(*cached, lba, sector_count);
-        return write_uncached(*cached, lba, sector_count, buffer);
+        return write_through(*cached, lba, sector_count, buffer);
     }
 
     const size_t sector_size = cached->backing.sector_size;
@@ -374,12 +491,12 @@ BlockIoStatus cached_write(void* context,
                 cache_full = true;
                 break;
             }
+            ++cached->write_sequence;
             memcpy(entry->data, in, sector_size);
             ++g_clock;
             ++entry->generation;
             entry->age = g_clock;
             entry->dirty = true;
-            entry->flushing = false;
             ++cached_count;
         }
         unlock();
@@ -389,7 +506,7 @@ BlockIoStatus cached_write(void* context,
                 static_cast<const uint8_t*>(buffer) +
                 static_cast<size_t>(cached_count) * sector_size);
             BlockIoStatus status =
-                write_uncached(*cached, lba + cached_count, 1, in);
+                write_through(*cached, lba + cached_count, 1, in);
             if (status != BlockIoStatus::Ok) {
                 return status;
             }
@@ -415,7 +532,8 @@ void init() {
     }
     g_clock = 0;
     g_victim_cursor = 0;
-    g_enabled = true;
+    g_active_cached_ops = 0;
+    __atomic_store_n(&g_enabled, true, __ATOMIC_RELEASE);
 }
 
 void service_idle_flush() {
@@ -429,18 +547,24 @@ void service_idle_flush() {
 bool flush_all() {
     for (;;) {
         bool has_dirty = false;
+        bool has_in_flight = false;
         bool flushed_any = false;
         bool failed_any = false;
 
         for (auto& entry : g_entries) {
             lock();
-            bool dirty = entry.valid && entry.dirty && !entry.flushing;
+            bool dirty = entry.valid && entry.dirty;
+            bool flushing = dirty && entry.flushing;
             unlock();
             if (!dirty) {
                 continue;
             }
 
             has_dirty = true;
+            if (flushing) {
+                has_in_flight = true;
+                continue;
+            }
             if (flush_dirty_entry(&entry)) {
                 flushed_any = true;
             } else {
@@ -454,19 +578,39 @@ bool flush_all() {
         if (failed_any && !flushed_any) {
             return false;
         }
+        if (has_in_flight && !flushed_any) {
+            asm volatile("pause");
+        }
     }
 }
 
 void set_enabled(bool enabled) {
+    lock_mode();
     if (!enabled) {
+        lock();
+        __atomic_store_n(&g_enabled, false, __ATOMIC_RELEASE);
+        unlock();
+        for (;;) {
+            lock();
+            bool idle = g_active_cached_ops == 0;
+            unlock();
+            if (idle) {
+                break;
+            }
+            asm volatile("pause");
+        }
         (void)flush_all();
+        unlock_mode();
+        return;
     }
-    LockGuard guard;
-    g_enabled = enabled;
+    lock();
+    __atomic_store_n(&g_enabled, true, __ATOMIC_RELEASE);
+    unlock();
+    unlock_mode();
 }
 
 bool enabled() {
-    return g_enabled;
+    return cache_enabled();
 }
 
 bool wrap_device(const BlockDevice& backing, BlockDevice& out_device) {
@@ -495,39 +639,6 @@ bool wrap_device(const BlockDevice& backing, BlockDevice& out_device) {
                 "BlockCache: no wrapper slots for %s",
                 backing.name != nullptr ? backing.name : "(unnamed)");
     return false;
-}
-
-void invalidate_device(const BlockDevice& device) {
-    if (device.read != cached_read && device.write != cached_write) {
-        return;
-    }
-    auto* cached = static_cast<CachedDevice*>(device.context);
-
-    for (;;) {
-        bool has_dirty = false;
-        lock();
-        for (auto& entry : g_entries) {
-            if (entry.valid && entry.owner == cached && entry.dirty) {
-                has_dirty = true;
-                break;
-            }
-        }
-        unlock();
-        if (!has_dirty || !flush_one_dirty()) {
-            break;
-        }
-    }
-
-    LockGuard guard;
-    for (auto& entry : g_entries) {
-        if (entry.owner == cached) {
-            unlink_entry_locked(entry);
-            entry.owner = nullptr;
-            entry.valid = false;
-            entry.dirty = false;
-            entry.flushing = false;
-        }
-    }
 }
 
 }  // namespace block_cache

@@ -402,6 +402,18 @@ bool persist_file(const neufs::NeufsVolume& volume,
     return write_object(volume.device, offset, &object, sizeof(object));
 }
 
+bool load_acl_entry(const neufs::NeufsVolume& volume,
+                    uint64_t offset,
+                    NeufsAclEntry& out) {
+    return read_object(volume.device, offset, &out, sizeof(out));
+}
+
+bool persist_acl_entry(const neufs::NeufsVolume& volume,
+                       uint64_t offset,
+                       const NeufsAclEntry& object) {
+    return write_object(volume.device, offset, &object, sizeof(object));
+}
+
 bool load_dcblk(const neufs::NeufsVolume& volume,
                 uint64_t offset,
                 NeufsDcblk& out) {
@@ -1776,6 +1788,60 @@ void release_directory_context(NeufsDirectoryContext* context) {
     }
 }
 
+bool valid_acl_value(vfs::AclValue value) {
+    return value == vfs::AclValue::Deny ||
+           value == vfs::AclValue::Allow ||
+           value == vfs::AclValue::Default;
+}
+
+bool load_acl_entries(const neufs::NeufsVolume& volume,
+                      const uint64_t* acl_offsets,
+                      vfs::AclEntry* entries,
+                      size_t max_entries,
+                      size_t& out_count) {
+    out_count = 0;
+    if (acl_offsets == nullptr) {
+        return false;
+    }
+    if (entries == nullptr) {
+        return max_entries == 0;
+    }
+    for (size_t index = 0; index < vfs::kMaxAclEntries; ++index) {
+        uint64_t acl_offset = acl_offsets[index];
+        if (acl_offset == 0) {
+            continue;
+        }
+        if (out_count >= max_entries) {
+            return false;
+        }
+        NeufsAclEntry disk_entry{};
+        if (!load_acl_entry(volume, acl_offset, disk_entry)) {
+            return false;
+        }
+        vfs::AclEntry& entry = entries[out_count++];
+        // IDs are opaque 64-bit values. The v1 disk format spelled these
+        // fields as int64_t, so preserve their complete bit patterns.
+        memcpy(&entry.machine_id,
+               &disk_entry.machine_id,
+               sizeof(entry.machine_id));
+        memcpy(&entry.local_id,
+               &disk_entry.local_id,
+               sizeof(entry.local_id));
+        entry.write = static_cast<vfs::AclValue>(disk_entry.write);
+        entry.read = static_cast<vfs::AclValue>(disk_entry.read);
+        entry.delete_permission =
+            static_cast<vfs::AclValue>(disk_entry.delete_flag);
+        entry.edit = static_cast<vfs::AclValue>(disk_entry.acledit);
+        memset(entry.reserved, 0, sizeof(entry.reserved));
+        if (!valid_acl_value(entry.write) || !valid_acl_value(entry.read) ||
+            !valid_acl_value(entry.delete_permission) ||
+            !valid_acl_value(entry.edit)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool neufs_list_directory(void* fs_context,
                           const char* path,
                           vfs::DirEntry* entries,
@@ -1842,7 +1908,6 @@ bool neufs_open_file(void* fs_context,
     if (!load_file(*volume, entry_offset, file)) {
         return false;
     }
-
     NeufsFileContext* context = nullptr;
     if (!open_file_context(context)) {
         log_message(LogLevel::Warn, "NEUFS: out of file contexts");
@@ -1989,6 +2054,14 @@ bool neufs_remove_file(void* fs_context, const char* path) {
                     path);
     }
 
+    for (uint64_t acl_offset : file.acl) {
+        if (acl_offset != 0) {
+            (void)free_metadata_bytes(*volume,
+                                      acl_offset,
+                                      sizeof(NeufsAclEntry));
+        }
+    }
+
     if (!free_metadata_bytes(*volume, entry_offset, sizeof(NeufsFile))) {
         log_message(LogLevel::Warn, "NEUFS: failed to free file metadata at %llu", entry_offset);
     }
@@ -2024,6 +2097,14 @@ bool neufs_remove_directory(void* fs_context, const char* path) {
     }
     if (dir.parent == 0) {
         return false;
+    }
+
+    for (uint64_t acl_offset : dir.acl) {
+        if (acl_offset != 0) {
+            (void)free_metadata_bytes(*volume,
+                                      acl_offset,
+                                      sizeof(NeufsAclEntry));
+        }
     }
 
     // Free ndir metadata
@@ -2096,7 +2177,6 @@ bool neufs_open_directory(void* fs_context,
     if (entry_type != kTypeNdir) {
         return false;
     }
-
     NeufsDirectoryContext* ctx = allocate_directory_context();
     if (ctx == nullptr) {
         log_message(LogLevel::Warn, "NEUFS: out of directory contexts");
@@ -2145,6 +2225,185 @@ void neufs_close_directory(void* dir_context) {
         return;
     }
     release_directory_context(static_cast<NeufsDirectoryContext*>(dir_context));
+}
+
+bool neufs_get_open_file_acl(void* file_context,
+                             vfs::AclEntry* entries,
+                             size_t max_entries,
+                             size_t& out_count) {
+    if (file_context == nullptr) {
+        return false;
+    }
+    auto* context = static_cast<NeufsFileContext*>(file_context);
+    return load_acl_entries(*context->volume,
+                            context->entry.acl,
+                            entries,
+                            max_entries,
+                            out_count);
+}
+
+bool neufs_get_open_directory_acl(void* dir_context,
+                                  vfs::AclEntry* entries,
+                                  size_t max_entries,
+                                  size_t& out_count) {
+    if (dir_context == nullptr) {
+        return false;
+    }
+    auto* context = static_cast<NeufsDirectoryContext*>(dir_context);
+    NeufsNdir dir{};
+    if (!load_ndir(*context->volume,
+                   context->current_dir_offset,
+                   dir)) {
+        return false;
+    }
+    return load_acl_entries(*context->volume,
+                            dir.acl,
+                            entries,
+                            max_entries,
+                            out_count);
+}
+
+bool neufs_get_acl(void* fs_context,
+                   const char* path,
+                   vfs::AclEntry* entries,
+                   size_t max_entries,
+                   size_t& out_count) {
+    out_count = 0;
+    if (fs_context == nullptr || entries == nullptr || max_entries == 0) {
+        return false;
+    }
+    auto* volume = static_cast<neufs::NeufsVolume*>(fs_context);
+    uint64_t entry_offset = 0;
+    uint8_t entry_type = 0;
+    if (!resolve_path(*volume, path, entry_offset, entry_type)) {
+        return false;
+    }
+
+    uint64_t acl_offsets[vfs::kMaxAclEntries]{};
+    if (entry_type == kTypeFile) {
+        NeufsFile file{};
+        if (!load_file(*volume, entry_offset, file)) {
+            return false;
+        }
+        memcpy(acl_offsets, file.acl, sizeof(acl_offsets));
+    } else if (entry_type == kTypeNdir) {
+        NeufsNdir dir{};
+        if (!load_ndir(*volume, entry_offset, dir)) {
+            return false;
+        }
+        memcpy(acl_offsets, dir.acl, sizeof(acl_offsets));
+    } else {
+        return false;
+    }
+
+    return load_acl_entries(*volume,
+                            acl_offsets,
+                            entries,
+                            max_entries,
+                            out_count);
+}
+
+bool neufs_set_acl(void* fs_context,
+                   const char* path,
+                   const vfs::AclEntry* entries,
+                   size_t entry_count) {
+    if (fs_context == nullptr || entry_count > vfs::kMaxAclEntries ||
+        (entries == nullptr && entry_count != 0)) {
+        return false;
+    }
+    for (size_t i = 0; i < entry_count; ++i) {
+        if (!valid_acl_value(entries[i].write) ||
+            !valid_acl_value(entries[i].read) ||
+            !valid_acl_value(entries[i].delete_permission) ||
+            !valid_acl_value(entries[i].edit)) {
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (entries[i].machine_id == entries[j].machine_id &&
+                entries[i].local_id == entries[j].local_id) {
+                return false;
+            }
+        }
+    }
+
+    auto* volume = static_cast<neufs::NeufsVolume*>(fs_context);
+    uint64_t object_offset = 0;
+    uint8_t entry_type = 0;
+    if (!resolve_path(*volume, path, object_offset, entry_type)) {
+        return false;
+    }
+
+    uint64_t old_offsets[vfs::kMaxAclEntries]{};
+    uint64_t new_offsets[vfs::kMaxAclEntries]{};
+    NeufsFile file{};
+    NeufsNdir dir{};
+    if (entry_type == kTypeFile) {
+        if (!load_file(*volume, object_offset, file)) {
+            return false;
+        }
+        memcpy(old_offsets, file.acl, sizeof(old_offsets));
+    } else if (entry_type == kTypeNdir) {
+        if (!load_ndir(*volume, object_offset, dir)) {
+            return false;
+        }
+        memcpy(old_offsets, dir.acl, sizeof(old_offsets));
+    } else {
+        return false;
+    }
+
+    for (size_t i = 0; i < entry_count; ++i) {
+        if (!allocate_metadata_bytes(*volume,
+                                     sizeof(NeufsAclEntry),
+                                     new_offsets[i])) {
+            goto rollback;
+        }
+        NeufsAclEntry disk_entry{};
+        memcpy(&disk_entry.machine_id,
+               &entries[i].machine_id,
+               sizeof(disk_entry.machine_id));
+        memcpy(&disk_entry.local_id,
+               &entries[i].local_id,
+               sizeof(disk_entry.local_id));
+        disk_entry.write = static_cast<uint8_t>(entries[i].write);
+        disk_entry.read = static_cast<uint8_t>(entries[i].read);
+        disk_entry.delete_flag =
+            static_cast<uint8_t>(entries[i].delete_permission);
+        disk_entry.acledit = static_cast<uint8_t>(entries[i].edit);
+        if (!persist_acl_entry(*volume, new_offsets[i], disk_entry)) {
+            goto rollback;
+        }
+    }
+
+    if (entry_type == kTypeFile) {
+        memcpy(file.acl, new_offsets, sizeof(new_offsets));
+        if (!persist_file(*volume, object_offset, file)) {
+            goto rollback;
+        }
+    } else {
+        memcpy(dir.acl, new_offsets, sizeof(new_offsets));
+        if (!persist_ndir(*volume, object_offset, dir)) {
+            goto rollback;
+        }
+    }
+
+    for (uint64_t old_offset : old_offsets) {
+        if (old_offset != 0) {
+            (void)free_metadata_bytes(*volume,
+                                      old_offset,
+                                      sizeof(NeufsAclEntry));
+        }
+    }
+    return true;
+
+rollback:
+    for (uint64_t new_offset : new_offsets) {
+        if (new_offset != 0) {
+            (void)free_metadata_bytes(*volume,
+                                      new_offset,
+                                      sizeof(NeufsAclEntry));
+        }
+    }
+    return false;
 }
 
 bool neufs_mount(neufs::NeufsVolume& volume, const fs::BlockDevice& device) {
@@ -2311,6 +2570,10 @@ const vfs::FilesystemOps& neufs_vfs_ops() {
         &neufs_open_directory,
         &neufs_directory_next,
         &neufs_close_directory,
+        &neufs_get_acl,
+        &neufs_set_acl,
+        &neufs_get_open_file_acl,
+        &neufs_get_open_directory_acl,
     };
     return kOps;
 }

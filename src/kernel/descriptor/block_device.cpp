@@ -2,8 +2,8 @@
 
 #include "../../drivers/fs/block_device.hpp"
 #include "../../drivers/log/logging.hpp"
+#include "../process.hpp"
 #include "../string_util.hpp"
-#include "../scheduler.hpp"
 #include "../vm.hpp"
 #include "../../lib/mem.hpp"
 
@@ -231,36 +231,8 @@ DescriptorEntry* lookup_process_entry(process::Process& proc, uint32_t handle) {
     return &entry;
 }
 
-struct BlockRequest {
-    BlockDeviceRecord* record;
-    process::Process* proc;
-    DescriptorEntry* entry;
-    uint64_t user_address;
-    uint64_t length;
-    uint64_t offset;
-    uint64_t progress;
-    bool is_write;
-    bool in_use;
-};
-
-constexpr size_t kMaxBlockRequests = 16;
-BlockRequest g_block_requests[kMaxBlockRequests];
-alignas(4096) uint8_t g_block_io_buffer[kBlockIoBufferSize];
 alignas(4096) uint8_t g_sync_block_io_buffer[kBlockIoBufferSize];
-volatile int g_request_lock = 0;
 volatile int g_sync_io_lock = 0;
-bool g_worker_started = false;
-process::Process* g_worker = nullptr;
-
-void lock_requests() {
-    while (__atomic_test_and_set(&g_request_lock, __ATOMIC_ACQUIRE)) {
-        asm volatile("pause");
-    }
-}
-
-void unlock_requests() {
-    __atomic_clear(&g_request_lock, __ATOMIC_RELEASE);
-}
 
 void lock_sync_io() {
     while (__atomic_test_and_set(&g_sync_io_lock, __ATOMIC_ACQUIRE)) {
@@ -312,150 +284,6 @@ bool copy_to_caller(const process::Process& proc,
         return true;
     }
     return vm::copy_to_user(proc.cr3, dest, src, length);
-}
-
-BlockRequest* allocate_request() {
-    for (auto& req : g_block_requests) {
-        if (!req.in_use) {
-            req = {};
-            req.in_use = true;
-            return &req;
-        }
-    }
-    return nullptr;
-}
-
-void complete_request(BlockRequest& req, int64_t result) {
-    if (req.proc != nullptr) {
-        req.proc->context.rax = static_cast<uint64_t>(result);
-        req.proc->state = process::State::Ready;
-        req.proc->waiting_on = nullptr;
-        scheduler::enqueue(req.proc);
-    }
-    req.in_use = false;
-}
-
-bool enqueue_block_request(BlockDeviceRecord& record,
-                           process::Process& proc,
-                           DescriptorEntry& entry,
-                           uint64_t user_address,
-                           uint64_t length,
-                           uint64_t offset,
-                           bool is_write) {
-    BlockRequest* req = allocate_request();
-    if (req == nullptr) {
-        return false;
-    }
-    req->record = &record;
-    req->proc = &proc;
-    req->entry = &entry;
-    req->user_address = user_address;
-    req->length = length;
-    req->offset = offset;
-    req->progress = 0;
-    req->is_write = is_write;
-
-    proc.state = process::State::Blocked;
-    proc.waiting_on = req;
-    // Wake the worker if it's sleeping.
-    if (g_worker != nullptr && g_worker->state == process::State::Blocked) {
-        g_worker->state = process::State::Ready;
-        g_worker->waiting_on = nullptr;
-        scheduler::enqueue(g_worker);
-    }
-    return true;
-}
-
-void service_request(BlockRequest& req, size_t& sectors_processed, size_t budget) {
-    auto* record = req.record;
-    auto* proc = req.proc;
-    if (record == nullptr || proc == nullptr || !record->in_use) {
-        complete_request(req, -1);
-        return;
-    }
-    uint64_t sector_size = record->device.sector_size;
-    if (sector_size == 0) {
-        complete_request(req, -1);
-        return;
-    }
-
-    if (req.progress >= req.length) {
-        complete_request(req, static_cast<int64_t>(req.length));
-        return;
-    }
-
-    while (sectors_processed < budget && req.progress < req.length) {
-        uint64_t remaining = req.length - req.progress;
-        uint64_t cur_offset = req.offset + req.progress;
-        if ((cur_offset % sector_size) != 0) {
-            complete_request(req, -1);
-            return;
-        }
-        uint64_t lba = cur_offset / sector_size;
-        uint64_t sectors_left =
-            (remaining + sector_size - 1) / sector_size;
-        size_t max_sectors =
-            static_cast<size_t>(sizeof(g_block_io_buffer) / sector_size);
-        size_t to_do = sectors_left < budget - sectors_processed
-                           ? static_cast<size_t>(sectors_left)
-                           : budget - sectors_processed;
-        if (to_do > max_sectors) {
-            to_do = max_sectors;
-        }
-        if (to_do == 0) {
-            break;
-        }
-        size_t transfer_bytes = to_do * static_cast<size_t>(sector_size);
-        uint8_t* buffer = g_block_io_buffer;
-
-        if (req.is_write) {
-            if (!vm::copy_from_user(proc->cr3,
-                                    buffer,
-                                    req.user_address + req.progress,
-                                    transfer_bytes)) {
-                complete_request(req, -1);
-                return;
-            }
-            fs::BlockIoStatus status = fs::block_write(record->device,
-                                                       static_cast<uint32_t>(lba),
-                                                       static_cast<uint8_t>(to_do),
-                                                       buffer);
-            if (status == fs::BlockIoStatus::Busy) {
-                return;
-            }
-            if (status != fs::BlockIoStatus::Ok) {
-                complete_request(req, -1);
-                return;
-            }
-        } else {
-            fs::BlockIoStatus status = fs::block_read(record->device,
-                                                      static_cast<uint32_t>(lba),
-                                                      static_cast<uint8_t>(to_do),
-                                                      buffer);
-            if (status == fs::BlockIoStatus::Busy) {
-                return;
-            }
-            if (status != fs::BlockIoStatus::Ok) {
-                complete_request(req, -1);
-                return;
-            }
-            if (!vm::copy_to_user(proc->cr3,
-                                  req.user_address + req.progress,
-                                  buffer,
-                                  transfer_bytes)) {
-                complete_request(req, -1);
-                return;
-            }
-        }
-
-        req.progress += transfer_bytes;
-        sectors_processed += to_do;
-
-        if (req.progress >= req.length) {
-            complete_request(req, static_cast<int64_t>(req.progress));
-            return;
-        }
-    }
 }
 
 int64_t block_device_read(process::Process& proc,
@@ -801,7 +629,9 @@ bool open_block_device(process::Process& proc,
     alloc.has_extended_flags = false;
     alloc.object = record;
     alloc.subsystem_data = nullptr;
-    alloc.close = close_disk;
+    // Registered block devices are owned by the device registry. Closing a
+    // descriptor must not treat their records as temporary DiskRecords.
+    alloc.close = nullptr;
     alloc.name = record->name;
     alloc.ops = &kBlockDeviceOps;
     return true;
@@ -844,7 +674,7 @@ bool open_disk(process::Process& proc,
     alloc.has_extended_flags = false;
     alloc.object = record;
     alloc.subsystem_data = nullptr;
-    alloc.close = nullptr;
+    alloc.close = close_disk;
     alloc.name = record->name;
     alloc.ops = &kDiskOps;
     return true;
@@ -909,21 +739,6 @@ void clear_block_devices() {
     for (auto& record : g_disk_records) {
         record = {};
     }
-}
-
-void service_requests(size_t sector_budget) {
-    lock_requests();
-    size_t processed = 0;
-    for (auto& req : g_block_requests) {
-        if (!req.in_use) {
-            continue;
-        }
-        if (processed >= sector_budget) {
-            break;
-        }
-        service_request(req, processed, sector_budget);
-    }
-    unlock_requests();
 }
 
 }  // namespace block_device_descriptor
@@ -1015,50 +830,6 @@ bool register_block_device(fs::BlockDevice& device, bool lock_for_kernel) {
 
 void reset_block_device_registry() {
     block_device_descriptor::clear_block_devices();
-}
-
-void service_block_io() {
-    // Process a larger batch per tick to drain requests quickly while still
-    // yielding to other work.
-    constexpr size_t kSectorsPerTick = 64;
-    block_device_descriptor::service_requests(kSectorsPerTick);
-}
-
-void block_io_worker(process::Process&) {
-    // Run until the queue drains, then park this task until new work arrives.
-    constexpr size_t kWorkerBudget = 256;
-    block_device_descriptor::service_requests(kWorkerBudget);
-    bool has_pending = false;
-    for (auto& req : block_device_descriptor::g_block_requests) {
-        if (req.in_use) {
-            has_pending = true;
-            break;
-        }
-    }
-    if (!has_pending && block_device_descriptor::g_worker != nullptr) {
-        block_device_descriptor::g_worker->state = process::State::Blocked;
-        block_device_descriptor::g_worker->waiting_on = nullptr;
-    }
-}
-
-void start_block_io_worker() {
-    block_device_descriptor::lock_requests();
-    if (block_device_descriptor::g_worker_started) {
-        block_device_descriptor::unlock_requests();
-        return;
-    }
-    block_device_descriptor::g_worker_started = true;
-    block_device_descriptor::unlock_requests();
-    process::Process* worker = process::allocate_kernel_task(block_io_worker);
-    if (worker == nullptr) {
-        log_message(LogLevel::Warn,
-                    "BlockIO: failed to allocate kernel I/O worker");
-        return;
-    }
-    block_device_descriptor::g_worker = worker;
-    scheduler::enqueue(worker);
-    log_message(LogLevel::Info, "BlockIO: kernel worker started (pid=%u)",
-                static_cast<unsigned int>(worker->pid));
 }
 
 }  // namespace descriptor

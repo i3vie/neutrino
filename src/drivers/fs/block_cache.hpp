@@ -12,7 +12,6 @@ void set_enabled(bool enabled);
 bool enabled();
 
 bool wrap_device(const BlockDevice& backing, BlockDevice& out_device);
-void invalidate_device(const BlockDevice& device);
 
 }  // namespace block_cache
 }  // namespace fs

@@ -32,5 +32,13 @@ bool remove_directory(process::Process& proc, const char* path);
 bool close_directory(process::Process& proc, uint32_t handle);
 int64_t read_directory(process::Process& proc, uint32_t handle,
                        uint64_t user_addr);
+int64_t get_acl(process::Process& proc,
+                const char* path,
+                uint64_t user_entries,
+                uint64_t max_entries);
+bool set_acl(process::Process& proc,
+             const char* path,
+             uint64_t user_entries,
+             uint64_t entry_count);
 
 }  // namespace file_io

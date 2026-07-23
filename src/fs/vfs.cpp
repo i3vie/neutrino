@@ -134,6 +134,11 @@ MountEntry* find_mount_for_path(const char* path, const char*& remainder) {
     return entry;
 }
 
+MountEntry* resolve_mount_for_path(const char* path, const char*& remainder) {
+    LockGuard guard;
+    return find_mount_for_path(path, remainder);
+}
+
 const char* normalize_relative_path(const char* path) {
     if (path == nullptr) {
         return "";
@@ -150,6 +155,7 @@ bool is_root_path(const char* path) {
 }
 
 RootDirectoryContext* allocate_root_dir_context() {
+    LockGuard guard;
     for (size_t i = 0; i < kMaxRootDirHandles; ++i) {
         if (!g_root_dir_in_use[i]) {
             g_root_dir_in_use[i] = true;
@@ -165,6 +171,7 @@ void release_root_dir_context(RootDirectoryContext* ctx) {
     if (ctx == nullptr) {
         return;
     }
+    LockGuard guard;
     for (size_t i = 0; i < kMaxRootDirHandles; ++i) {
         if (&g_root_dir_contexts[i] == ctx) {
             g_root_dir_in_use[i] = false;
@@ -193,9 +200,12 @@ void populate_entry_from_mount(const char* name, DirEntry& entry) {
 }  // namespace
 
 void init() {
+    LockGuard guard;
     for (auto& mount : g_mounts) {
         mount = {};
     }
+    memset(g_root_dir_contexts, 0, sizeof(g_root_dir_contexts));
+    memset(g_root_dir_in_use, 0, sizeof(g_root_dir_in_use));
     g_root_mount = nullptr;
 }
 
@@ -208,6 +218,7 @@ bool register_mount(const char* name,
         return false;
     }
 
+    LockGuard guard;
     size_t name_len = string_length(name);
     if (find_mount(name, name_len) != nullptr) {
         log_message(LogLevel::Warn, "VFS: mount '%s' already exists", name);
@@ -231,6 +242,7 @@ bool register_mount(const char* name,
 }
 
 void set_root_mount(const char* name) {
+    LockGuard guard;
     if (name == nullptr || *name == '\0') {
         g_root_mount = nullptr;
         return;
@@ -248,6 +260,7 @@ void set_root_mount(const char* name) {
 }
 
 const char* root_mount_name() {
+    LockGuard guard;
     return g_root_mount;
 }
 
@@ -267,10 +280,12 @@ bool has_explicit_mount_prefix(const char* path) {
     }
 
     size_t mount_len = static_cast<size_t>(mount_end - trimmed);
+    LockGuard guard;
     return find_mount(trimmed, mount_len) != nullptr;
 }
 
 size_t enumerate_mounts(const char** names, size_t max_names) {
+    LockGuard guard;
     size_t count = 0;
     for (auto& mount : g_mounts) {
         if (!mount.in_use) {
@@ -307,7 +322,7 @@ bool list(const char* path,
     }
 
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount '%s' not found for list operation",
@@ -320,11 +335,18 @@ bool list(const char* path,
     }
 
     const char* relative = normalize_relative_path(remainder);
-    return mount->ops->list_directory(mount->fs_context,
-                                      relative,
-                                      entries,
-                                      max_entries,
-                                      out_count);
+    size_t count = 0;
+    if (!mount->ops->list_directory(mount->fs_context,
+                                    relative,
+                                    entries,
+                                    max_entries,
+                                    count) ||
+        count > max_entries) {
+        out_count = 0;
+        return false;
+    }
+    out_count = count;
+    return true;
 }
 
 bool read_file(const char* path,
@@ -347,10 +369,19 @@ bool read_file(const char* path,
 }
 
 bool open_file(const char* path, FileHandle& out_handle) {
+    return open_file(path, out_handle, nullptr);
+}
+
+bool open_file(const char* path,
+               FileHandle& out_handle,
+               AclSnapshot* out_acl) {
     out_handle = {};
+    if (out_acl != nullptr) {
+        *out_acl = {};
+    }
 
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
@@ -377,6 +408,30 @@ bool open_file(const char* path, FileHandle& out_handle) {
         return false;
     }
 
+    if (out_acl != nullptr) {
+        out_acl->supported = mount->ops->get_acl != nullptr ||
+                             mount->ops->get_open_file_acl != nullptr;
+        bool acl_ok = true;
+        if (mount->ops->get_open_file_acl != nullptr) {
+            acl_ok = mount->ops->get_open_file_acl(file_context,
+                                                    out_acl->entries,
+                                                    kMaxAclEntries,
+                                                    out_acl->count);
+        } else if (out_acl->supported) {
+            // Preserve fail-closed behavior for ACL-aware filesystems that
+            // have not implemented the resolved-handle fast path yet.
+            acl_ok = mount->ops->get_acl(mount->fs_context,
+                                         relative,
+                                         out_acl->entries,
+                                         kMaxAclEntries,
+                                         out_acl->count);
+        }
+        if (!acl_ok || out_acl->count > kMaxAclEntries) {
+            mount->ops->close_file(file_context);
+            return false;
+        }
+    }
+
     out_handle.ops = mount->ops;
     out_handle.fs_context = mount->fs_context;
     out_handle.file_context = file_context;
@@ -388,7 +443,7 @@ bool create_file(const char* path, FileHandle& out_handle) {
     out_handle = {};
 
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
@@ -425,7 +480,7 @@ bool create_file(const char* path, FileHandle& out_handle) {
 
 bool create_directory(const char* path) {
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
@@ -444,7 +499,7 @@ bool create_directory(const char* path) {
 
 bool remove_file(const char* path) {
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
@@ -463,7 +518,7 @@ bool remove_file(const char* path) {
 
 bool remove_directory(const char* path) {
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
@@ -495,14 +550,20 @@ bool read_file(FileHandle& handle,
                size_t& out_size) {
     out_size = 0;
     if (handle.ops == nullptr || handle.ops->read_file == nullptr ||
-        handle.file_context == nullptr || buffer == nullptr) {
+        handle.file_context == nullptr || buffer == nullptr ||
+        static_cast<uint64_t>(buffer_size) > UINT64_MAX - offset) {
         return false;
     }
-    return handle.ops->read_file(handle.file_context,
-                                 offset,
-                                 buffer,
-                                 buffer_size,
-                                 out_size);
+    if (!handle.ops->read_file(handle.file_context,
+                               offset,
+                               buffer,
+                               buffer_size,
+                               out_size) ||
+        out_size > buffer_size) {
+        out_size = 0;
+        return false;
+    }
+    return true;
 }
 
 bool write_file(FileHandle& handle,
@@ -512,7 +573,8 @@ bool write_file(FileHandle& handle,
                 size_t& out_size) {
     out_size = 0;
     if (handle.ops == nullptr || handle.ops->write_file == nullptr ||
-        handle.file_context == nullptr || buffer == nullptr) {
+        handle.file_context == nullptr || buffer == nullptr ||
+        static_cast<uint64_t>(buffer_size) > UINT64_MAX - offset) {
         return false;
     }
     if (!handle.ops->write_file(handle.file_context,
@@ -520,6 +582,13 @@ bool write_file(FileHandle& handle,
                                 buffer,
                                 buffer_size,
                                 out_size)) {
+        out_size = 0;
+        return false;
+    }
+
+    if (out_size > buffer_size ||
+        static_cast<uint64_t>(out_size) > UINT64_MAX - offset) {
+        out_size = 0;
         return false;
     }
 
@@ -531,7 +600,16 @@ bool write_file(FileHandle& handle,
 }
 
 bool open_directory(const char* path, DirectoryHandle& out_handle) {
+    return open_directory(path, out_handle, nullptr);
+}
+
+bool open_directory(const char* path,
+                    DirectoryHandle& out_handle,
+                    AclSnapshot* out_acl) {
     out_handle = {};
+    if (out_acl != nullptr) {
+        *out_acl = {};
+    }
 
     if (is_root_path(path)) {
         RootDirectoryContext* ctx = allocate_root_dir_context();
@@ -552,7 +630,7 @@ bool open_directory(const char* path, DirectoryHandle& out_handle) {
     }
 
     const char* remainder = nullptr;
-    MountEntry* mount = find_mount_for_path(path, remainder);
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
     if (mount == nullptr) {
         log_message(LogLevel::Warn,
                     "VFS: mount not found for path '%s'",
@@ -574,6 +652,29 @@ bool open_directory(const char* path, DirectoryHandle& out_handle) {
         return false;
     }
 
+    if (out_acl != nullptr) {
+        out_acl->supported = mount->ops->get_acl != nullptr ||
+                             mount->ops->get_open_directory_acl != nullptr;
+        bool acl_ok = true;
+        if (mount->ops->get_open_directory_acl != nullptr) {
+            acl_ok = mount->ops->get_open_directory_acl(
+                dir_context,
+                out_acl->entries,
+                kMaxAclEntries,
+                out_acl->count);
+        } else if (out_acl->supported) {
+            acl_ok = mount->ops->get_acl(mount->fs_context,
+                                         relative,
+                                         out_acl->entries,
+                                         kMaxAclEntries,
+                                         out_acl->count);
+        }
+        if (!acl_ok || out_acl->count > kMaxAclEntries) {
+            mount->ops->close_directory(dir_context);
+            return false;
+        }
+    }
+
     out_handle.ops = mount->ops;
     out_handle.fs_context = mount->fs_context;
     out_handle.dir_context = dir_context;
@@ -583,6 +684,7 @@ bool open_directory(const char* path, DirectoryHandle& out_handle) {
 
 bool read_directory(DirectoryHandle& handle, DirEntry& out_entry) {
     if (handle.is_root) {
+        LockGuard guard;
         auto* ctx = static_cast<RootDirectoryContext*>(handle.dir_context);
         if (ctx == nullptr || ctx->index >= ctx->count) {
             return false;
@@ -612,6 +714,54 @@ void close_directory(DirectoryHandle& handle) {
         handle.ops->close_directory(handle.dir_context);
     }
     handle = {};
+}
+
+bool acl_supported(const char* path) {
+    const char* remainder = nullptr;
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
+    return mount != nullptr && mount->ops != nullptr &&
+           mount->ops->get_acl != nullptr && mount->ops->set_acl != nullptr;
+}
+
+bool get_acl(const char* path,
+             AclEntry* entries,
+             size_t max_entries,
+             size_t& out_count) {
+    out_count = 0;
+    if (entries == nullptr || max_entries == 0) {
+        return false;
+    }
+    const char* remainder = nullptr;
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
+    if (mount == nullptr || mount->ops == nullptr ||
+        mount->ops->get_acl == nullptr) {
+        return false;
+    }
+    return mount->ops->get_acl(mount->fs_context,
+                               normalize_relative_path(remainder),
+                               entries,
+                               max_entries,
+                               out_count) &&
+           out_count <= max_entries;
+}
+
+bool set_acl(const char* path,
+             const AclEntry* entries,
+             size_t entry_count) {
+    if ((entries == nullptr && entry_count != 0) ||
+        entry_count > kMaxAclEntries) {
+        return false;
+    }
+    const char* remainder = nullptr;
+    MountEntry* mount = resolve_mount_for_path(path, remainder);
+    if (mount == nullptr || mount->ops == nullptr ||
+        mount->ops->set_acl == nullptr) {
+        return false;
+    }
+    return mount->ops->set_acl(mount->fs_context,
+                               normalize_relative_path(remainder),
+                               entries,
+                               entry_count);
 }
 
 }  // namespace vfs

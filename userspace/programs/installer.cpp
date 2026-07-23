@@ -1597,6 +1597,50 @@ bool copy_tree(const char* source_dir,
     return ok;
 }
 
+bool protect_installed_user_store(const char* target_root, long console) {
+    void* root_user = user_find("root");
+    UserInfo root_info{};
+    if (root_user == nullptr || user_info(root_user, &root_info) != 0 ||
+        root_info.id_local == 0) {
+        userspace::write_line(console,
+                              "failed to resolve root user for credential ACL");
+        return false;
+    }
+
+    FileAclEntry acl{};
+    acl.machine_id = root_info.id_machine;
+    acl.local_id = root_info.id_local;
+    acl.write = AclValue::Allow;
+    acl.read = AclValue::Allow;
+    acl.delete_permission = AclValue::Allow;
+    acl.edit = AclValue::Allow;
+
+    const char* candidates[] = {"/system/users.ntd", "/users.ntd"};
+    bool found = false;
+    for (const char* suffix : candidates) {
+        char path[160];
+        if (!append_path(target_root, suffix + 1, path, sizeof(path))) {
+            return false;
+        }
+        long handle = file_open(path);
+        if (handle < 0) {
+            continue;
+        }
+        file_close(static_cast<uint32_t>(handle));
+        found = true;
+        if (file_set_acl(path, &acl, 1) != 0) {
+            userspace::write(console, "failed to protect credential store: ");
+            userspace::write_line(console, path);
+            return false;
+        }
+    }
+    if (!found) {
+        userspace::write_line(console,
+                              "installed credential store was not found");
+    }
+    return found;
+}
+
 bool install_neufs(const Device& src, const Device& dst, long console) {
     clear_console(console);
     set_cursor(console, 0, 0);
@@ -1748,7 +1792,8 @@ bool install_neufs(const Device& src, const Device& dst, long console) {
     render_copy_progress(progress, true);
 
     ok = copy_tree(source_root, target_root, console, &progress) &&
-         ensure_installed_root_home(target_root, console);
+         ensure_installed_root_home(target_root, console) &&
+         protect_installed_user_store(target_root, console);
     if (ok) {
         (void)write_installed_module_loads(target_root, console);
         progress.copied_files = progress.total_files;
