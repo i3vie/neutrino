@@ -10,6 +10,8 @@
 namespace networkd_protocol {
 
 constexpr uint32_t kRegistryMagic = 0x4E455457u;  // "NETW"
+// New diagnostics are appended to Registry so v3 readers retain a stable
+// prefix and can coexist with newer daemons in the same page-sized segment.
 constexpr uint32_t kRegistryVersion = 3;
 constexpr const char kRegistryName[] = "network.registry";
 
@@ -66,6 +68,23 @@ struct Registry {
     uint32_t net_rx_delivered;
     uint32_t net_tx_udp;
     uint32_t net_tx_tcp;
+    uint32_t net_rx_arp;
+    uint32_t net_rx_icmp;
+    uint32_t net_rx_unrecognized;
+    uint32_t net_rx_no_binding;
+    uint32_t net_tx_frames;
+    uint32_t net_tx_failures;
+    uint32_t arp_requests;
+    uint32_t arp_cache_hits;
+    uint32_t arp_timeouts;
+    uint32_t control_invalid;
+    uint32_t dhcp_discovers_sent;
+    uint32_t dhcp_requests_sent;
+    uint32_t dhcp_replies_seen;
+    uint32_t dhcp_replies_rejected;
+    uint32_t dhcp_offer_timeouts;
+    uint32_t dhcp_ack_timeouts;
+    uint32_t dhcp_last_server;
 };
 
 enum RegistryState : uint32_t {

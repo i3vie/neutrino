@@ -5,6 +5,7 @@
 #include "kernel/config.hpp"
 #include "kernel/descriptor.hpp"
 #include "kernel/string_util.hpp"
+#include "kernel/sync.hpp"
 #include "lib/mem.hpp"
 
 namespace net {
@@ -60,15 +61,24 @@ size_t g_link_count = 0;
 bool g_default_ipv4_configured = false;
 uint32_t g_default_ipv4_address = 0;
 
-void lock_device(LinkDevice& device) {
-    while (__atomic_test_and_set(&device.rx_lock, __ATOMIC_ACQUIRE)) {
-        asm volatile("pause");
+class DeviceGuard {
+public:
+    explicit DeviceGuard(LinkDevice& device)
+        : device_(device), flags_(sync::disable_interrupts()) {
+        while (__atomic_test_and_set(&device_.rx_lock, __ATOMIC_ACQUIRE)) {
+            asm volatile("pause");
+        }
     }
-}
-
-void unlock_device(LinkDevice& device) {
-    __atomic_clear(&device.rx_lock, __ATOMIC_RELEASE);
-}
+    ~DeviceGuard() {
+        __atomic_clear(&device_.rx_lock, __ATOMIC_RELEASE);
+        sync::restore_interrupts(flags_);
+    }
+    DeviceGuard(const DeviceGuard&) = delete;
+    DeviceGuard& operator=(const DeviceGuard&) = delete;
+private:
+    LinkDevice& device_;
+    uint64_t flags_;
+};
 
 uint16_t load_be16(const void* ptr) {
     const uint8_t* bytes = static_cast<const uint8_t*>(ptr);
@@ -620,12 +630,11 @@ LinkDevice* device_at(size_t index) {
 }
 
 size_t queued_frame_count(LinkDevice& device) {
-    lock_device(device);
+    DeviceGuard guard(device);
     size_t count = (device.rx_head >= device.rx_tail)
                        ? static_cast<size_t>(device.rx_head - device.rx_tail)
                        : static_cast<size_t>(kMaxQueuedFrames -
                                              (device.rx_tail - device.rx_head));
-    unlock_device(device);
     return count;
 }
 
@@ -638,23 +647,20 @@ int read_frame(LinkDevice& device,
         return -1;
     }
 
-    lock_device(device);
+    DeviceGuard guard(device);
     if (device.rx_head == device.rx_tail) {
-        unlock_device(device);
         return 0;
     }
 
     uint16_t slot = device.rx_tail;
     size_t frame_size = device.rx_lengths[slot];
     if (frame_size > buffer_size) {
-        unlock_device(device);
         return -1;
     }
 
     memcpy(buffer, device.rx_frames[slot], frame_size);
     device.rx_lengths[slot] = 0;
     device.rx_tail = static_cast<uint16_t>((slot + 1) % kMaxQueuedFrames);
-    unlock_device(device);
 
     out_size = frame_size;
     return 1;
@@ -704,26 +710,26 @@ void receive_frame(LinkDevice* device, const void* frame, size_t length) {
 
     if (length <= kMaxQueuedFrameSize) {
         bool queued = false;
-        lock_device(*device);
-        ++device->rx_frames_received;
-        uint16_t next_head =
-            static_cast<uint16_t>((device->rx_head + 1) % kMaxQueuedFrames);
-        if (next_head != device->rx_tail) {
-            memcpy(device->rx_frames[device->rx_head], frame, length);
-            device->rx_lengths[device->rx_head] = static_cast<uint16_t>(length);
-            device->rx_head = next_head;
-            queued = true;
-        } else {
-            ++device->rx_frames_dropped;
+        {
+            DeviceGuard guard(*device);
+            ++device->rx_frames_received;
+            uint16_t next_head =
+                static_cast<uint16_t>((device->rx_head + 1) % kMaxQueuedFrames);
+            if (next_head != device->rx_tail) {
+                memcpy(device->rx_frames[device->rx_head], frame, length);
+                device->rx_lengths[device->rx_head] = static_cast<uint16_t>(length);
+                device->rx_head = next_head;
+                queued = true;
+            } else {
+                ++device->rx_frames_dropped;
+            }
         }
-        unlock_device(*device);
         if (queued) {
             descriptor::wake_waiters();
         }
     } else {
-        lock_device(*device);
+        DeviceGuard guard(*device);
         ++device->rx_frames_dropped;
-        unlock_device(*device);
     }
 
     const uint8_t* bytes = static_cast<const uint8_t*>(frame);

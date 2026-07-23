@@ -72,6 +72,11 @@ struct Registry {
     uint32_t last_ack;
     uint32_t expected_seq;
     uint32_t expected_ack;
+    // Appended diagnostics preserve the stable version-1 registry prefix.
+    uint32_t outbound_syns;
+    uint32_t outbound_syn_retransmits;
+    uint32_t outbound_connect_timeouts;
+    uint32_t syn_sent;
 };
 
 struct ListenRequest {

@@ -20,6 +20,9 @@ constexpr uint8_t kAckFlushSegments = 4;
 constexpr size_t kNetworkRegistryPollSpins = 120000;
 constexpr uint16_t kEphemeralPortStart = 49152;
 constexpr uint16_t kEphemeralPortEnd = 65535;
+constexpr uint64_t kSynInitialRetryMs = 1000;
+constexpr uint8_t kSynMaxRetransmits = 3;
+constexpr uint64_t kSynPollIntervalMs = 25;
 
 enum ConnectionState : uint8_t {
     kConnStateClosed = 0,
@@ -51,6 +54,8 @@ struct Connection {
     uint32_t endpoint_handle;
     uint32_t endpoint_id;
     uint8_t pending_ack_segments;
+    uint8_t syn_retransmits;
+    uint64_t syn_retry_deadline_ms;
     Listener* listener;
 };
 
@@ -271,6 +276,7 @@ void recount_registry(ServerContext& ctx) {
     }
     uint32_t listeners = 0;
     uint32_t connections = 0;
+    uint32_t syn_sent = 0;
     for (size_t i = 0; i < kMaxListeners; ++i) {
         if (ctx.listeners[i].in_use && ctx.listeners[i].bound) {
             ++listeners;
@@ -279,10 +285,14 @@ void recount_registry(ServerContext& ctx) {
     for (size_t i = 0; i < kMaxConnections; ++i) {
         if (ctx.connections[i].in_use) {
             ++connections;
+            if (ctx.connections[i].state == kConnStateSynSent) {
+                ++syn_sent;
+            }
         }
     }
     ctx.registry->listeners = listeners;
     ctx.registry->connections = connections;
+    ctx.registry->syn_sent = syn_sent;
 }
 
 bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
@@ -342,6 +352,10 @@ bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
     registry->last_ack = 0;
     registry->expected_seq = 0;
     registry->expected_ack = 0;
+    registry->outbound_syns = 0;
+    registry->outbound_syn_retransmits = 0;
+    registry->outbound_connect_timeouts = 0;
+    registry->syn_sent = 0;
     ctx.registry = registry;
     return true;
 }
@@ -483,6 +497,8 @@ void reset_connection(Connection& conn) {
     conn.endpoint_handle = 0;
     conn.endpoint_id = 0;
     conn.pending_ack_segments = 0;
+    conn.syn_retransmits = 0;
+    conn.syn_retry_deadline_ms = 0;
     conn.listener = nullptr;
 }
 
@@ -519,6 +535,91 @@ void close_connection(ServerContext& ctx, Connection& conn, uint32_t reason) {
         release_client_port(ctx, local_port);
     }
     recount_registry(ctx);
+}
+
+bool wall_time_ms(uint64_t& out) {
+    NeutrinoWallTime now{};
+    if (time_get(&now) != 0) {
+        return false;
+    }
+    out = now.unix_seconds * 1000ull + now.nanoseconds / 1000000u;
+    return true;
+}
+
+bool service_outbound_syns(ServerContext& ctx) {
+    uint64_t now_ms = 0;
+    if (!wall_time_ms(now_ms)) {
+        return false;
+    }
+
+    bool pending = false;
+    bool recount = false;
+    for (size_t i = 0; i < kMaxConnections; ++i) {
+        Connection& conn = ctx.connections[i];
+        if (!conn.in_use || conn.state != kConnStateSynSent) {
+            continue;
+        }
+        pending = true;
+        if (conn.syn_retry_deadline_ms == 0) {
+            conn.syn_retry_deadline_ms = now_ms + kSynInitialRetryMs;
+            continue;
+        }
+        if (now_ms < conn.syn_retry_deadline_ms) {
+            continue;
+        }
+
+        if (conn.syn_retransmits >= kSynMaxRetransmits) {
+            const uint16_t local_port = conn.local_port;
+            send_connect_response(conn.app_pipe_handle,
+                                  tcpd_protocol::kStatusIo,
+                                  0,
+                                  local_port,
+                                  0);
+            if (conn.endpoint_handle != 0) {
+                descriptor_close(conn.endpoint_handle);
+            }
+            if (conn.app_pipe_handle != 0) {
+                descriptor_close(conn.app_pipe_handle);
+            }
+            reset_connection(conn);
+            release_client_port(ctx, local_port);
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->outbound_connect_timeouts;
+            }
+            recount = true;
+            continue;
+        }
+
+        descriptor_defs::NetIpv4Config cfg{};
+        if (!load_ipv4_config(ctx, cfg)) {
+            conn.syn_retry_deadline_ms = now_ms + kSynInitialRetryMs;
+            continue;
+        }
+        const uint32_t initial_seq = conn.local_next_seq - 1;
+        const bool sent = send_network_segment(ctx,
+                                               cfg.address,
+                                               conn.remote_ip,
+                                               conn.local_port,
+                                               conn.remote_port,
+                                               initial_seq,
+                                               0,
+                                               usernet::kTcpFlagSyn,
+                                               nullptr,
+                                               0);
+        ++conn.syn_retransmits;
+        if (sent) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->outbound_syn_retransmits;
+            }
+        }
+        const uint64_t backoff =
+            kSynInitialRetryMs << conn.syn_retransmits;
+        conn.syn_retry_deadline_ms = now_ms + backoff;
+    }
+    if (recount) {
+        recount_registry(ctx);
+    }
+    return pending;
 }
 
 void record_tcp_observation(ServerContext& ctx,
@@ -602,6 +703,8 @@ bool begin_outbound_connection(ServerContext& ctx,
     conn->remote_next_seq = 0;
     conn->pending_ack_bytes = 0;
     conn->pending_ack_segments = 0;
+    conn->syn_retransmits = 0;
+    conn->syn_retry_deadline_ms = 0;
     conn->app_pipe_handle = app_pipe_handle;
     conn->endpoint_handle = 0;
     conn->endpoint_id = endpoint_id;
@@ -642,6 +745,16 @@ bool begin_outbound_connection(ServerContext& ctx,
         reset_connection(*conn);
         release_client_port(ctx, local_port);
         return false;
+    }
+
+    NeutrinoWallTime now{};
+    if (time_get(&now) == 0) {
+        conn->syn_retry_deadline_ms =
+            now.unix_seconds * 1000ull + now.nanoseconds / 1000000u +
+            kSynInitialRetryMs;
+    }
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->outbound_syns;
     }
 
     recount_registry(ctx);
@@ -1084,6 +1197,8 @@ void handle_new_connection(ServerContext& ctx,
     conn->remote_next_seq = segment.sequence_number + 1;
     conn->pending_ack_bytes = 0;
     conn->pending_ack_segments = 0;
+    conn->syn_retransmits = 0;
+    conn->syn_retry_deadline_ms = 0;
     uint32_t initial_seq =
         0x4E540000u + (static_cast<uint32_t>(listener.port) << 4) + conn->id;
     conn->local_next_seq = initial_seq + 1;
@@ -1146,6 +1261,13 @@ void handle_existing_connection(ServerContext& ctx,
             ++ctx.registry->remote_resets;
         }
         record_tcp_observation(ctx, segment, conn.remote_next_seq, conn.local_next_seq);
+        if (conn.state == kConnStateSynSent) {
+            send_connect_response(conn.app_pipe_handle,
+                                  tcpd_protocol::kStatusNotFound,
+                                  0,
+                                  conn.local_port,
+                                  0);
+        }
         close_connection(ctx, conn, tcpd_protocol::kCloseRemoteRst);
         return;
     }
@@ -1208,30 +1330,26 @@ void handle_existing_connection(ServerContext& ctx,
     }
 
     if (conn.state == kConnStateSynSent) {
-        if ((segment.flags & usernet::kTcpFlagRst) != 0) {
-            uint16_t local_port = conn.local_port;
-            send_connect_response(conn.app_pipe_handle,
-                                  tcpd_protocol::kStatusNotFound,
-                                  0,
-                                  conn.local_port,
-                                  0);
-            descriptor_close(conn.app_pipe_handle);
-            reset_connection(conn);
-            release_client_port(ctx, local_port);
-            recount_registry(ctx);
-            return;
-        }
         if ((segment.flags & usernet::kTcpFlagSyn) != 0 &&
             (segment.flags & usernet::kTcpFlagAck) != 0 &&
             segment.acknowledgment_number == conn.local_next_seq) {
             conn.remote_next_seq = seq + 1;
             conn.state = kConnStateEstablished;
+            conn.syn_retry_deadline_ms = 0;
             send_ack_only(ctx, conn);
             send_connect_response(conn.app_pipe_handle,
                                   tcpd_protocol::kStatusOk,
                                   conn.id,
                                   conn.local_port,
                                   conn.endpoint_id);
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->established;
+            }
+            record_tcp_observation(ctx,
+                                   segment,
+                                   conn.remote_next_seq,
+                                   conn.local_next_seq);
+            recount_registry(ctx);
         }
         return;
     }
@@ -1424,10 +1542,15 @@ int main(uint64_t, uint64_t) {
         did_work = poll_control(ctx) || did_work;
         did_work = poll_connection_endpoints(ctx) || did_work;
         did_work = poll_network(ctx) || did_work;
+        const bool pending_syn = service_outbound_syns(ctx);
         if (did_work) {
             continue;
         }
         if (flush_pending_acks(ctx)) {
+            continue;
+        }
+        if (pending_syn) {
+            sleep_ms(kSynPollIntervalMs);
             continue;
         }
 

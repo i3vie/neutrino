@@ -263,13 +263,22 @@ bool write_device_frame(ServerContext& ctx, const uint8_t* frame, size_t frame_l
     for (uint32_t attempts = 0; attempts < kDeviceWriteRetryLimit; ++attempts) {
         long written = descriptor_write(ctx.device.handle, frame, frame_length);
         if (written == static_cast<long>(frame_length)) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_tx_frames;
+            }
             return true;
         }
         if (written == kDescriptorWouldBlock) {
             yield();
             continue;
         }
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->net_tx_failures;
+        }
         return false;
+    }
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->net_tx_failures;
     }
     return false;
 }
@@ -309,6 +318,9 @@ bool send_arp_request(ServerContext& ctx, const uint8_t target_ip[4]) {
                                           cfg.address,
                                           target_ip)) {
         return false;
+    }
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->arp_requests;
     }
     return write_device_frame(ctx, frame, frame_length);
 }
@@ -357,22 +369,13 @@ bool populate_registry(ServerContext& ctx, uint32_t server_pipe_id) {
     }
 
     auto* registry = reinterpret_cast<networkd_protocol::Registry*>(info_base);
+    memset(registry, 0, sizeof(*registry));
     registry->magic = networkd_protocol::kRegistryMagic;
     registry->version = networkd_protocol::kRegistryVersion;
     registry->server_pipe_id = server_pipe_id;
-    registry->reserved = 0;
     registry->networkd_state = networkd_protocol::kStateStarting;
     registry->dhcp_state = networkd_protocol::kStateIdle;
-    registry->dhcp_attempts = 0;
-    registry->dhcp_last_offer = 0;
-    registry->dhcp_last_ack = 0;
     registry->dhcp_last_error = networkd_protocol::kErrorNone;
-    registry->net_rx_frames = 0;
-    registry->net_rx_udp = 0;
-    registry->net_rx_tcp = 0;
-    registry->net_rx_delivered = 0;
-    registry->net_tx_udp = 0;
-    registry->net_tx_tcp = 0;
     ctx.registry = registry;
     return true;
 }
@@ -750,6 +753,8 @@ bool poll_control(ServerContext& ctx) {
             handle_tcp_send_request(ctx, message->send_tcp_request);
         } else if (message->type == networkd_protocol::kSendIcmpEchoRequest) {
             handle_icmp_request(ctx, message->icmp_request);
+        } else if (ctx.registry != nullptr) {
+            ++ctx.registry->control_invalid;
         }
     }
 }
@@ -763,6 +768,9 @@ bool lookup_or_resolve_mac(ServerContext& ctx,
     }
     ArpEntry* entry = find_arp_entry(ctx, next_hop_ip);
     if (entry != nullptr) {
+        if (ctx.registry != nullptr) {
+            ++ctx.registry->arp_cache_hits;
+        }
         for (size_t i = 0; i < 6; ++i) {
             out_mac[i] = entry->mac[i];
         }
@@ -781,6 +789,9 @@ bool lookup_or_resolve_mac(ServerContext& ctx,
             return true;
         }
         yield();
+    }
+    if (ctx.registry != nullptr) {
+        ++ctx.registry->arp_timeouts;
     }
     return false;
 }
@@ -804,6 +815,9 @@ bool poll_network(ServerContext& ctx) {
 
         usernet::ArpPacketView arp{};
         if (usernet::parse_arp_frame(frame, static_cast<size_t>(result), arp)) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_rx_arp;
+            }
             if (arp.operation == 0x0001 || arp.operation == 0x0002) {
                 record_arp(ctx, arp.sender_ip, arp.sender_mac);
             }
@@ -819,6 +833,9 @@ bool poll_network(ServerContext& ctx) {
             Binding* binding =
                 find_binding(ctx, kBindingProtocolUdp, packet.destination_port);
             if (binding == nullptr) {
+                if (ctx.registry != nullptr) {
+                    ++ctx.registry->net_rx_no_binding;
+                }
                 continue;
             }
             if (ctx.registry != nullptr) {
@@ -832,6 +849,9 @@ bool poll_network(ServerContext& ctx) {
         if (usernet::parse_icmp_echo_reply_frame(frame,
                                                  static_cast<size_t>(result),
                                                  icmp)) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_rx_icmp;
+            }
             PendingPing* pending =
                 find_pending_ping(ctx, icmp.identifier, icmp.sequence);
             if (pending == nullptr) {
@@ -846,6 +866,9 @@ bool poll_network(ServerContext& ctx) {
 
         usernet::TcpSegmentView segment{};
         if (!usernet::parse_tcp_frame(frame, static_cast<size_t>(result), segment)) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_rx_unrecognized;
+            }
             continue;
         }
         if (ctx.registry != nullptr) {
@@ -855,6 +878,9 @@ bool poll_network(ServerContext& ctx) {
         Binding* binding =
             find_binding(ctx, kBindingProtocolTcp, segment.destination_port);
         if (binding == nullptr) {
+            if (ctx.registry != nullptr) {
+                ++ctx.registry->net_rx_no_binding;
+            }
             continue;
         }
         if (ctx.registry != nullptr) {

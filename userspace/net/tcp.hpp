@@ -99,6 +99,9 @@ inline bool parse_tcp_frame(const uint8_t* frame,
         frame_length < kEthernetHeaderSize + total_length) {
         return false;
     }
+    if (finish_checksum(checksum_partial(ipv4, ihl)) != 0) {
+        return false;
+    }
 
     uint16_t fragment = load_be16(ipv4 + 6);
     if ((fragment & 0x3FFFu) != 0) {
@@ -107,6 +110,9 @@ inline bool parse_tcp_frame(const uint8_t* frame,
 
     const uint8_t* tcp = ipv4 + ihl;
     size_t tcp_length = total_length - ihl;
+    if (tcp_checksum(ipv4 + 12, ipv4 + 16, tcp, tcp_length) != 0) {
+        return false;
+    }
     uint8_t data_offset = static_cast<uint8_t>((tcp[12] >> 4) * 4u);
     if (data_offset < kTcpHeaderMinSize || data_offset > tcp_length) {
         return false;

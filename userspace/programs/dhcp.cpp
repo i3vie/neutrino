@@ -514,7 +514,8 @@ bool wait_for_reply(uint32_t reply_handle,
                     uint32_t xid,
                     const uint8_t mac[6],
                     uint8_t expected_type,
-                    DhcpReply& out_reply) {
+                    DhcpReply& out_reply,
+                    networkd_protocol::Registry* registry) {
     for (size_t spins = 0; spins < kDhcpPollSpins; ++spins) {
         auto* message = allocate_message_buffer();
         if (message == nullptr) {
@@ -525,13 +526,25 @@ bool wait_for_reply(uint32_t reply_handle,
             continue;
         }
         if (message->type != networkd_protocol::kUdpPacketEvent) {
+            if (registry != nullptr) {
+                ++registry->dhcp_replies_rejected;
+            }
             continue;
         }
+        if (registry != nullptr) {
+            ++registry->dhcp_replies_seen;
+        }
         if (!parse_dhcp_reply(message->udp_event, xid, mac, out_reply)) {
+            if (registry != nullptr) {
+                ++registry->dhcp_replies_rejected;
+            }
             continue;
         }
         if (out_reply.message_type == expected_type) {
             return true;
+        }
+        if (registry != nullptr) {
+            ++registry->dhcp_replies_rejected;
         }
     }
     return false;
@@ -581,16 +594,21 @@ bool attempt_dhcp(uint32_t server_pipe,
         return false;
     }
     print_line("dhcp: discover sent");
+    if (registry != nullptr) {
+        ++registry->dhcp_discovers_sent;
+    }
 
     DhcpReply offer{};
     if (!wait_for_reply(reply_pipe,
                         xid,
                         device.info.mac,
                         kDhcpOffer,
-                        offer)) {
+                        offer,
+                        registry)) {
         if (registry != nullptr) {
             registry->dhcp_state = networkd_protocol::kStateWaitingOffer;
             registry->dhcp_last_error = networkd_protocol::kErrorNoOffer;
+            ++registry->dhcp_offer_timeouts;
         }
         print_line("dhcp: no offer received");
         return false;
@@ -598,6 +616,7 @@ bool attempt_dhcp(uint32_t server_pipe,
     if (registry != nullptr) {
         registry->dhcp_state = networkd_protocol::kStateOfferReceived;
         registry->dhcp_last_offer = ipv4_to_u32(offer.yiaddr);
+        registry->dhcp_last_server = ipv4_to_u32(offer.server_id);
     }
     print("dhcp: offer ");
     print_ipv4(offer.yiaddr);
@@ -632,6 +651,7 @@ bool attempt_dhcp(uint32_t server_pipe,
     }
     if (registry != nullptr) {
         registry->dhcp_state = networkd_protocol::kStateRequestSent;
+        ++registry->dhcp_requests_sent;
     }
     print_line("dhcp: request sent");
 
@@ -640,10 +660,12 @@ bool attempt_dhcp(uint32_t server_pipe,
                         xid,
                         device.info.mac,
                         kDhcpAck,
-                        ack)) {
+                        ack,
+                        registry)) {
         if (registry != nullptr) {
             registry->dhcp_state = networkd_protocol::kStateError;
             registry->dhcp_last_error = networkd_protocol::kErrorNoAck;
+            ++registry->dhcp_ack_timeouts;
         }
         print_line("dhcp: no ack received");
         return false;
