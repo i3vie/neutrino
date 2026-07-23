@@ -53,6 +53,7 @@ BEARSSL_SOURCES := $(if $(wildcard $(BEARSSL_SOURCE_DIR)),$(shell cd $(BEARSSL_S
 BEARSSL_OBJECTS := $(addprefix $(OBJ_DIR)/bearssl/,$(BEARSSL_SOURCES:.c=.o))
 BEARSSL_SHARED_OBJECTS := $(addprefix $(OBJ_DIR)/bearssl-pic/,$(BEARSSL_SOURCES:.c=.o))
 BEARSSL_LIB := $(OBJ_DIR)/libbearssl.a
+BEARSSL_PIC_LIB := $(OBJ_DIR)/libbearssl-pic.a
 SHARED_LIBC_OBJECTS := $(OBJ_DIR)/shared/libc_string.o
 BEARSSL_SO := $(OUT_DIR)/libbearssl.so.0
 BEARSSL_SO_LINK := $(OUT_DIR)/libbearssl.so
@@ -66,13 +67,11 @@ BEARSSL_DEP_HEADERS := $(if $(DEPENDENCY_ROOT),$(DEPENDENCY_INCLUDE_DIR)/bearssl
 # PROGRAM_LIBS_<program> += $(BEARSSL_DEP_SO)
 PROGRAM_DEPS_browse += $(BEARSSL_DEP_HEADERS)
 PROGRAM_DEPS_download += $(BEARSSL_DEP_HEADERS)
-PROGRAM_DEPS_netget += $(BEARSSL_DEP_HEADERS)
-PROGRAM_LIBS_browse += $(BEARSSL_DEP_SO)
-PROGRAM_LIBS_download += $(BEARSSL_DEP_SO)
-PROGRAM_LIBS_netget += $(BEARSSL_DEP_SO)
-BEARSSL_PROGRAMS := browse download netget
+PROGRAM_LIBS_browse += $(BEARSSL_PIC_LIB)
+PROGRAM_LIBS_download += $(BEARSSL_PIC_LIB)
+BEARSSL_PROGRAMS := browse download
 SELECTED_BEARSSL_PROGRAMS := $(filter $(BEARSSL_PROGRAMS),$(PROGRAMS))
-INSTALL_STAGED_LIBRARIES ?= $(if $(SELECTED_BEARSSL_PROGRAMS),1,0)
+INSTALL_STAGED_LIBRARIES ?= 0
 PROGRAM_HELPERS_browse += http
 PROGRAM_HELPERS_installer += console
 PROGRAM_HELPERS_insmod += args console
@@ -85,6 +84,9 @@ PROGRAM_HELPERS_neupak += args text
 PROGRAM_HELPERS_download += http
 PROGRAM_HELPERS_netget += http
 PROGRAM_DEPS_font += ../shared/include/TOSH-SAT.F14
+PROGRAM_DEPS_desktop += ../shared/include/font8x8_basic.hpp
+PROGRAM_DEPS_networkd += net/ipv4.hpp net/network_protocol.hpp net/tcp.hpp net/udp.hpp
+PROGRAM_DEPS_tcpd += net/network_protocol.hpp net/tcp.hpp net/tcpd_protocol.hpp net/udp.hpp
 
 HDD_IMAGE ?= ../hdd.img
 MOUNT_DIR ?= $(HOME)/MountedImage
@@ -145,6 +147,12 @@ $(OBJ_DIR)/bearssl-pic/%.o: $(BEARSSL_SOURCE_DIR)/%.c $(BEARSSL_SOURCE_INCLUDE_D
 $(BEARSSL_LIB): $(BEARSSL_SOURCE_INCLUDE_DIR)/bearssl.h $(BEARSSL_OBJECTS) | $(OBJ_DIR)
 	$(AR) rcs $@ $(BEARSSL_OBJECTS)
 
+# Programs link the archive directly so launching a TLS-capable utility does
+# not require the kernel to stage an entire shared object in one contiguous
+# buddy allocation.  The PIC objects are also valid in PIE executables.
+$(BEARSSL_PIC_LIB): $(BEARSSL_SHARED_OBJECTS) | $(OBJ_DIR)
+	$(AR) rcs $@ $(BEARSSL_SHARED_OBJECTS)
+
 $(BEARSSL_SO): $(BEARSSL_SOURCE_INCLUDE_DIR)/bearssl.h $(BEARSSL_SHARED_OBJECTS) $(SHARED_LIBC_OBJECTS) | $(OUT_DIR)
 	$(CC) $(SHARED_LDFLAGS) -Wl,-soname,libbearssl.so.0 $(BEARSSL_SHARED_OBJECTS) $(SHARED_LIBC_OBJECTS) -o $@
 
@@ -162,7 +170,7 @@ $(BEARSSL_STAGED_SO_LINK): $(BEARSSL_SO)
 bearssl: $(BEARSSL_LIB)
 bearssl-shared: $(BEARSSL_SO) $(BEARSSL_SO_LINK) $(BEARSSL_STAGED_SO) $(BEARSSL_STAGED_SO_LINK) $(BEARSSL_STAGED_HEADERS)
 
-INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all $(if $(SELECTED_BEARSSL_PROGRAMS),bearssl-shared)
+INSTALL_PREREQS := $(if $(filter clean,$(MAKECMDGOALS)),clean) all
 program_helper_objects = $(addprefix $(OBJ_DIR)/helper_,$(addsuffix .o,$(PROGRAM_HELPERS_$(1))))
 
 $(OUT_DIR)/%.elf: $(SRC_PROG_DIR)/%.cpp $(OBJ_DIR)/crt0.o $(OBJ_DIR)/libc_string.o $(OBJ_DIR)/libc_ctype.o $(OBJ_DIR)/libc_neutrino.o $(CRT_DIR)/syscall.hpp $$(PROGRAM_DEPS_$$*) $$(PROGRAM_LIBS_$$*) $$(call program_helper_objects,$$*) | $(OUT_DIR)

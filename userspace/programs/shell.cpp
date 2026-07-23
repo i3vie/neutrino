@@ -931,7 +931,22 @@ int main(uint64_t arg, uint64_t) {
                 handle_input_byte(key);
             }
         }
-        yield();
+
+        if (input_is_keyboard) {
+            // A local keyboard may be fed by a scheduler poll worker (notably
+            // USB keyboards in the live ISO).  Waiting for keyboard readiness
+            // can deadlock that producer when no other userspace task yields.
+            yield();
+        } else {
+            descriptor_defs::DescriptorWait wait{};
+            wait.handle = static_cast<uint32_t>(input_handle);
+            wait.events = descriptor_defs::kWaitRead;
+            if (descriptor_wait(&wait, 1) < 0) {
+                // Preserve the cooperative fallback for descriptor types that
+                // do not support readiness notification.
+                yield();
+            }
+        }
     }
 
     return 0;

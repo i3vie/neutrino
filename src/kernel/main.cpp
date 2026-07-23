@@ -13,6 +13,8 @@
 #include "drivers/acpi/acpi.hpp"
 #include "../drivers/log/logging.hpp"
 #include "../drivers/pci/pci.hpp"
+#include "../drivers/sensors/acpi_thermal.hpp"
+#include "../drivers/sensors/it87.hpp"
 #include "../drivers/timer/pit.hpp"
 #include "../fs/vfs.hpp"
 #include "../net/network.hpp"
@@ -31,6 +33,7 @@
 #include "config.hpp"
 #include "descriptor.hpp"
 #include "capabilities.hpp"
+#include "debug_heartbeat.hpp"
 #include "users.hpp"
 #include "error.hpp"
 #include "loader.hpp"
@@ -425,6 +428,7 @@ static void kernel_main_stage2() {
     if (early_cmdline != nullptr) {
         string_util::copy(boot_cmdline, sizeof(boot_cmdline), early_cmdline);
     }
+    const char* cmdline = boot_cmdline[0] != '\0' ? boot_cmdline : nullptr;
     preserve_limine_modules();
 
     auto fb = *framebuffer_request.response->framebuffers[0];
@@ -450,6 +454,8 @@ static void kernel_main_stage2() {
                                fb.green_mask_shift,
                                fb.blue_mask_size,
                                fb.blue_mask_shift};
+
+    debug_heartbeat::init(cmdline, framebuffer);
 
     descriptor::init();
     descriptor::register_builtin_types();
@@ -538,6 +544,9 @@ static void kernel_main_stage2() {
     pit::init(1000);
     log_message(LogLevel::Info, "PIT configured");
 
+    log_message(LogLevel::Info, "Probing ISA hardware-monitor adapters");
+    it87::init();
+
     log_message(
         LogLevel::Debug, "Kernel phys base addr: %016x",
         (unsigned long long)kernel_addr_request.response->physical_base);
@@ -555,6 +564,12 @@ static void kernel_main_stage2() {
 
     log_message(LogLevel::Debug, "HHDM offset: %016x",
                 (unsigned long long)hhdm_request.response->offset);
+
+    // Limine's APs are still executing from bootloader-reclaimable low memory.
+    // Release them before the physical allocator is allowed to reuse it.
+    log_message(LogLevel::Info, "Starting SMP bring-up");
+    smp::init();
+    log_message(LogLevel::Info, "SMP bring-up complete");
 
     log_message(LogLevel::Info, "Initializing physical memory pools");
     memory::init();
@@ -580,10 +595,6 @@ static void kernel_main_stage2() {
         kconsole->enable_back_buffer();
         log_message(LogLevel::Info, "Console back buffer enabled");
     }
-    log_message(LogLevel::Info, "Starting SMP bring-up");
-    smp::init();
-    log_message(LogLevel::Info, "SMP bring-up complete");
-
     bool pat_ok = cpu::configure_pat_write_combining();
     bool wc_pages = false;
     if (pat_ok && fb_virtual != nullptr) {
@@ -611,7 +622,6 @@ static void kernel_main_stage2() {
             static_cast<unsigned long long>(fb_length));
     }
 
-    const char* cmdline = boot_cmdline[0] != '\0' ? boot_cmdline : nullptr;
     net::init(cmdline);
 
     log_message(LogLevel::Info, "Initializing PCI subsystem");
@@ -808,16 +818,18 @@ static void kernel_main_stage2() {
 
     process::init();
     scheduler::init();
+    descriptor::start_waiter_worker();
     // Namespace initialization may install SCI handlers and queue deferred AML
     // work, so it must follow process and scheduler initialization.
-    if (!acpi::initialize()) {
+    if (!acpi::initialize(cmdline)) {
         log_message(LogLevel::Warn, "ACPI runtime unavailable");
+    } else {
+        acpi_thermal::init();
     }
 
     log_message(LogLevel::Info, "DriverRegistry: probing PCI drivers");
     driver_registry::probe_pci_drivers();
     log_message(LogLevel::Info, "DriverRegistry: PCI probe complete");
-    descriptor::start_block_io_worker();
 
     constexpr size_t kInitMaxSize = 64 * 1024;
     alignas(16) static uint8_t init_buffer[kInitMaxSize];
@@ -928,6 +940,7 @@ static void kernel_main_stage2() {
     // prompts. Logging continues to serial and the kernel ring buffer, where
     // it remains available through dmesg.
     log_set_console_enabled(false);
+    smp::release_aps();
     scheduler::run();
 
     error_screen::display("SCHEDULER_EXITED", nullptr, nullptr);
